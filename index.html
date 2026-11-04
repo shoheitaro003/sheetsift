@@ -1,0 +1,879 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SheetSift</title>
+<meta name="description" content="A self-hosted React importer for the messy Excel and CSV files your customers actually send. Early access waitlist.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a working spreadsheet as the hero, then a ledger of real file problems, then a short path to the waitlist. */
+:root{
+  --paper:#F6F7F9;
+  --sheet:#FFFFFF;
+  --ink:#16202B;
+  --muted:#5A6573;
+  --rule:#DCE1E7;
+  --gridhead:#EEF1F4;
+  --accent:#0F5F66;      /* deep teal: selection, links */
+  --mark:#F3C64B;        /* highlighter: detected header row */
+  --mark-soft:#FBEBB8;
+  --bad:#B63A28;
+  --bad-soft:#F8E1DC;
+  --warn:#8A5A00;
+  --warn-soft:#FFF0C7;
+  --good:#1D7A45;
+  --skip:#A3ACB7;
+  --display:"Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --body:"IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono:"IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#11161C; --sheet:#171E26; --ink:#E6EBF0; --muted:#9AA6B3; --rule:#2A3440;
+    --gridhead:#1D2630; --accent:#5FC2C9; --mark:#C99A1E; --mark-soft:#3A3115;
+    --bad:#F08A76; --bad-soft:#3B201B; --good:#6BCB92; --skip:#5B6672; color-scheme:dark;
+    --warn:#E3B341; --warn-soft:#3A2E10;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#11161C; --sheet:#171E26; --ink:#E6EBF0; --muted:#9AA6B3; --rule:#2A3440;
+  --gridhead:#1D2630; --accent:#5FC2C9; --mark:#C99A1E; --mark-soft:#3A3115;
+  --bad:#F08A76; --bad-soft:#3B201B; --good:#6BCB92; --skip:#5B6672; color-scheme:dark;
+  --warn:#E3B341; --warn-soft:#3A2E10;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.6 var(--body)}
+a{color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.wrap{max-width:1120px;margin:0 auto;padding-left:max(16px, env(safe-area-inset-left, 0px));padding-right:max(16px, env(safe-area-inset-right, 0px))}
+h1,h2,h3{font-family:var(--display);line-height:1.1;text-wrap:balance;margin:0}
+h1{font-size:clamp(2.2rem, 5vw, 3.6rem);font-weight:800;letter-spacing:-0.02em}
+h2{font-size:clamp(1.6rem, 3vw, 2.3rem);font-weight:700;letter-spacing:-0.01em}
+h3{font-size:1.1rem;font-weight:700}
+p{margin:0}
+.eyebrow{font:500 .75rem/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+
+/* nav */
+header.top{border-bottom:1px solid var(--rule);background:var(--paper)}
+header.top .wrap{display:flex;align-items:center;justify-content:space-between;gap:16px;padding-block:14px}
+.logo{display:flex;align-items:center;gap:10px;font:800 1.15rem/1 var(--display);color:var(--ink);text-decoration:none}
+.logo svg{flex:none}
+@media (max-width: 520px){ .pill{display:none} }
+.pill{font:500 .72rem/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;padding:6px 9px;border:1px solid var(--rule);border-radius:999px;color:var(--muted)}
+.btn{display:inline-flex;align-items:center;gap:8px;font:600 .95rem/1 var(--body);padding:12px 18px;border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:var(--sheet);text-decoration:none;cursor:pointer}
+.btn.ghost{background:transparent;color:var(--accent)}
+.btn:hover{filter:brightness(1.08)}
+
+/* hero */
+.hero .wrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);gap:48px;align-items:center;padding-block:56px 64px}
+.hero-copy{display:flex;flex-direction:column;gap:20px;min-width:0}
+.hero-copy .lede{font-size:1.12rem;color:var(--muted);max-width:34em}
+.hero-actions{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+.fine{font-size:.85rem;color:var(--muted)}
+
+/* demo sheet */
+.demo{min-width:0;background:var(--sheet);border:1px solid var(--rule);border-radius:10px;box-shadow:0 18px 40px -24px rgba(16,32,43,.35)}
+.demo-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid var(--rule)}
+.file{font:500 .82rem/1.2 var(--mono);color:var(--muted);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.seg{display:inline-flex;border:1px solid var(--rule);border-radius:6px;overflow:hidden}
+.seg button{font:600 .82rem/1 var(--body);padding:8px 12px;border:0;background:transparent;color:var(--muted);cursor:pointer}
+.seg button[aria-selected="true"]{background:var(--accent);color:var(--sheet)}
+.grid-scroll{overflow-x:auto}
+table.sheet{border-collapse:collapse;width:100%;min-width:520px;font:400 .8rem/1.35 var(--mono);font-variant-numeric:tabular-nums}
+.sheet th,.sheet td{border:1px solid var(--rule);padding:6px 8px;text-align:left;white-space:nowrap}
+.sheet thead th{background:var(--gridhead);color:var(--muted);font-weight:500;text-align:center}
+.sheet td.rn{background:var(--gridhead);color:var(--muted);text-align:center;width:2.4em}
+.sheet tr.is-header td:not(.rn){background:var(--mark-soft);font-weight:500}
+.sheet tr.is-header td.rn{background:var(--mark);color:var(--ink)}
+.sheet tr.is-skip td:not(.rn){color:var(--skip);text-decoration:line-through}
+.sheet td.bad{background:var(--bad-soft);color:var(--bad);position:relative}
+.sheet td.fixed{color:var(--good)}
+.sheet td.num{text-align:right}
+.chip{display:inline-block;font:500 .7rem/1 var(--mono);padding:4px 6px;border-radius:4px;background:var(--accent);color:var(--sheet)}
+.demo-notes{display:flex;flex-direction:column;gap:6px;padding:12px;border-top:1px solid var(--rule);font-size:.86rem;color:var(--muted);min-height:6.2em}
+.demo-notes b{color:var(--ink);font-weight:600}
+.note-row{display:flex;gap:8px;align-items:baseline}
+.ref{font:500 .78rem/1 var(--mono);color:var(--accent);flex:none;min-width:3.2em}
+
+/* playground */
+.drop{display:flex;flex-direction:column;align-items:center;gap:12px;text-align:center;padding:28px 16px;border:2px dashed var(--rule);border-radius:10px;background:var(--sheet)}
+.drop.over{border-color:var(--accent)}
+.drop-actions{display:flex;flex-wrap:wrap;gap:10px;justify-content:center}
+.summary{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0 12px}
+.tag{font:500 .8rem/1.2 var(--mono);padding:6px 9px;border-radius:4px;border:1px solid var(--rule);background:var(--sheet);color:var(--muted)}
+.tag.good{color:var(--good)}
+.tag.bad{color:var(--bad)}
+.tag.warn{color:var(--warn)}
+.result-grid{max-height:440px;overflow:auto;border:1px solid var(--rule);border-radius:8px;background:var(--sheet)}
+.result-grid table.sheet{min-width:0}
+.sheet th .type{display:block;font-size:.68rem;font-weight:400;color:var(--muted);margin-top:3px}
+.sheet td.warn{background:var(--warn-soft);color:var(--warn)}
+.sheet td[contenteditable="true"]{cursor:text}
+.result-actions{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:12px}
+
+/* problems ledger */
+section{padding-block:56px}
+.sec-head{display:flex;flex-direction:column;gap:12px;max-width:44em;margin-bottom:28px}
+.sec-head p{color:var(--muted)}
+.ledger{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border-top:1px solid var(--rule)}
+.ledger div{display:grid;grid-template-columns:4.2em minmax(0,1fr);gap:12px;padding:16px 8px 16px 0;border-bottom:1px solid var(--rule)}
+.ledger div:nth-child(odd){padding-right:24px}
+.ledger .ref{font-size:.85rem;padding-top:2px}
+.ledger b{display:block;font-weight:600}
+.ledger span{color:var(--muted);font-size:.93rem}
+
+/* steps */
+.steps{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px}
+.step{display:flex;flex-direction:column;gap:10px;min-width:0}
+.step .n{font:700 .8rem/1 var(--mono);color:var(--accent)}
+.step p{color:var(--muted);font-size:.95rem}
+pre.code{margin:24px 0 0;padding:18px;background:var(--sheet);border:1px solid var(--rule);border-radius:8px;overflow-x:auto;font:400 .82rem/1.6 var(--mono);color:var(--ink)}
+.code .k{color:var(--accent)}
+.code .s{color:var(--good)}
+.code .c{color:var(--muted)}
+
+/* privacy band */
+.band{background:var(--sheet);border-block:1px solid var(--rule)}
+.band .wrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:40px;align-items:start}
+.facts{display:flex;flex-direction:column;gap:14px;margin:0;padding:0;list-style:none}
+.facts li{display:grid;grid-template-columns:1.4em minmax(0,1fr);gap:8px}
+.facts li::before{content:"✓";color:var(--good);font-weight:700}
+
+/* pricing */
+.plans{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px}
+.plan{display:flex;flex-direction:column;gap:14px;padding:24px;border:1px solid var(--rule);border-radius:10px;background:var(--sheet);min-width:0}
+.plan.pro{border-color:var(--accent);border-width:2px}
+.price{font:800 2.2rem/1 var(--display)}
+.price small{font:500 .9rem/1 var(--body);color:var(--muted)}
+.plan ul{margin:0;padding-left:1.1em;display:flex;flex-direction:column;gap:6px;font-size:.95rem}
+.plan .fine{margin-top:auto}
+
+/* waitlist */
+.join .wrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:40px;align-items:start}
+form{display:flex;flex-direction:column;gap:16px;background:var(--sheet);border:1px solid var(--rule);border-radius:10px;padding:24px;min-width:0}
+label{display:flex;flex-direction:column;gap:6px;font-weight:600;font-size:.92rem}
+input[type=email],input[type=text],select{font:400 1rem/1.3 var(--body);padding:11px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);width:100%}
+fieldset{border:0;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+legend{font-weight:600;font-size:.92rem;margin-bottom:6px}
+.radio{display:flex;flex-direction:row;align-items:center;gap:8px;font-weight:400}
+.form-msg{font-size:.9rem;color:var(--muted)}
+.form-msg.err{color:var(--bad)}
+.form-msg.ok{color:var(--good)}
+
+/* faq */
+.faq{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px 40px;max-width:960px}
+.faq div{display:flex;flex-direction:column;gap:6px}
+.faq p{color:var(--muted);font-size:.95rem}
+
+footer{border-top:1px solid var(--rule)}
+footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;padding-block:24px;font-size:.85rem;color:var(--muted)}
+
+@media (max-width: 860px){
+  .hero .wrap,.band .wrap,.join .wrap{grid-template-columns:minmax(0,1fr);gap:32px}
+  .ledger,.plans,.faq{grid-template-columns:minmax(0,1fr)}
+  .plans{max-width:560px}
+  .ledger div:nth-child(odd){padding-right:8px}
+  .steps{grid-template-columns:minmax(0,1fr)}
+  .hero .wrap{padding-block:36px 48px}
+}
+@media (prefers-reduced-motion: no-preference){
+  .sheet td{transition:background-color .25s ease,color .25s ease}
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="logo" href="#top" aria-label="SheetSift home">
+      <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+        <rect x="1" y="1" width="24" height="24" rx="4" fill="none" stroke="currentColor" stroke-width="2"/>
+        <path d="M1 9h24M9 9v16" stroke="currentColor" stroke-width="2"/>
+        <rect x="11" y="12" width="12" height="4" fill="var(--mark)"/>
+      </svg>
+      SheetSift
+    </a>
+    <div style="display:flex;gap:12px;align-items:center">
+      <span class="pill">Early access</span>
+      <a class="btn ghost" href="#waitlist">Join the waitlist</a>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+  <section class="hero" style="padding-block:0">
+    <div class="wrap">
+      <div class="hero-copy">
+        <span class="eyebrow">Embeddable importer for React apps</span>
+        <h1>Messy spreadsheets in. Clean rows out.</h1>
+        <p class="lede">SheetSift is a drop-in import screen for the Excel and CSV files your customers actually send. It finds the table, matches the columns and flags what needs fixing. It runs inside your app, so files never leave it, and it costs less than $1,000 a year.</p>
+        <div class="hero-actions">
+          <a class="btn" href="#waitlist">Get early access</a>
+          <span class="fine">One npm package. No servers, no per-import fees.</span>
+        </div>
+      </div>
+
+      <div class="demo" aria-label="Example import">
+        <div class="demo-bar">
+          <span class="file">customer_export_FINAL(2).xlsx</span>
+          <div class="seg" role="tablist" aria-label="Show file">
+            <button id="tab-before" role="tab" aria-selected="true" type="button">As uploaded</button>
+            <button id="tab-after" role="tab" aria-selected="false" type="button">After SheetSift</button>
+          </div>
+        </div>
+        <div class="grid-scroll">
+          <table class="sheet" id="sheet"></table>
+        </div>
+        <div class="demo-notes" id="notes" aria-live="polite"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="try">
+    <div class="wrap" style="display:block">
+      <div class="sec-head">
+        <span class="eyebrow">Try it now</span>
+        <h2>Drop in your messiest file</h2>
+        <p>This is the SheetSift engine running in your browser. Your file is read on this page and is never uploaded anywhere.</p>
+      </div>
+      <div class="drop" id="drop">
+        <input type="file" id="file" accept=".csv,.tsv,.txt,.xlsx,.xls" hidden>
+        <p><b>Drop a CSV or Excel file here</b></p>
+        <div class="drop-actions">
+          <button class="btn" type="button" id="pick">Choose a file</button>
+          <button class="btn ghost" type="button" id="sample">Load the messy sample</button>
+        </div>
+        <p class="fine">Shows up to 100 rows. Nothing leaves your browser.</p>
+      </div>
+      <div id="result">
+        <div class="summary" id="summary" aria-live="polite"></div>
+        <div class="grid-scroll result-grid"><table class="sheet" id="out"></table></div>
+        <div class="result-actions">
+          <button class="btn ghost" id="dl" type="button">Download clean CSV</button>
+          <span class="fine">Click a red or amber cell to fix it.</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <div class="sec-head">
+        <span class="eyebrow">What it handles</span>
+        <h2>The six problems behind most failed imports</h2>
+        <p>Most importers assume a clean CSV with headers on row 1. SheetSift handles the common ways real files differ, and does nothing else.</p>
+      </div>
+      <div class="ledger">
+        <div><span class="ref">A3</span><p><b>Header row is not row 1</b><span>Title lines and blank rows above the table are detected and skipped.</span></p></div>
+        <div><span class="ref">A7</span><p><b>Totals rows</b><span>A “Total” row at the bottom is recognised and kept out of your database.</span></p></div>
+        <div><span class="ref">B3</span><p><b>Column names that don't match</b><span>“E-mail”, “Email address” and “mail” all map to your email field automatically.</span></p></div>
+        <div><span class="ref">C4:C6</span><p><b>Mixed date formats</b><span>2026/04/03, 03.04.2026 and Apr 3 2026 become one ISO date.</span></p></div>
+        <div><span class="ref">E5</span><p><b>Decimal commas</b><span>49,00 and 1,234.56 are read correctly for the user's locale.</span></p></div>
+        <div><span class="ref">B6</span><p><b>Cell-level fixes</b><span>Users correct flagged cells in place before anything is submitted.</span></p></div>
+      </div>
+    </div>
+  </section>
+
+  <section style="padding-top:0">
+    <div class="wrap">
+      <div class="sec-head">
+        <span class="eyebrow">How it works</span>
+        <h2>Three steps to a working import screen</h2>
+      </div>
+      <div class="steps">
+        <div class="step"><span class="n">Step 1</span><h3>Install the component</h3><p>One npm package. Works with any React app and your existing design tokens.</p></div>
+        <div class="step"><span class="n">Step 2</span><h3>Describe your columns</h3><p>Field names, types, required fields and your own validation functions.</p></div>
+        <div class="step"><span class="n">Step 3</span><h3>Receive clean rows</h3><p>A typed array of validated records, plus a report of what was skipped and why.</p></div>
+      </div>
+<pre class="code"><span class="k">import</span> { SheetSift } <span class="k">from</span> <span class="s">"sheetsift"</span>
+
+&lt;SheetSift
+  fields={[
+    { key: <span class="s">"name"</span>,  label: <span class="s">"Full name"</span>, required: <span class="k">true</span> },
+    { key: <span class="s">"email"</span>, type: <span class="s">"email"</span> },
+    { key: <span class="s">"signed_up_at"</span>, type: <span class="s">"date"</span> },
+    { key: <span class="s">"mrr"</span>,   type: <span class="s">"number"</span> },
+  ]}
+  onComplete={(rows) =&gt; saveCustomers(rows)}  <span class="c">// runs in your app, on your servers</span>
+/&gt;</pre>
+      <p class="fine" style="margin-top:10px">Planned API. Details may change before release.</p>
+    </div>
+  </section>
+
+  <section class="band">
+    <div class="wrap">
+      <div class="sec-head" style="margin-bottom:0">
+        <span class="eyebrow">Self-hosted by design</span>
+        <h2>No per-import fees. No customer data in someone else's cloud.</h2>
+        <p>Hosted import services usually charge by the import or by the month, and route your customers' files through their servers. SheetSift parses files in the browser and hands the result to your code.</p>
+      </div>
+      <ul class="facts">
+        <li><span>Files are read in the user's browser and handed straight to your code.</span></li>
+        <li><span>Nothing is sent to SheetSift. No tracking, no account, no server to run.</span></li>
+        <li><span>Fits security reviews that rule out third-party data processors.</span></li>
+        <li><span>One annual license per company, not per import or per end user.</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <div class="sec-head">
+        <span class="eyebrow">Planned pricing</span>
+        <h2>Every feature on both plans. Pay when you go to production.</h2>
+      </div>
+      <div class="plans">
+        <div class="plan">
+          <h3>Free</h3>
+          <div class="price">$0 <small>forever</small></div>
+          <ul>
+            <li>All six fixes above</li>
+            <li>CSV and XLSX</li>
+            <li>Up to 100 rows per import</li>
+            <li>Small “Powered by SheetSift” label</li>
+            <li>Free key sent to your email</li>
+          </ul>
+          <p class="fine">Unlimited use in development and testing.</p>
+        </div>
+        <div class="plan pro">
+          <h3>Pro</h3>
+          <div class="price">$990 <small>per product / year</small></div>
+          <ul>
+            <li>Unlimited rows</li>
+            <li>No label, your own colors and wording</li>
+            <li>All updates for the year</li>
+            <li>Bug fixes for the year, reported by email</li>
+            <li>Pay by card, license key by email in minutes</li>
+            <li>30-day refund, no questions asked</li>
+          </ul>
+          <p class="fine"><b>Founding price for the first 20 waitlist teams: $490 for the first year.</b></p>
+        </div>
+        <div class="plan">
+          <h3>Unlimited</h3>
+          <div class="price">$2,990 <small>per company / year</small></div>
+          <ul>
+            <li>Everything in Pro</li>
+            <li>Use it in any number of products</li>
+            <li>Ship it inside apps you build for your clients</li>
+          </ul>
+          <p class="fine">For agencies and companies with several products. Pro covers one product.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="join band" id="waitlist">
+    <div class="wrap">
+      <div class="sec-head">
+        <span class="eyebrow">Early access</span>
+        <h2>Tell us about your import problem</h2>
+        <p>SheetSift is being built now. Join the list to get the beta, and tell us what your users upload so we build the right thing first. We'll email you only about SheetSift.</p>
+      </div>
+      <!-- FormSubmit: replace the email address with the random key sent after the one-time email confirmation. -->
+      <form id="wl" action="https://formsubmit.co/ajax/ika138669@gmail.com" method="POST">
+        <input type="hidden" name="_subject" value="SheetSift waitlist signup">
+        <input type="hidden" name="_template" value="table">
+        <input type="text" name="_honey" tabindex="-1" autocomplete="off" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0">
+        <label for="email">Work email
+          <input id="email" name="email" type="email" required autocomplete="email" placeholder="you@company.com">
+        </label>
+        <label for="product">What does your product do?
+          <input id="product" name="product" type="text" placeholder="e.g. CRM for dental clinics">
+        </label>
+        <label for="current">How do customers import data today?
+          <select id="current" name="current_solution">
+            <option value="">Choose one</option>
+            <option>We built our own importer</option>
+            <option>Flatfile, OneSchema, Dromo or similar</option>
+            <option>A free open-source component</option>
+            <option>We ask them to email files to support</option>
+            <option>No import feature yet</option>
+          </select>
+        </label>
+        <label for="framework">Frontend framework
+          <select id="framework" name="framework">
+            <option value="">Choose one</option>
+            <option>React / Next.js</option>
+            <option>Vue / Nuxt</option>
+            <option>Angular</option>
+            <option>Svelte</option>
+            <option>Other</option>
+          </select>
+        </label>
+        <fieldset>
+          <legend>Would your team pay $990 a year for Pro?</legend>
+          <label class="radio" for="pay-yes"><input id="pay-yes" type="radio" name="would_pay" value="yes"> Yes, if it handles our files</label>
+          <label class="radio" for="pay-maybe"><input id="pay-maybe" type="radio" name="would_pay" value="maybe"> Maybe, at a different price</label>
+          <label class="radio" for="pay-biz"><input id="pay-biz" type="radio" name="would_pay" value="unlimited"> Yes, and we'd need Unlimited</label>
+          <label class="radio" for="pay-no"><input id="pay-no" type="radio" name="would_pay" value="no"> No, the free plan is enough</label>
+        </fieldset>
+        <label for="mess">The messiest file a customer sent you (optional)
+          <input id="mess" name="messiest_file" type="text" placeholder="e.g. bank export with totals every 50 rows">
+        </label>
+        <button class="btn" type="submit">Join the waitlist</button>
+        <p class="form-msg" id="form-msg" role="status"></p>
+      </form>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <div class="faq">
+        <div><h3>Is SheetSift available now?</h3><p>Not yet. It is in development, and waitlist members will be invited to the beta first.</p></div>
+        <div><h3>Which frameworks are supported?</h3><p>React. SheetSift deliberately does one job in one framework so it stays small and dependable.</p></div>
+        <div><h3>What if we stop paying?</h3><p>The last version you paid for keeps working in production. There is no remote kill switch and no phone-home check. You only lose new updates and support.</p></div>
+        <div><h3>Do I need a sales call or a purchase order?</h3><p>No. You buy by card on the website and the license key arrives by email. Pro covers one product; Unlimited covers every product your company builds.</p></div>
+        <div><h3>What support is included?</h3><p>Bug reports by email, with fixes shipped in regular updates. Setup questions are answered in the docs, which grow from the questions people ask. There are no calls or custom development.</p></div>
+        <div><h3>Who is behind SheetSift?</h3><p>An independent developer building focused tools for SaaS teams.</p></div>
+        <div><h3>What happens to my answers?</h3><p>They are used only to decide what to build and to contact you about the beta. Ask anytime and we'll delete them.</p></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>SheetSift · early access</span>
+    <span>Product names mentioned belong to their owners.</span>
+  </div>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script>
+/* SheetSift engine (prototype). Pure functions, no network access. */
+window.SheetSiftEngine = (function(){
+  var MONTHS = {jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12};
+  var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+  function str(v){ return v == null ? "" : String(v); }
+  function isTotalLabel(s){
+    s = str(s).trim();
+    return /^(grand\s+)?(sub-?)?totals?\b/i.test(s) || /^(sum|summe|gesamt)\b/i.test(s) || /^(合計|小計|総計)/.test(s);
+  }
+
+  function pickDelimiter(text){
+    var lines = text.split(/\r?\n/).filter(function(l){ return l.trim(); }).slice(0, 30);
+    var best = ",", bestScore = -1;
+    [",", ";", "\t", "|"].forEach(function(d){
+      var counts = lines.map(function(l){ return countOutsideQuotes(l, d); });
+      var freq = {};
+      counts.forEach(function(c){ if (c > 0) freq[c] = (freq[c] || 0) + 1; });
+      var score = 0;
+      Object.keys(freq).forEach(function(k){ if (freq[k] > score) score = freq[k]; });
+      if (score > bestScore){ bestScore = score; best = d; }
+    });
+    return best;
+  }
+  function countOutsideQuotes(line, d){
+    var n = 0, q = false;
+    for (var i = 0; i < line.length; i++){
+      if (line[i] === '"') q = !q;
+      else if (!q && line[i] === d) n++;
+    }
+    return n;
+  }
+  function parseCSV(text){
+    text = text.replace(/^﻿/, "");
+    var d = pickDelimiter(text), rows = [], row = [], f = "", q = false;
+    for (var i = 0; i < text.length; i++){
+      var c = text[i];
+      if (q){
+        if (c === '"'){ if (text[i + 1] === '"'){ f += '"'; i++; } else q = false; }
+        else f += c;
+      } else if (c === '"') q = true;
+      else if (c === d){ row.push(f); f = ""; }
+      else if (c === "\n" || c === "\r"){
+        if (c === "\r" && text[i + 1] === "\n") i++;
+        row.push(f); rows.push(row); row = []; f = "";
+      } else f += c;
+    }
+    if (f !== "" || row.length){ row.push(f); rows.push(row); }
+    return rows;
+  }
+
+  function looksNumericOrDate(s){ return /^[\d\s.,\-\/:¥$€£%()年月日]+$/.test(s); }
+  function detectHeader(grid){
+    var best = -1, bestScore = 0;
+    for (var i = 0; i < Math.min(grid.length, 15); i++){
+      var cells = grid[i].map(function(s){ return str(s).trim(); }).filter(Boolean);
+      if (cells.length < 2) continue;
+      var texty = cells.filter(function(s){ return !looksNumericOrDate(s) && s.indexOf("@") < 0; }).length;
+      var uniq = {}; cells.forEach(function(s){ uniq[s.toLowerCase()] = 1; });
+      if (texty < cells.length * 0.8 || Object.keys(uniq).length < cells.length) continue;
+      if (cells.length > bestScore){ bestScore = cells.length; best = i; }
+    }
+    return best < 0 ? 0 : best;
+  }
+
+  function validDay(y, m, d){
+    if (m < 1 || m > 12 || d < 1) return false;
+    return d <= new Date(Date.UTC(y, m, 0)).getUTCDate();
+  }
+  function iso(y, m, d){ return y + "-" + String(m).padStart(2, "0") + "-" + String(d).padStart(2, "0"); }
+  function yr(s){ var n = +s; return s.length === 2 ? 2000 + n : n; }
+  function parseDateParts(s){
+    s = str(s).trim(); var m;
+    if ((m = s.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?$/))) return {y:+m[1], m:+m[2], d:+m[3]};
+    if ((m = s.match(/^(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日$/))) return {y:+m[1], m:+m[2], d:+m[3]};
+    if ((m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})$/))) return {y:yr(m[3]), m:+m[2], d:+m[1]};
+    if ((m = s.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{2}|\d{4})$/))) return {y:yr(m[3]), p:+m[1], q:+m[2], amb:true};
+    if ((m = s.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})$/)) && MONTHS[m[1].slice(0,3).toLowerCase()]) return {y:+m[3], m:MONTHS[m[1].slice(0,3).toLowerCase()], d:+m[2]};
+    if ((m = s.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})$/)) && MONTHS[m[2].slice(0,3).toLowerCase()]) return {y:+m[3], m:MONTHS[m[2].slice(0,3).toLowerCase()], d:+m[1]};
+    return null;
+  }
+  function dateOrderFor(values){
+    var dayFirst = false, monthFirst = false;
+    values.forEach(function(v){
+      var p = parseDateParts(v);
+      if (p && p.amb){ if (p.p > 12) dayFirst = true; if (p.q > 12) monthFirst = true; }
+    });
+    if (dayFirst && !monthFirst) return "dmy";
+    if (monthFirst && !dayFirst) return "mdy";
+    return null;
+  }
+  function normDate(v, order){
+    var p = parseDateParts(v);
+    if (!p) return {status:"bad", value:v, msg:"Not a date we can read"};
+    if (p.amb){
+      if (!order){
+        if (p.p === p.q && validDay(p.y, p.p, p.q)) return {status:"fixed", value:iso(p.y, p.p, p.q)};
+        return {status:"warn", value:v, msg:"Ambiguous: day/month or month/day? Nothing else in this column decides it."};
+      }
+      p = order === "dmy" ? {y:p.y, m:p.q, d:p.p} : {y:p.y, m:p.p, d:p.q};
+    }
+    if (!validDay(p.y, p.m, p.d)) return {status:"bad", value:v, msg:"This date does not exist"};
+    return {status:"fixed", value:iso(p.y, p.m, p.d)};
+  }
+
+  function cleanNum(s){
+    var t = str(s).trim().replace(/[\s ]/g, "").replace(/^[¥$€£]/, "").replace(/(円|[¥$€£]|EUR|USD|JPY)$/i, "");
+    var neg = false;
+    if (/^\(.*\)$/.test(t)){ neg = true; t = t.slice(1, -1); }
+    if (t[0] === "-"){ neg = true; t = t.slice(1); }
+    return {t:t, neg:neg};
+  }
+  function isEuropean(values){
+    return values.some(function(v){ var t = cleanNum(v).t; return /^\d+(\.\d{3})*,\d{1,2}$/.test(t); });
+  }
+  function parseNumber(s, eu){
+    var c = cleanNum(s), t = c.t, v;
+    if (!/^[\d.,]+$/.test(t) || !/\d/.test(t)) return null;
+    var hasC = t.indexOf(",") > -1, hasD = t.indexOf(".") > -1;
+    if (hasC && hasD){
+      v = t.lastIndexOf(",") > t.lastIndexOf(".") ? t.replace(/\./g, "").replace(",", ".") : t.replace(/,/g, "");
+    } else if (hasC){
+      if (/^\d{1,3}(,\d{3})+$/.test(t) && !eu) v = t.replace(/,/g, "");
+      else if ((t.match(/,/g) || []).length === 1) v = t.replace(",", ".");
+      else return null;
+    } else if (hasD){
+      if (/^\d{1,3}(\.\d{3})+$/.test(t) && (eu || (t.match(/\./g) || []).length > 1)) v = t.replace(/\./g, "");
+      else if ((t.match(/\./g) || []).length === 1) v = t;
+      else return null;
+    } else v = t;
+    var n = parseFloat(v);
+    if (isNaN(n)) return null;
+    return c.neg ? -n : n;
+  }
+
+  function inferType(header, values){
+    var h = str(header).toLowerCase(), n = values.length || 1;
+    var at = values.filter(function(v){ return v.indexOf("@") > -1; }).length;
+    if (/mail|メール/.test(h) ? at / n >= 0.3 : at / n >= 0.6) return "email";
+    var dates = values.filter(function(v){ return parseDateParts(v); }).length;
+    if (dates / n >= 0.7) return "date";
+    var eu = isEuropean(values);
+    var nums = values.filter(function(v){ return parseNumber(v, eu) !== null; }).length;
+    if (nums / n >= 0.8) return "number";
+    return "text";
+  }
+
+  function process(grid){
+    grid = grid.map(function(r){ return r.map(function(c){ return str(c); }); });
+    var h = detectHeader(grid), skipped = [];
+    for (var i = 0; i < h; i++) skipped.push({row:i + 1, reason: grid[i].join("").trim() ? "title above table" : "blank"});
+    var header = grid[h].map(function(s){ return s.trim(); });
+    while (header.length && !header[header.length - 1]) header.pop();
+    var width = header.length, body = [];
+    for (var r = h + 1; r < grid.length; r++){
+      var cells = grid[r].slice(0, width);
+      while (cells.length < width) cells.push("");
+      var filled = cells.filter(function(s){ return s.trim(); });
+      if (!filled.length){ skipped.push({row:r + 1, reason:"blank"}); continue; }
+      if (isTotalLabel(filled[0])){ skipped.push({row:r + 1, reason:"totals row"}); continue; }
+      var extra = grid[r].slice(width).some(function(s){ return s.trim(); });
+      body.push({row:r + 1, cells:cells, extra:extra});
+    }
+    var columns = header.map(function(name, ci){
+      var vals = body.map(function(b){ return b.cells[ci].trim(); }).filter(Boolean);
+      var type = inferType(name, vals), col = {name:name || ("Column " + (ci + 1)), type:type};
+      if (type === "date") col.order = dateOrderFor(vals);
+      if (type === "number"){
+        col.eu = isEuropean(vals);
+        col.decimals = vals.some(function(v){ var n = parseNumber(v, col.eu); return n !== null && n % 1 !== 0; }) || col.eu;
+      }
+      if (type === "text"){
+        var variants = {};
+        vals.forEach(function(v){ var k = v.toLowerCase(); (variants[k] = variants[k] || {})[v] = (variants[k][v] || 0) + 1; });
+        if (Object.keys(variants).length <= 12 && vals.length >= 4){
+          col.canon = {};
+          Object.keys(variants).forEach(function(k){
+            var best = null, bc = -1;
+            Object.keys(variants[k]).forEach(function(v){
+              var c = variants[k][v] + (/^[A-Z]/.test(v) ? 0.5 : 0);
+              if (c > bc){ bc = c; best = v; }
+            });
+            col.canon[k] = best;
+          });
+        }
+      }
+      return col;
+    });
+    var rows = body.map(function(b){
+      var cells = b.cells.map(function(v, ci){ return cell(columns[ci], v); });
+      if (b.extra){
+        var last = cells[cells.length - 1];
+        last.status = "warn";
+        last.msg = "This row has more values than there are columns. A value may contain an unquoted comma.";
+      }
+      return {row:b.row, cells:cells};
+    });
+    var counts = {fixed:0, bad:0, warn:0};
+    rows.forEach(function(r){ r.cells.forEach(function(c){ if (counts[c.status] !== undefined) counts[c.status]++; }); });
+    return {headerRow:h + 1, skipped:skipped, columns:columns, rows:rows, counts:counts};
+  }
+
+  function cell(col, raw){
+    var v = str(raw).trim(), out;
+    if (!v) return {orig:raw, value:"", status:"ok"};
+    if (col.type === "email"){
+      var e = v.toLowerCase();
+      if (!EMAIL_RE.test(e)) return {orig:raw, value:v, status:"bad", msg:"Not a complete email address"};
+      out = {value:e};
+    } else if (col.type === "date"){
+      var d = normDate(v, col.order);
+      if (d.status !== "fixed") return {orig:raw, value:d.value, status:d.status, msg:d.msg};
+      out = {value:d.value};
+    } else if (col.type === "number"){
+      var n = parseNumber(v, col.eu);
+      if (n === null) return {orig:raw, value:v, status:"bad", msg:"Not a number"};
+      out = {value: col.decimals ? n.toFixed(2) : String(n)};
+    } else {
+      out = {value: col.canon ? col.canon[v.toLowerCase()] : v};
+    }
+    out.orig = raw;
+    out.status = out.value === raw ? "ok" : "fixed";
+    return out;
+  }
+
+  function toCSV(result){
+    function q(s){ s = str(s); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }
+    var lines = [result.columns.map(function(c){ return q(c.name); }).join(",")];
+    result.rows.forEach(function(r){ lines.push(r.cells.map(function(c){ return q(c.value); }).join(",")); });
+    return lines.join("\n");
+  }
+
+  return {parseCSV:parseCSV, process:process, cell:cell, toCSV:toCSV, parseNumber:parseNumber, parseDateParts:parseDateParts};
+})();
+
+/* Playground UI */
+(function(){
+  var E = window.SheetSiftEngine;
+  var SAMPLE = [
+    "Acme Corp - Customer export (do not edit),,,,",
+    ",,,,",
+    "Name,E-mail,Signup date,Plan,MRR",
+    "Yui Tanaka,yui@example.jp,2026/04/03,Pro,49",
+    "Lena Hoffmann,lena@example.de,03.04.2026,pro ,\"49,00\"",
+    "Sam Ortiz,sam@example,Apr 3 2026,Team,129",
+    "Priya Shah,PRIYA@EXAMPLE.COM,2026年4月5日,team,\"1,290.50\"",
+    "Tom Becker,tom@example.com,04/05/2026,Pro,49",
+    ",,,,",
+    "Total,,,,1566.5"
+  ].join("\n");
+  var current = null, MAX = 100;
+  var out = document.getElementById("out"), summary = document.getElementById("summary");
+
+  function esc(s){ var d = document.createElement("span"); d.textContent = s == null ? "" : String(s); return d.innerHTML; }
+  function tag(cls, text){ return "<span class='tag " + cls + "'>" + esc(text) + "</span>"; }
+
+  function render(res, name){
+    current = res;
+    var s = tag("", name);
+    s += tag("good", "Header found on row " + res.headerRow);
+    if (res.skipped.length) s += tag("", res.skipped.length + " rows skipped (" + uniqueReasons(res.skipped) + ")");
+    s += tag("good", res.counts.fixed + " cells cleaned");
+    if (res.counts.warn) s += tag("warn", res.counts.warn + " need a decision");
+    if (res.counts.bad) s += tag("bad", res.counts.bad + " need a fix");
+    if (res.rows.length > MAX) s += tag("", "Showing " + MAX + " of " + res.rows.length + " rows");
+    summary.innerHTML = s;
+
+    var h = "<thead><tr><th scope='col'>Row</th>";
+    res.columns.forEach(function(c){ h += "<th scope='col'>" + esc(c.name) + "<span class='type'>" + c.type + (c.eu ? " · decimal comma" : "") + (c.order ? " · " + c.order : "") + "</span></th>"; });
+    h += "</tr></thead><tbody>";
+    res.rows.slice(0, MAX).forEach(function(r, ri){
+      h += "<tr><td class='rn'>" + r.row + "</td>";
+      r.cells.forEach(function(c, ci){
+        var cls = c.status === "fixed" ? "fixed" : c.status === "bad" ? "bad" : c.status === "warn" ? "warn" : "";
+        var edit = (c.status === "bad" || c.status === "warn") ? " contenteditable='true' data-r='" + ri + "' data-c='" + ci + "'" : "";
+        var title = c.msg ? c.msg : (c.status === "fixed" ? "Was: " + c.orig : "");
+        h += "<td class='" + cls + (res.columns[ci].type === "number" ? " num" : "") + "' title='" + esc(title) + "'" + edit + ">" + esc(c.value) + "</td>";
+      });
+      h += "</tr>";
+    });
+    out.innerHTML = h + "</tbody>";
+  }
+  function uniqueReasons(sk){
+    var seen = {}; sk.forEach(function(s){ seen[s.reason] = 1; }); return Object.keys(seen).join(", ");
+  }
+
+  out.addEventListener("keydown", function(e){
+    if (e.key === "Enter" && e.target.isContentEditable){ e.preventDefault(); e.target.blur(); }
+  });
+  out.addEventListener("focusout", function(e){
+    var td = e.target; if (!td.isContentEditable || !current) return;
+    var r = +td.getAttribute("data-r"), c = +td.getAttribute("data-c");
+    var fixed = E.cell(current.columns[c], td.textContent);
+    if (fixed.status === "ok") fixed.status = "fixed";
+    current.rows[r].cells[c] = fixed;
+    current.counts = {fixed:0, bad:0, warn:0};
+    current.rows.forEach(function(row){ row.cells.forEach(function(x){ if (current.counts[x.status] !== undefined) current.counts[x.status]++; }); });
+    render(current, lastName);
+  });
+
+  var lastName = "messy-sample.csv";
+  function runGrid(grid, name){
+    lastName = name;
+    try { render(E.process(grid), name); }
+    catch (err){ summary.innerHTML = tag("bad", "We couldn't find a table in " + name + ". Try another file."); out.innerHTML = ""; }
+  }
+  function readFile(f){
+    if (!f) return;
+    if (/\.(xlsx|xls)$/i.test(f.name)){
+      if (!window.XLSX){ summary.innerHTML = tag("bad", "Excel support didn't load. Try a CSV file."); return; }
+      f.arrayBuffer().then(function(buf){
+        var wb = XLSX.read(buf, {type:"array", cellDates:true, dateNF:"yyyy-mm-dd"});
+        var ws = wb.Sheets[wb.SheetNames[0]];
+        runGrid(XLSX.utils.sheet_to_json(ws, {header:1, raw:false, defval:"", dateNF:"yyyy-mm-dd"}), f.name);
+      });
+    } else {
+      f.text().then(function(t){ runGrid(E.parseCSV(t), f.name); });
+    }
+  }
+
+  var input = document.getElementById("file"), drop = document.getElementById("drop");
+  document.getElementById("pick").addEventListener("click", function(){ input.click(); });
+  input.addEventListener("change", function(){ readFile(input.files[0]); input.value = ""; });
+  document.getElementById("sample").addEventListener("click", function(){ runGrid(E.parseCSV(SAMPLE), "messy-sample.csv"); });
+  ["dragenter", "dragover"].forEach(function(ev){ drop.addEventListener(ev, function(e){ e.preventDefault(); drop.classList.add("over"); }); });
+  ["dragleave", "drop"].forEach(function(ev){ drop.addEventListener(ev, function(e){ e.preventDefault(); drop.classList.remove("over"); }); });
+  drop.addEventListener("drop", function(e){ readFile(e.dataTransfer.files[0]); });
+  document.getElementById("dl").addEventListener("click", function(){
+    if (!current) return;
+    var blob = new Blob([E.toCSV(current)], {type:"text/csv"});
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = lastName.replace(/\.\w+$/, "") + "-clean.csv";
+    document.body.appendChild(a); a.click(); a.remove();
+  });
+
+  runGrid(E.parseCSV(SAMPLE), "messy-sample.csv");
+  window.__sheetsiftSample = SAMPLE;
+})();
+</script>
+<script>
+(function(){
+  var cols = ["", "A", "B", "C", "D", "E"];
+  var before = {
+    rows: [
+      {n:1, cls:"", cells:["Acme Corp – Customer export (do not edit)", "", "", "", ""]},
+      {n:2, cls:"", cells:["", "", "", "", ""]},
+      {n:3, cls:"", cells:["Name", "E-mail", "Signup date", "Plan", "MRR"]},
+      {n:4, cls:"", cells:["Yui Tanaka", "yui@example.jp", "2026/04/03", "Pro", "49"]},
+      {n:5, cls:"", cells:["Lena Hoffmann", "lena@example.de", "03.04.2026", "pro ", "49,00"]},
+      {n:6, cls:"", cells:["Sam Ortiz", "sam@example", "Apr 3 2026", "Team", "129"]},
+      {n:7, cls:"", cells:["Total", "", "", "", "227"]}
+    ],
+    notes: [["", "<b>As uploaded.</b> Title on row 1, headers on row 3, a totals row, three date styles and a decimal comma."]]
+  };
+  var after = {
+    head: ["full_name", "email", "signed_up_at", "plan", "mrr"],
+    rows: [
+      {n:1, cls:"is-skip", cells:["Acme Corp – Customer export (do not edit)", "", "", "", ""]},
+      {n:2, cls:"is-skip", cells:["", "", "", "", ""]},
+      {n:3, cls:"is-header", cells:["Name", "E-mail", "Signup date", "Plan", "MRR"]},
+      {n:4, cls:"", cells:["Yui Tanaka", "yui@example.jp", "2026-04-03", "Pro", "49.00"], fx:[2,4]},
+      {n:5, cls:"", cells:["Lena Hoffmann", "lena@example.de", "2026-04-03", "Pro", "49.00"], fx:[2,3,4]},
+      {n:6, cls:"", cells:["Sam Ortiz", "sam@example", "2026-04-03", "Team", "129.00"], fx:[2,4], bad:[1]},
+      {n:7, cls:"is-skip", cells:["Total", "", "", "", "227"]}
+    ],
+    notes: [
+      ["A3", "<b>Header row found on row 3.</b> Rows 1, 2 and 7 skipped as title, blank and totals."],
+      ["C4:E6", "<b>7 cells normalised:</b> dates to ISO, “pro ” to Pro, 49,00 to 49.00."],
+      ["B6", "<b>1 cell needs a fix:</b> “sam@example” has no domain. The user can correct it here."]
+    ]
+  };
+  var table = document.getElementById("sheet");
+  var notes = document.getElementById("notes");
+  function esc(s){ var d=document.createElement("span"); d.textContent=s; return d.innerHTML; }
+  function render(state){
+    var isAfter = state === after;
+    var h = "<thead><tr>";
+    cols.forEach(function(c){ h += "<th scope='col'>" + c + "</th>"; });
+    h += "</tr>";
+    if (isAfter){
+      h += "<tr><th scope='row'></th>";
+      after.head.forEach(function(k){ h += "<th><span class='chip'>" + k + "</span></th>"; });
+      h += "</tr>";
+    }
+    h += "</thead><tbody>";
+    state.rows.forEach(function(r){
+      h += "<tr class='" + r.cls + "'><td class='rn'>" + r.n + "</td>";
+      if (r.n === 1){ h += "<td colspan='5'>" + esc(r.cells[0]) + "</td></tr>"; return; }
+      r.cells.forEach(function(v, i){
+        var c = [];
+        if (i === 4) c.push("num");
+        if (r.fx && r.fx.indexOf(i) > -1) c.push("fixed");
+        if (r.bad && r.bad.indexOf(i) > -1) c.push("bad");
+        h += "<td class='" + c.join(" ") + "'>" + esc(v) + "</td>";
+      });
+      h += "</tr>";
+    });
+    table.innerHTML = h + "</tbody>";
+    notes.innerHTML = state.notes.map(function(n){
+      return "<div class='note-row'><span class='ref'>" + n[0] + "</span><span>" + n[1] + "</span></div>";
+    }).join("");
+  }
+  var tb = document.getElementById("tab-before"), ta = document.getElementById("tab-after");
+  function select(which){
+    tb.setAttribute("aria-selected", which === "before");
+    ta.setAttribute("aria-selected", which === "after");
+    render(which === "after" ? after : before);
+  }
+  tb.addEventListener("click", function(){ select("before"); });
+  ta.addEventListener("click", function(){ select("after"); });
+  select("after");
+
+  var form = document.getElementById("wl"), msg = document.getElementById("form-msg");
+  form.addEventListener("submit", function(e){
+    e.preventDefault();
+    if (false){
+      msg.className = "form-msg err";
+      msg.textContent = "The signup form isn't connected yet. Please check back soon.";
+      return;
+    }
+    msg.className = "form-msg"; msg.textContent = "Sending…";
+    fetch(form.action, {method:"POST", body:new FormData(form), headers:{Accept:"application/json"}})
+      .then(function(r){
+        if (r.ok){ form.reset(); msg.className = "form-msg ok"; msg.textContent = "You're on the list. We'll email you when the beta opens."; }
+        else { throw new Error(); }
+      })
+      .catch(function(){ msg.className = "form-msg err"; msg.textContent = "That didn't go through. Check your email address and try again."; });
+  });
+})();
+</script>
+</body>
+</html>
