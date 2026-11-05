@@ -375,7 +375,8 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;
         <p>SheetSift is being built now. Join the list to get the beta, and tell us what your users upload so we build the right thing first. We'll email you only about SheetSift.</p>
       </div>
       <!-- FormSubmit: replace the email address with the random key sent after the one-time email confirmation. -->
-      <form id="wl" action="https://formsubmit.co/ajax/ika138669@gmail.com" method="POST">
+      <form id="wl" action="https://formsubmit.co/ika138669@gmail.com" method="POST">
+        <input type="hidden" name="_next" value="https://shoheitaro003.github.io/sheetsift/?joined=1#waitlist">
         <input type="hidden" name="_subject" value="SheetSift waitlist signup">
         <input type="hidden" name="_template" value="table">
         <input type="text" name="_honey" tabindex="-1" autocomplete="off" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0">
@@ -858,20 +859,12 @@ window.SheetSiftEngine = (function(){
   select("after");
 
   var form = document.getElementById("wl"), msg = document.getElementById("form-msg");
-  form.addEventListener("submit", function(e){
-    e.preventDefault();
-    if (false){
-      msg.className = "form-msg err";
-      msg.textContent = "The signup form isn't connected yet. Please check back soon.";
-      return;
-    }
+  if (/[?&]joined=1/.test(location.search)){
+    msg.className = "form-msg ok";
+    msg.textContent = "You're on the list. We'll email you when the beta opens.";
+  }
+  form.addEventListener("submit", function(){
     msg.className = "form-msg"; msg.textContent = "Sending…";
-    fetch(form.action, {method:"POST", body:new FormData(form), headers:{Accept:"application/json"}})
-      .then(function(r){
-        if (r.ok){ form.reset(); msg.className = "form-msg ok"; msg.textContent = "You're on the list. We'll email you when the beta opens."; }
-        else { throw new Error(); }
-      })
-      .catch(function(){ msg.className = "form-msg err"; msg.textContent = "That didn't go through. Check your email address and try again."; });
   });
 })();
 </script>
