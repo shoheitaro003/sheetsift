@@ -5,6 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>SheetSift</title>
 <meta name="description" content="A self-hosted React importer for the messy Excel and CSV files your customers actually send. Early access waitlist.">
+<link rel="canonical" href="https://shoheitaro003.github.io/sheetsift/">
+<meta property="og:title" content="SheetSift: messy spreadsheets in, clean rows out">
+<meta property="og:description" content="A drop-in React importer for the Excel and CSV files your customers actually send. Runs in the browser, under $1,000 a year.">
+<meta property="og:url" content="https://shoheitaro003.github.io/sheetsift/">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -64,6 +70,7 @@ header.top .wrap{display:flex;align-items:center;justify-content:space-between;g
 .logo{display:flex;align-items:center;gap:10px;font:800 1.15rem/1 var(--display);color:var(--ink);text-decoration:none}
 .logo svg{flex:none}
 @media (max-width: 520px){ .pill{display:none} }
+.navlink{font-weight:600;text-decoration:none}
 .pill{font:500 .72rem/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;padding:6px 9px;border:1px solid var(--rule);border-radius:999px;color:var(--muted)}
 .btn{display:inline-flex;align-items:center;gap:8px;font:600 .95rem/1 var(--body);padding:12px 18px;border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:var(--sheet);text-decoration:none;cursor:pointer}
 .btn.ghost{background:transparent;color:var(--accent)}
@@ -200,6 +207,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;
     </a>
     <div style="display:flex;gap:12px;align-items:center">
       <span class="pill">Early access</span>
+      <a href="blog/" class="navlink">Blog</a>
       <a class="btn ghost" href="#waitlist">Join the waitlist</a>
     </div>
   </div>
@@ -440,7 +448,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;
 
 <footer>
   <div class="wrap">
-    <span>SheetSift · early access</span>
+    <span>SheetSift · early access · <a href="blog/">Blog</a></span>
     <span>Product names mentioned belong to their owners.</span>
   </div>
 </footer>

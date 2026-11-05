@@ -1,0 +1,52 @@
+title: Why CSV importers break on real Excel files, and how to fix each case in JavaScript
+description: Six ways real customer spreadsheets differ from a clean CSV (header rows, totals, ambiguous dates, decimal commas, Excel quirks, encodings) with tested JavaScript for each.
+date: 2026-11-05
+---
+<p>Most import screens are built and tested with a CSV that someone exported from a database five minutes earlier. Headers on row 1, ISO dates, dots for decimals, UTF-8. Then the first real customer uploads <code>customer_export_FINAL(2).xlsx</code> and the import either fails or, worse, succeeds with the wrong numbers.</p>
+
+<p>This post walks through the six differences that cause most of those failures, with a small JavaScript function for each. Every code example on this page runs in our test suite, so you can copy them as they are.</p>
+
+<h2>1. The header row is not row 1</h2>
+<p>Exports from accounting tools, banks and Excel power users usually start with a title, a date range or a blank line. If your importer treats row 1 as the header, every column name is wrong.</p>
+<p>A reliable rule: scan the first rows and pick the one with the most cells that look like labels. Labels are not numbers, not dates and not email addresses, and they don't repeat.</p>
+{{code:HEADER}}
+<p>For a file whose first rows are <code>Export (do not edit)</code>, a blank line, then <code>Name, Email, Plan</code>, this returns <code>2</code>. Show the detected row to the user and let them change it. Detection is a suggestion, not a decision.</p>
+
+<h2>2. A totals row at the bottom</h2>
+<p>People add a <em>Total</em> row before exporting. If it reaches your database, you have a customer called "Total" with a revenue figure equal to everyone else combined.</p>
+{{code:TOTALS}}
+<p>Note the word boundary in the pattern: <code>Totally Fit Ltd</code> is a customer, not a totals row. Add the words your users actually write. The pattern above covers English, German and Japanese.</p>
+
+<h2>3. Dates that can be read two ways</h2>
+<p><code>04/05/2026</code> is 4 May in most of the world and 5 April in the United States. No single value can tell you which. The column can: if any value in it has a first number above 12, the column is day-first. If any has a second number above 12, it is month-first.</p>
+{{code:DATES}}
+<p>When the function returns <code>null</code>, don't guess. Leave those cells unconverted and ask the user to confirm the format once for the whole column. A wrong date that looks valid is much harder to find later than a cell flagged for review.</p>
+
+<h2>4. Decimal commas</h2>
+<p>A German or French export writes one thousand two hundred and thirty-four euros fifty as <code>1.234,50</code>. Parse that with <code>parseFloat</code> and you get <code>1.234</code>. Decide the convention per column, then parse every value the same way.</p>
+{{code:NUMBERS}}
+<p><code>usesDecimalComma</code> only returns true when it sees an unambiguous value such as <code>49,00</code> or <code>1.234,50</code>. A column that contains only <code>1,234</code> stays in the default convention, because that value is valid both ways.</p>
+
+<h2>5. Excel files are not CSV files</h2>
+<p>If you accept <code>.xlsx</code>, three details matter.</p>
+<ul>
+<li><strong>Dates.</strong> Excel stores dates as numbers. Ask the parser for formatted text, and set the date format when you <em>read</em> the workbook. Setting it only when you convert the sheet gives you <code>4/3/26</code>.</li>
+<li><strong>Empty first sheets.</strong> Workbooks often open with a cover or notes sheet. Use the first sheet that has data.</li>
+<li><strong>The library version.</strong> The <code>xlsx</code> package on the npm registry is stuck at 0.18.5, which is affected by a prototype pollution issue (CVE-2023-30533, fixed in 0.19.3) and a ReDoS issue (CVE-2024-22363, fixed in 0.20.2). SheetJS publishes current releases on its own CDN.</li>
+</ul>
+{{code:EXCEL}}
+
+<h2>6. Text encodings</h2>
+<p>CSV files from older Windows software are often not UTF-8. Reading them as UTF-8 turns <code>Café</code> into <code>Caf�</code>. Check for a byte order mark first, then try strict UTF-8, and fall back to the legacy encoding your users are most likely to have.</p>
+{{code:ENCODING}}
+
+<h2>The rule behind all six: don't guess silently</h2>
+<p>Every case above has an input that cannot be resolved automatically: a file with two plausible header rows, a date column with no value above 12, a number like <code>1,234</code>. An importer earns trust by converting what it can prove, and by showing the rest to the person who knows the data. A cell marked "needs a decision" costs your user five seconds. A silently wrong date can cost a support ticket, or a customer.</p>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer that handles these six cases and nothing else. It runs in the browser, so files never leave your app. You can drop a file into the demo on our homepage and see what it does. Nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. The functions in this post are simplified versions of the ideas it uses, and you are free to use them in your own code.</p>

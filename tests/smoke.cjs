@@ -152,6 +152,29 @@ function check(name, ok, detail) {
   }
 
   check("no script errors on the page", errors.length === 0, errors);
+
+  // 10. Blog: every page renders on a phone and every local link points to a real file
+  const root = path.resolve(__dirname, "..");
+  const pages = ["index.html", "blog/index.html"].concat(
+    fs.readdirSync(path.join(root, "blog"), { withFileTypes: true }).filter((d) => d.isDirectory())
+      .map((d) => "blog/" + d.name + "/index.html"));
+  for (const rel of pages) {
+    const file = path.join(root, rel);
+    const htmlText = fs.readFileSync(file, "utf8");
+    const hrefs = [...htmlText.matchAll(/href="([^"#:]+)(#[^"]*)?"/g)].map((m) => m[1]).filter((h) => !h.startsWith("//"));
+    const broken = hrefs.filter((h) => {
+      let target = path.resolve(path.dirname(file), h);
+      if (h.endsWith("/") || fs.existsSync(target) && fs.statSync(target).isDirectory()) target = path.join(target, "index.html");
+      return !fs.existsSync(target);
+    });
+    check(rel + ": local links resolve", broken.length === 0, broken);
+    const p3 = await browser.newPage({ viewport: { width: 375, height: 800 } });
+    const errs3 = []; p3.on("pageerror", (e) => errs3.push(String(e)));
+    await p3.goto("file://" + file); await p3.waitForTimeout(300);
+    const w3 = await p3.evaluate(() => document.documentElement.scrollWidth);
+    check(rel + ": no horizontal scroll on phone (" + w3 + ")", w3 <= 375 && errs3.length === 0, { w3, errs3 });
+    await p3.close();
+  }
   await browser.close();
   console.log(failed ? `\n${failed} check(s) failed` : "\nAll checks passed");
   process.exit(failed ? 1 : 0);

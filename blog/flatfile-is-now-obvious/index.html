@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Flatfile is now Obvious. What should teams using the Flatfile importer do? | SheetSift</title>
+<meta name="description" content="What changed when Flatfile became Obvious, what the company says about the embedded importer, and a checklist for deciding whether to stay or move.">
+<link rel="canonical" href="https://shoheitaro003.github.io/sheetsift/blog/flatfile-is-now-obvious/">
+<meta property="og:title" content="Flatfile is now Obvious. What should teams using the Flatfile importer do? | SheetSift">
+<meta property="og:description" content="What changed when Flatfile became Obvious, what the company says about the embedded importer, and a checklist for deciding whether to stay or move.">
+<meta property="og:url" content="https://shoheitaro003.github.io/sheetsift/blog/flatfile-is-now-obvious/">
+<meta property="og:site_name" content="SheetSift">
+<meta name="twitter:card" content="summary">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400&display=swap">
+<link rel="stylesheet" href="../../blog.css">
+<meta property="og:type" content="article">
+<meta property="article:published_time" content="2026-11-05">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "Flatfile is now Obvious. What should teams using the Flatfile importer do?", "description": "What changed when Flatfile became Obvious, what the company says about the embedded importer, and a checklist for deciding whether to stay or move.", "datePublished": "2026-11-05", "dateModified": "2026-11-05", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/flatfile-is-now-obvious/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="logo" href="../../"><svg width="24" height="24" viewBox="0 0 26 26" aria-hidden="true"><rect x="1" y="1" width="24" height="24" rx="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M1 9h24M9 9v16" stroke="currentColor" stroke-width="2"/><rect x="11" y="12" width="12" height="4" fill="var(--mark)"/></svg> SheetSift</a>
+  <nav class="nav"><a href="../../blog/">Blog</a><a class="btn" href="../../#try">Try the demo</a></nav>
+</div></header>
+<main><div class="wrap">
+<article>
+<h1>Flatfile is now Obvious. What should teams using the Flatfile importer do?</h1>
+<p class="meta"><time datetime="2026-11-05">2026-11-05</time></p>
+<p>If your product uses Flatfile to let customers upload spreadsheets, you have probably seen the banner: Flatfile the company is now called Obvious. This post sums up what is publicly known, what it means for an embedded importer, and how to decide whether to do anything about it.</p>
+
+<h2>What changed</h2>
+<ul>
+<li>In December 2025 the company announced that Flatfile was becoming <strong>Obvious</strong>, which is also the name of a new per-seat AI agent product (<a href="https://www.filefeed.io/blog/flatfile-is-now-obvious">FileFeed</a>).</li>
+<li>Its knowledge base states: "Flatfile the company is now Obvious. Flatfile the product remains unchanged." The company also says there is no deprecation and no change to pricing or contracts (as quoted by <a href="https://www.filefeed.io/blog/flatfile-is-now-obvious">FileFeed</a>).</li>
+<li>Flatfile is now positioned as software for data migration projects run by service teams and system integrators, with editions for NetSuite and Workday partners (<a href="https://dromo.io/blog/what-happened-to-the-flatfile-importer">Dromo</a>).</li>
+<li>Pricing is based on project volume. There is a free Starter plan; prices for Professional and Enterprise are given by sales (<a href="https://flatfile.com/pricing">Flatfile pricing</a>).</li>
+</ul>
+<p>Two of the sources above are competitors of Flatfile, as are we. Read their interpretation with that in mind, and check Flatfile's own announcements before deciding anything.</p>
+
+<h2>What it means if Flatfile is embedded in your app</h2>
+<p>Nothing breaks today. Flatfile says the product continues and contracts are unchanged, and no end-of-support date has been published. The practical question is direction. A company that moves toward large migration projects tends to invest less in the small, self-serve import screen inside a SaaS app. FileFeed reports that Flatfile's developer changelog had no entries after July 2025 and that the last <code>@flatfile/react</code> release was in November 2025. Check the current state yourself before relying on that.</p>
+<p>If the importer is a minor feature for you, staying is a reasonable choice. If customer onboarding depends on it, it is worth knowing your options before your next renewal.</p>
+
+<h2>A checklist for deciding</h2>
+<div class="table"><table>
+<thead><tr><th>Question</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td>Where are files processed?</td><td>Hosted importers route your customers' files through a third party. Some security reviews rule that out.</td></tr>
+<tr><td>How is it priced?</td><td>Per import, per month, per project or per year. Model it against your expected volume for the next two years.</td></tr>
+<tr><td>Does it handle real Excel files?</td><td>Header rows below row 1, totals rows, mixed date formats, decimal commas. Test with your three worst customer files, not a sample CSV.</td></tr>
+<tr><td>What happens with ambiguous values?</td><td>An importer that silently converts <code>04/05/2026</code> one way will be wrong for half your customers.</td></tr>
+<tr><td>How much of your validation logic moves with you?</td><td>Hooks and validators written for one vendor rarely port directly. Count them before you start.</td></tr>
+<tr><td>Is the SDK maintained?</td><td>Look at release dates and open issues for the framework package you use.</td></tr>
+</tbody></table></div>
+
+<h2>The options</h2>
+<h3>Stay on Flatfile</h3>
+<p>Lowest effort, and supported according to the company. Ask your account contact for a support timeline for the SDK version you use.</p>
+<h3>Move to another hosted importer</h3>
+<p>Dromo, OneSchema and CSVBox all offer embedded importers with a hosted backend. Pricing and data residency differ, so compare them with the checklist above.</p>
+<h3>Use an open-source component</h3>
+<p>ImportCSV (MIT frontend, AGPL backend) and HelloCSV (MIT) are maintained free options. Older components such as react-spreadsheet-import have had little activity since 2024. Open source gives you control, and you take on the maintenance.</p>
+<h3>Build your own</h3>
+<p>A basic CSV upload takes a day. Handling real customer files takes much longer. Our post on <a href="../csv-importers-real-excel-files/">why CSV importers break on real Excel files</a> lists the six cases you will need, with code.</p>
+<h3>SheetSift</h3>
+<p>SheetSift is the importer we are building: a React component that runs entirely in the browser, handles those six cases, and costs $990 a year per product. It is in early access. You can test it on your own files in the demo on our homepage.</p>
+
+<div class="cta">
+<h2>Test your worst file</h2>
+<p>Drop a real customer spreadsheet into the SheetSift demo and see what it finds. The file is read in your browser and never uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift, which competes with the products named here. Facts about Flatfile come from the linked sources as of November 2026. If anything here is out of date, email us and we will correct it.</p>
+
+</article>
+</div></main>
+<footer><div class="wrap"><span>SheetSift · a drop-in importer for messy Excel and CSV files</span><a href="../../#waitlist">Join the waitlist</a></div></footer>
+</body>
+</html>

@@ -20,8 +20,17 @@ jobs:
         run: |
           npm install --no-save playwright@1.47.2
           npx playwright install --with-deps chromium
-      - name: Test the page and the demo
+      - name: Blog output is up to date
+        run: |
+          python3 tools/build_blog.py
+          python3 tools/make_article_tests.py tests/article-examples.cjs
+          git diff --exit-code -- blog sitemap.xml tests/article-examples.cjs
+      - name: Test the page, the demo and the blog
         run: node tests/smoke.cjs
+      - name: Run every code example from the articles (SheetJS 0.20.3)
+        run: |
+          npm install --no-save https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
+          node tests/article-examples.cjs
 
   live:
     if: github.event_name != 'push'
