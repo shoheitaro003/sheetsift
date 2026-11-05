@@ -445,7 +445,8 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;
   </div>
 </footer>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"
+        onerror="var s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';document.head.appendChild(s);"></script>
 <script>
 /* SheetSift engine (prototype). Pure functions, no network access. */
 window.SheetSiftEngine = (function(){
@@ -595,7 +596,10 @@ window.SheetSiftEngine = (function(){
   }
 
   function process(grid){
-    grid = grid.map(function(r){ return r.map(function(c){ return str(c); }); });
+    grid = (grid || []).map(function(r){ return (r || []).map(function(c){ return str(c); }); });
+    if (!grid.some(function(r){ return r.join("").trim(); })){
+      return {headerRow:0, skipped:[], columns:[], rows:[], counts:{fixed:0, bad:0, warn:0}, empty:true};
+    }
     var h = detectHeader(grid), skipped = [];
     for (var i = 0; i < h; i++) skipped.push({row:i + 1, reason: grid[i].join("").trim() ? "title above table" : "blank"});
     var header = grid[h].map(function(s){ return s.trim(); });
@@ -700,7 +704,9 @@ window.SheetSiftEngine = (function(){
   var current = null, MAX = 100;
   var out = document.getElementById("out"), summary = document.getElementById("summary");
 
-  function esc(s){ var d = document.createElement("span"); d.textContent = s == null ? "" : String(s); return d.innerHTML; }
+  function esc(s){
+    return (s == null ? "" : String(s)).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
   function tag(cls, text){ return "<span class='tag " + cls + "'>" + esc(text) + "</span>"; }
 
   function render(res, name){
@@ -750,20 +756,43 @@ window.SheetSiftEngine = (function(){
   var lastName = "messy-sample.csv";
   function runGrid(grid, name){
     lastName = name;
-    try { render(E.process(grid), name); }
+    try {
+      var res = E.process(grid);
+      if (res.empty || !res.columns.length){
+        summary.innerHTML = tag("bad", name + " looks empty. Try a file with a header row and some data.");
+        out.innerHTML = ""; current = null; return;
+      }
+      render(res, name);
+    }
     catch (err){ summary.innerHTML = tag("bad", "We couldn't find a table in " + name + ". Try another file."); out.innerHTML = ""; }
   }
   function readFile(f){
     if (!f) return;
+    if (!/\.(csv|tsv|txt|xlsx|xls)$/i.test(f.name)){
+      summary.innerHTML = tag("bad", "Please choose a CSV or Excel file (.csv, .tsv, .txt, .xlsx, .xls).");
+      out.innerHTML = ""; current = null; return;
+    }
+    if (f.size > 20 * 1024 * 1024){
+      summary.innerHTML = tag("bad", "This demo reads files up to 20 MB. Try a smaller export.");
+      out.innerHTML = ""; current = null; return;
+    }
     if (/\.(xlsx|xls)$/i.test(f.name)){
       if (!window.XLSX){ summary.innerHTML = tag("bad", "Excel support didn't load. Try a CSV file."); return; }
       f.arrayBuffer().then(function(buf){
         var wb = XLSX.read(buf, {type:"array", cellDates:true, dateNF:"yyyy-mm-dd"});
-        var ws = wb.Sheets[wb.SheetNames[0]];
+        var name0 = wb.SheetNames.filter(function(n){
+          var rows = XLSX.utils.sheet_to_json(wb.Sheets[n], {header:1, defval:""});
+          return rows.some(function(r){ return r.join("").trim(); });
+        })[0] || wb.SheetNames[0];
+        var ws = wb.Sheets[name0];
         runGrid(XLSX.utils.sheet_to_json(ws, {header:1, raw:false, defval:"", dateNF:"yyyy-mm-dd"}), f.name);
+      }).catch(function(){
+        summary.innerHTML = tag("bad", "We couldn't open " + f.name + ". If it is password-protected, save an unprotected copy and try again.");
+        out.innerHTML = ""; current = null;
       });
     } else {
-      f.text().then(function(t){ runGrid(E.parseCSV(t), f.name); });
+      f.text().then(function(t){ runGrid(E.parseCSV(t), f.name); })
+        .catch(function(){ summary.innerHTML = tag("bad", "We couldn't read " + f.name + "."); out.innerHTML = ""; current = null; });
     }
   }
 
@@ -871,6 +900,10 @@ window.SheetSiftEngine = (function(){
       msg.textContent = "The signup form isn't connected yet. Please check back soon.";
       return;
     }
+    if (form.dataset.sending){ e.preventDefault(); return; }
+    form.dataset.sending = "1";
+    var btn = form.querySelector('button[type="submit"]');
+    if (btn){ btn.disabled = true; btn.textContent = "Sending…"; }
     msg.className = "form-msg"; msg.textContent = "Sending…";
   });
 })();

@@ -1,0 +1,37 @@
+name: Site checks
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 0 * * *"   # every day at 09:00 Japan time
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Playwright
+        run: |
+          npm install --no-save playwright@1.47.2
+          npx playwright install --with-deps chromium
+      - name: Test the page and the demo
+        run: node tests/smoke.cjs
+
+  live:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Public page is up
+        run: curl -fsS https://shoheitaro003.github.io/sheetsift/ | grep -q "SheetSift"
+      - name: Form service is reachable
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' https://api.web3forms.com/submit)
+          echo "Web3Forms answered $code"
+          test "$code" -lt 500
