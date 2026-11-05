@@ -374,12 +374,13 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;
         <h2>Tell us about your import problem</h2>
         <p>SheetSift is being built now. Join the list to get the beta, and tell us what your users upload so we build the right thing first. We'll email you only about SheetSift.</p>
       </div>
-      <!-- FormSubmit: replace the email address with the random key sent after the one-time email confirmation. -->
-      <form id="wl" action="https://formsubmit.co/ika138669@gmail.com" method="POST">
-        <input type="hidden" name="_next" value="https://shoheitaro003.github.io/sheetsift/?joined=1#waitlist">
-        <input type="hidden" name="_subject" value="SheetSift waitlist signup">
-        <input type="hidden" name="_template" value="table">
-        <input type="text" name="_honey" tabindex="-1" autocomplete="off" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0">
+      <!-- Web3Forms: put the access key in the access_key field. -->
+      <form id="wl" action="https://api.web3forms.com/submit" method="POST">
+        <input type="hidden" name="access_key" value="YOUR_ACCESS_KEY">
+        <input type="hidden" name="redirect" value="https://shoheitaro003.github.io/sheetsift/?joined=1#waitlist">
+        <input type="hidden" name="from_name" value="SheetSift waitlist">
+        <input type="hidden" name="subject" value="SheetSift waitlist signup">
+        <input type="checkbox" name="botcheck" tabindex="-1" autocomplete="off" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0">
         <label for="email">Work email
           <input id="email" name="email" type="email" required autocomplete="email" placeholder="you@company.com">
         </label>
@@ -863,7 +864,13 @@ window.SheetSiftEngine = (function(){
     msg.className = "form-msg ok";
     msg.textContent = "You're on the list. We'll email you when the beta opens.";
   }
-  form.addEventListener("submit", function(){
+  form.addEventListener("submit", function(e){
+    if (form.access_key.value === "YOUR_ACCESS_KEY"){
+      e.preventDefault();
+      msg.className = "form-msg err";
+      msg.textContent = "The signup form isn't connected yet. Please check back soon.";
+      return;
+    }
     msg.className = "form-msg"; msg.textContent = "Sending…";
   });
 })();
