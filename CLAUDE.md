@@ -27,11 +27,25 @@ Push only when all checks pass. Commit as `Claude <noreply@anthropic.com>`.
 - Facts about other companies need a linked source and a date. Name competitors fairly. Never claim something about them you have not read in a source.
 - No invented statistics, customers, quotes or testimonials. SheetSift is in early access: never say it has users or customers.
 - End with the demo call to action and the disclosure line ("We build SheetSift ...").
-- One post per week at most. Quality over volume.
+- At most two posts per week (Tuesday and Saturday, Japan time). Quality over volume: mass-produced pages can be treated as spam by search engines and would hurt the whole site.
+- Before publishing, revise each post in five passes and fix what each pass finds:
+  1. Facts: every claim about the world has a source you actually read; dates are current.
+  2. Code: every example is in `tools/snippets.py`, tested, and passes.
+  3. Reader: a developer can follow it without guessing; cut anything that doesn't help.
+  4. Search: the title and description say what the reader searches for, in plain words.
+  5. Fit: no claims about SheetSift users or customers; demo call to action and disclosure are present.
 
-## Weekly routine (scheduled task)
-1. **Signups.** In Gmail, search `subject:"SheetSift waitlist"`. Count all signups and those from the last 7 days. Summarise the answers (framework, current solution, would_pay, messiest file). Do not copy email addresses into the repo or any public place.
+## Daily routine (scheduled task, every morning, Japan time)
+**Every day:**
+1. **Signups.** In Gmail, search `subject:"SheetSift waitlist"`. Count all signups and those since the last run. Summarise new answers (framework, current solution, would_pay, messiest file). Do not copy email addresses into the repo or any public place.
 2. **Other mail.** Search Gmail for messages that mention SheetSift and are not waitlist notifications (questions, bug reports, GitHub failure emails). For each that needs an answer, create a Gmail draft reply. Never send email yourself.
 3. **Site health.** Check the latest GitHub Actions runs. If anything failed, find the cause, fix it, run the tests and push.
-4. **One article.** Take the top unchecked idea from `content/BACKLOG.md`, write the post following the rules above, build, test, push, and tick it off.
-5. **Report.** Update the project doc `claude/SheetSift_週次レポート.md` (newest week at the top) in Japanese: signups (total / this week), what people answered, emails drafted, fixes made, the new article, and where we stand against the decision table in `claude/SheetSift_需要検証プラン.md` (stage 1 runs 90 days from 2026-11-05; target 50 signups). If a tool was unavailable, say so in the report instead of guessing numbers.
+4. **Learn from questions.** If a question or a "messiest file" answer shows a gap, add an idea to the top of `content/BACKLOG.md`, or fix the demo if the problem is a bug (add a test for it first).
+
+**Tuesday and Saturday only:**
+5. **One article.** Take the top unchecked idea from `content/BACKLOG.md`, write the post following the rules above including the five revision passes, build, test, push, and tick it off.
+
+**Saturday only:**
+6. **Weekly report.** Update the project doc `claude/SheetSift_週次レポート.md` (newest week at the top) in Japanese: signups (total / this week), what people answered, emails drafted, fixes made, articles published, and where we stand against the decision table in `claude/SheetSift_需要検証プラン.md` (stage 1 runs 90 days from 2026-11-05; target 50 signups). If a tool was unavailable, say so instead of guessing numbers.
+
+On other days, do not write a report doc. If nothing changed, say so in one line.
