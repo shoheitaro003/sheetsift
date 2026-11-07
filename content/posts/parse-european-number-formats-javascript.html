@@ -1,0 +1,69 @@
+title: How to parse European number formats in JavaScript (1.234,56 vs 1,234.56) without a library
+description: parseFloat("1.234,56") returns 1.234 without an error. Tested JavaScript to parse decimal commas, negative values and currency symbols, and to detect the format of a column.
+date: 2026-11-07
+---
+<p>A customer in Germany uploads a CSV with a price column. The first value is <code>1.234,56</code>. Your importer calls <code>parseFloat</code>, stores <code>1.234</code>, and nobody notices until an invoice is off by a factor of a thousand.</p>
+{{code:EU_PROBLEM}}
+<p>JavaScript can <em>format</em> numbers for any locale with <code>Intl.NumberFormat</code>, but it has no matching parse function. This post builds one in about 70 lines, in five small steps. Every function runs in our test suite, so you can copy them as they are.</p>
+
+<h2>The formats you will actually see</h2>
+<table>
+<tr><th>Written as</th><th>Typical source</th><th>Value</th></tr>
+<tr><td><code>1,234.56</code></td><td>US, UK, Japan</td><td>1234.56</td></tr>
+<tr><td><code>1.234,56</code></td><td>Germany, Italy, Spain, the Netherlands, Brazil</td><td>1234.56</td></tr>
+<tr><td><code>1 234,56</code></td><td>France (the space is a narrow no-break space, U+202F)</td><td>1234.56</td></tr>
+<tr><td><code>1'234.56</code></td><td>Switzerland</td><td>1234.56</td></tr>
+<tr><td><code>12,34,567.89</code></td><td>India</td><td>1234567.89</td></tr>
+</table>
+<p>The separators in this table are the ones <code>Intl.NumberFormat</code> produces for <code>en-US</code>, <code>en-GB</code>, <code>ja-JP</code>, <code>de-DE</code>, <code>it-IT</code>, <code>es-ES</code>, <code>nl-NL</code>, <code>pt-BR</code>, <code>fr-FR</code>, <code>de-CH</code> and <code>en-IN</code> in Node.js. Our tests check each one, because these outputs come from the ICU library and can change between versions.</p>
+<p>Negative numbers add more variants: <code>-1.234,56</code>, the Unicode minus sign <code>−</code> (U+2212), accounting brackets <code>(1,234.56)</code>, and a minus at the end, <code>1.234,56-</code>. The last one comes from financial systems; Excel does not recognise <code>150-</code> as a negative number either (<a href="https://www.asap-utilities.com/blog/video-how-to-fix-trailing-minus-signs-in-excel-with-asaputilities-after-importing-data/">ASAP Utilities, 2007, updated 2021</a>).</p>
+
+<h2>Step 1: separate the sign and remove the noise</h2>
+<p>First remove everything that is not part of the number: spaces of every kind, apostrophes used as thousands separators, currency symbols and three-letter codes like <code>EUR</code>. Then read the sign, wherever it is. The function returns the sign and a "body" that contains only digits, dots and commas, or <code>null</code> if the cell is not a number at all.</p>
+{{code:EU_SPLIT}}
+<p>Removing all spaces is safe because none of these formats uses a space as the decimal separator. The currency code is only removed when it sits right next to the number, so a cell like <code>12abc34</code> is rejected instead of becoming <code>1234</code>.</p>
+
+<h2>Step 2: turn the body into a number, strictly</h2>
+<p>Once you know which character is the decimal separator, the other one must be a thousands separator. That is a strong rule, and you should enforce it: groups have three digits (or two, then three, for Indian lakh grouping), there is at most one decimal separator, and no thousands separator after it. Anything else is rejected.</p>
+{{code:EU_TONUMBER}}
+<p>The strictness is the point. With a comma as decimal separator, <code>1.23</code> is not a valid number, so it returns <code>null</code> rather than <code>123</code>. A rejected cell can be shown to the user. A wrong number goes straight into your database.</p>
+
+<h2>Step 3: when you know the locale</h2>
+<p>If the user has told you their locale (an account setting, or a choice on the import screen), ask <code>Intl.NumberFormat</code> which separators that locale uses. <code>formatToParts</code> splits a formatted number into labelled pieces, including <code>group</code> and <code>decimal</code>.</p>
+{{code:EU_LOCALE}}
+<p><code>parseLocaleNumber("1.234,56", "de-DE")</code> returns <code>1234.56</code>, and the same string with <code>"en-US"</code> returns <code>null</code>. Our test also formats <code>-1234567.891</code> in eleven locales and checks that parsing gives the same number back.</p>
+<p>Be careful with <code>navigator.language</code>. It tells you how the browser is set up, not where the file came from. An accountant in London can easily upload an export from the German office.</p>
+
+<h2>Step 4: when you don't know the locale, look at the whole column</h2>
+<p>One value can be ambiguous; a column usually is not. <code>1,234</code> could be one thousand two hundred thirty-four or one point two three four. But if the same column also contains <code>12,5</code> or <code>1.234,56</code>, the answer is clear. Each value casts a vote, and the column gets a format only if all votes agree.</p>
+{{code:EU_DETECT}}
+<p>The rules per value:</p>
+<ul>
+<li>Both a dot and a comma: the last one is the decimal separator.</li>
+<li>The same separator twice (<code>1.234.567</code>): it is a thousands separator.</li>
+<li>One separator not followed by exactly three digits (<code>12,5</code>, <code>99,90</code>): it is the decimal separator.</li>
+<li>One separator after a leading zero (<code>0,125</code>): decimal, because nobody writes a thousands separator after a zero.</li>
+<li>Exactly three digits after a single separator (<code>1,234</code>): no vote. This is the case that cannot be decided from the value.</li>
+</ul>
+<p>If the votes contradict each other, the function returns <code>null</code> too. A column with both <code>1.234,56</code> and <code>1,234.56</code> was probably pasted together from two sources, and someone needs to look at it.</p>
+
+<h2>Step 5: put it together for an import</h2>
+<p>Detect from the data first. Use the locale the user chose only when the data gives no evidence. If neither is available, don't pick a default: show the column and ask.</p>
+{{code:EU_COLUMN}}
+<p>For a German export with <code>1.234,56</code>, <code>-99,90 €</code>, <code>1.000-</code>, an empty cell and <code>n/a</code>, this returns <code>[1234.56, -99.9, -1000, null, null]</code>. The two <code>null</code> cells are the ones to highlight in your preview. A column with only <code>1,234</code> and <code>5,678</code> returns no format at all until the user picks one.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Numbers that are already numbers.</strong> Cells that a spreadsheet stored as real numbers don't have this problem. It is text that does: CSV files, and numbers typed into a cell as text.</li>
+<li><strong>Scientific notation</strong> such as <code>1,5E+03</code>. Add it only if your users' files contain it.</li>
+<li><strong>Arabic, Persian or Devanagari digits.</strong> These need a digit mapping step before step 1.</li>
+<li><strong>Percentages.</strong> Strip <code>%</code> in step 1 and divide by 100 afterwards, but only for columns you know are percentages.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer that detects decimal commas, header rows, totals rows and mixed date formats, and asks instead of guessing when a date column could be read two ways. It runs in the browser, so files never leave your app. You can drop a file into the demo on our homepage and see what it does. Nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. The functions in this post are simplified versions of the ideas it uses, and you are free to use them in your own code.</p>
