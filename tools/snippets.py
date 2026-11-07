@@ -72,72 +72,126 @@ EU_PROBLEM = r'''parseFloat("1.234,56"); // 1.234   (wrong, and no error)
 Number("1.234,56");     // NaN
 Number("1,234.56");     // NaN
 parseFloat("1,234.56"); // 1       (wrong, and no error)'''
-EU_SPLIT = r'''function splitSign(raw) {
-  let t = String(raw ?? "").trim()
-    .replace(/[\s\u00a0\u202f'’]/g, "")                // spaces, no-break spaces, apostrophes
-    .replace(/^[A-Z]{3}(?=[-+\u2212(\d.,])/i, "")      // EUR 1.234,56
-    .replace(/([\d.,)\-\u2212])[A-Z]{3}$/i, "$1")     // 1.234,56 EUR
-    .replace(/[$€£¥₹]|円$/g, "");
-  let negative = false;
-  if (/^\(.+\)$/.test(t)) { negative = true; t = t.slice(1, -1); }   // (1,234.56)
-  if (/^[-\u2212]/.test(t)) { negative = !negative; t = t.slice(1); } // -1.234,56 and U+2212
-  else if (/[-\u2212]$/.test(t)) { negative = !negative; t = t.slice(0, -1); } // 1.234,56-
+EU_SPLIT = r'''const CURRENCY = "R\\$|[$€£¥₹₽₩円]|kr\\.?|zł|EUR|USD|GBP|CHF|JPY|SEK|NOK|DKK|PLN|CZK|BRL|INR|CAD|AUD";
+const CURRENCY_START = new RegExp(`^(?:${CURRENCY})\\s*`, "i");
+const CURRENCY_END = new RegExp(`\\s*(?:${CURRENCY})$`, "i");
+const MINUS = /^[-\u2212]\s*|\s*[-\u2212]$/; // -5, 5- and the minus sign U+2212
+const GROUP_SPACE = "[ \u00a0\u202f\u2009'’]"; // space, no-break spaces, thin space, apostrophes
+const SPACED_GROUPS = new RegExp(`^[1-9]\\d{0,2}(${GROUP_SPACE})\\d{3}(?:\\1\\d{3})*(?:[.,]\\d+)?$`); // 1 234,56
+
+function splitSign(raw) {
+  let t = String(raw ?? "").replace(/[\u200e\u200f\u061c]/g, "").trim(); // direction marks (he-IL)
+  let negative = false, signs = 0, currencies = 0;
+  const stripCurrency = () => {
+    for (const re of [CURRENCY_START, CURRENCY_END]) {
+      const next = t.replace(re, "");
+      if (next !== t) { currencies++; t = next; }
+    }
+  };
+  stripCurrency();
+  if (/^\(.+\)$/.test(t)) { negative = true; signs++; t = t.slice(1, -1).trim(); stripCurrency(); }
+  if (MINUS.test(t)) { negative = true; signs++; t = t.replace(MINUS, ""); }
   else if (t.startsWith("+")) t = t.slice(1);
+  stripCurrency();
+  if (signs > 1 || currencies > 1) return null; // "(-5)" or "$5€" is a mistake, not a number
+  if (/[\s'’]/.test(t)) {
+    if (!SPACED_GROUPS.test(t)) return null;    // "10 20", "1\n234", "030 123", "2,5 Mio"
+    t = t.replace(new RegExp(GROUP_SPACE, "g"), "");
+  }
   return /^[\d.,]*\d[\d.,]*$/.test(t) ? { negative, body: t } : null;
 }'''
-EU_TONUMBER = r'''const GROUPS = {
-  ".": /^\d{1,3}(\.\d{3})+$|^\d{1,2}(\.\d{2})*\.\d{3}$/,
-  ",": /^\d{1,3}(,\d{3})+$|^\d{1,2}(,\d{2})*,\d{3}$/, // also 12,34,567 (India)
-};
+EU_TONUMBER = r'''const GROUPED = { ".": /^[1-9]\d{0,2}(\.\d{3})+$/, ",": /^[1-9]\d{0,2}(,\d{3})+$/ };
+const INDIAN = /^[1-9]\d?(,\d{2})*,\d{3}$/; // 12,34,567: only accepted for Indian locales
 
-function toNumber({ negative, body }, decimal) {
+function toNumber({ negative, body }, decimal, { indian = false } = {}) {
   const group = decimal === "," ? "." : ",";
   const [int, frac, extra] = body.split(decimal);
-  if (extra !== undefined) return null;                    // 1,2,3 with "," as decimal
-  if (frac !== undefined && frac.includes(group)) return null; // 1,23.4 with "," as decimal
-  if (int.includes(group) && !GROUPS[group].test(int)) return null; // 1.23 with "," as decimal
-  const n = Number(int.split(group).join("") + (frac !== undefined ? "." + frac : ""));
+  if (extra !== undefined || frac === "") return null;         // "1,2,3" or "1,"
+  if (frac !== undefined && frac.includes(group)) return null;  // "1,23.4"
+  const grouped = GROUPED[group].test(int) || (indian && group === "," && INDIAN.test(int));
+  if (int.includes(group) && !grouped) return null;             // "1.23" or "030.123"
+  const digits = int.split(group).join("");
+  if (/^0\d/.test(digits)) return null;                         // "01067": a code, not an amount
+  const plain = digits + (frac !== undefined ? "." + frac : "");
+  if (plain.replace(/\D/g, "").length > 15) return null;        // too long to be sure it is exact
+  const n = Number(plain);
   if (!Number.isFinite(n)) return null;
-  return negative ? -n : n;
+  return negative && n !== 0 ? -n : n;
 }'''
-EU_LOCALE = r'''function localeSeparators(locale) {
-  const parts = new Intl.NumberFormat(locale).formatToParts(1234567.891);
-  const find = (type) => parts.find((p) => p.type === type)?.value ?? "";
-  return { group: find("group"), decimal: find("decimal") };
+EU_LOCALE = r'''const separatorCache = new Map();
+
+function localeSeparators(locale) {
+  if (!separatorCache.has(locale)) {
+    let info = null;
+    try {
+      const format = new Intl.NumberFormat(locale);
+      const parts = format.formatToParts(1234567.891);
+      const find = (type) => parts.find((p) => p.type === type)?.value ?? "";
+      info = { group: find("group"), decimal: find("decimal"), indian: format.format(1234567) === "12,34,567" };
+    } catch {
+      info = null; // not a valid locale string
+    }
+    separatorCache.set(locale, info);
+  }
+  return separatorCache.get(locale);
+}
+
+function readNumber(raw, { decimal, indian = false }) {
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null; // already a number
+  if (decimal !== "." && decimal !== ",") return null; // e.g. "٫" in ar-EG: not handled here
+  const s = splitSign(raw);
+  return s ? toNumber(s, decimal, { indian }) : null;
 }
 
 function parseLocaleNumber(raw, locale) {
-  const s = splitSign(raw);
-  return s ? toNumber(s, localeSeparators(locale).decimal) : null;
+  const separators = localeSeparators(locale);
+  return separators ? readNumber(raw, separators) : null;
 }'''
 EU_DETECT = r'''function decimalVote(body) {
   const dot = body.lastIndexOf("."), comma = body.lastIndexOf(",");
-  if (dot >= 0 && comma >= 0) return dot > comma ? "." : ",";  // 1.234,56 or 1,234.56
-  const sep = dot >= 0 ? "." : comma >= 0 ? "," : null;
-  if (!sep) return null;                                      // 1234: no evidence
-  const other = sep === "." ? "," : ".";
-  if (body.indexOf(sep) !== body.lastIndexOf(sep)) return other; // 1.234.567: grouping
-  const [int, frac] = body.split(sep);
-  if (frac.length !== 3 || int === "" || int === "0") return sep; // 12,5 / 0,125 / ,5
-  return null;                                                // 1,234 or 1.234: could be either
+  let vote = null;
+  if (dot >= 0 && comma >= 0) vote = dot > comma ? "." : ",";         // 1.234,56 or 1,234.56
+  else if (dot >= 0 || comma >= 0) {
+    const sep = dot >= 0 ? "." : ",", other = sep === "." ? "," : ".";
+    const [int, frac] = body.split(sep);
+    if (body.indexOf(sep) !== body.lastIndexOf(sep)) vote = other;      // 1.234.567: grouping
+    else if (frac.length !== 3 || int === "" || int === "0") vote = sep; // 12,5 / 0,125 / ,5
+    // else 1,234 or 1.234: could be either, no vote
+  }
+  // A vote only counts if the value is valid under it, so 07.11.2026 never votes.
+  return vote && toNumber({ negative: false, body }, vote) !== null ? vote : null;
 }
 
-function detectDecimalSeparator(values) {
-  const votes = new Set();
+function columnVotes(values) {
+  const votes = { ".": 0, ",": 0 };
   for (const v of values) {
+    if (typeof v === "number") continue; // real numbers carry no format
     const s = splitSign(v);
     const vote = s && decimalVote(s.body);
-    if (vote) votes.add(vote);
+    if (vote) votes[vote]++;
   }
-  return votes.size === 1 ? [...votes][0] : null; // none, or contradictory: ask the user
+  return votes;
+}
+
+function detectDecimalSeparator(values, minVotes = 2) {
+  const votes = columnVotes(values);
+  if (votes["."] && votes[","]) return null;  // contradictory: ask the user
+  const sep = votes["."] ? "." : ",";
+  return votes[sep] >= minVotes ? sep : null; // one value is not enough evidence
 }'''
 EU_COLUMN = r'''function parseNumberColumn(values, chosenLocale) {
-  const decimal = detectDecimalSeparator(values)
-    ?? (chosenLocale ? localeSeparators(chosenLocale).decimal : null);
-  if (!decimal) return { decimal: null, numbers: null }; // show the column and ask
-  const numbers = values.map((v) => {
-    const s = splitSign(v);
-    return s ? toNumber(s, decimal) : null; // null: empty or not a number, flag the cell
-  });
-  return { decimal, numbers };
+  const ask = (reason) => ({ decimal: null, numbers: null, ask: reason });
+  let separators;
+  if (chosenLocale) {
+    separators = localeSeparators(chosenLocale);
+    if (!separators || !/^[.,]$/.test(separators.decimal)) return ask("locale not supported");
+    const other = separators.decimal === "," ? "." : ",";
+    if (columnVotes(values)[other] > 0) return ask("data disagrees with the chosen locale");
+  } else {
+    const decimal = detectDecimalSeparator(values);
+    if (!decimal) return ask("no clear format");
+    separators = { decimal, group: decimal === "," ? "." : "," };
+  }
+  // null in numbers: the cell is empty or not a number, so flag it in the preview
+  return { decimal: separators.decimal, numbers: values.map((v) => readNumber(v, separators)), ask: null };
 }'''

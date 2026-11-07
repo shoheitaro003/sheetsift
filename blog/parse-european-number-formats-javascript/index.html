@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>How to parse European number formats in JavaScript (1.234,56 vs 1,234.56) | SheetSift</title>
-<meta name="description" content="parseFloat(&quot;1.234,56&quot;) returns 1.234 without an error. Tested JavaScript to parse decimal commas, negative values and currency symbols, and to detect the format of a column.">
+<title>How to parse European number formats in JavaScript | SheetSift</title>
+<meta name="description" content="parseFloat(&quot;1.234,56&quot;) returns 1.234 with no error. Tested JavaScript for decimal commas, negative values, currencies and detecting a column&#x27;s format.">
 <link rel="canonical" href="https://shoheitaro003.github.io/sheetsift/blog/parse-european-number-formats-javascript/">
-<meta property="og:title" content="How to parse European number formats in JavaScript (1.234,56 vs 1,234.56) | SheetSift">
-<meta property="og:description" content="parseFloat(&quot;1.234,56&quot;) returns 1.234 without an error. Tested JavaScript to parse decimal commas, negative values and currency symbols, and to detect the format of a column.">
+<meta property="og:title" content="How to parse European number formats in JavaScript | SheetSift">
+<meta property="og:description" content="parseFloat(&quot;1.234,56&quot;) returns 1.234 with no error. Tested JavaScript for decimal commas, negative values, currencies and detecting a column&#x27;s format.">
 <meta property="og:url" content="https://shoheitaro003.github.io/sheetsift/blog/parse-european-number-formats-javascript/">
 <meta property="og:site_name" content="SheetSift">
 <meta name="twitter:card" content="summary">
@@ -17,7 +17,7 @@
 <link rel="stylesheet" href="../../blog.css">
 <meta property="og:type" content="article">
 <meta property="article:published_time" content="2026-11-07">
-<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "How to parse European number formats in JavaScript (1.234,56 vs 1,234.56)", "description": "parseFloat(\"1.234,56\") returns 1.234 without an error. Tested JavaScript to parse decimal commas, negative values and currency symbols, and to detect the format of a column.", "datePublished": "2026-11-07", "dateModified": "2026-11-07", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/parse-european-number-formats-javascript/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "How to parse European number formats in JavaScript", "description": "parseFloat(\"1.234,56\") returns 1.234 with no error. Tested JavaScript for decimal commas, negative values, currencies and detecting a column's format.", "datePublished": "2026-11-07", "dateModified": "2026-11-07", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/parse-european-number-formats-javascript/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
 </head>
 <body>
 <header class="top"><div class="wrap">
@@ -26,130 +26,204 @@
 </div></header>
 <main><div class="wrap">
 <article>
-<h1>How to parse European number formats in JavaScript (1.234,56 vs 1,234.56)</h1>
+<h1>How to parse European number formats in JavaScript</h1>
 <p class="meta"><time datetime="2026-11-07">2026-11-07</time></p>
 <p>A customer in Germany uploads a CSV with a price column. The first value is <code>1.234,56</code>. Your importer calls <code>parseFloat</code>, stores <code>1.234</code>, and nobody notices until an invoice is off by a factor of a thousand.</p>
 <pre><code>parseFloat(&quot;1.234,56&quot;); // 1.234   (wrong, and no error)
 Number(&quot;1.234,56&quot;);     // NaN
 Number(&quot;1,234.56&quot;);     // NaN
 parseFloat(&quot;1,234.56&quot;); // 1       (wrong, and no error)</code></pre>
-<p>JavaScript can <em>format</em> numbers for any locale with <code>Intl.NumberFormat</code>, but it has no matching parse function. This post builds one in about 70 lines, in five small steps. Every function runs in our test suite, so you can copy them as they are.</p>
+<p>JavaScript can <em>format</em> numbers for any locale with <code>Intl.NumberFormat</code>, but it has no matching parse function. This post builds one in five steps. By the end you can turn <code>1.234,56</code>, <code>1 234,56 €</code> or <code>(1,234.56)</code> into the right number, and flag the cells you cannot read instead of guessing. Every function, and every input and output quoted below, is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a>.</p>
+<p>Our earlier post on <a href="../csv-importers-real-excel-files/">why CSV importers break on real Excel files</a> handles the simple case in five lines. This one covers what that version gets wrong: spaces and apostrophes as separators, negative values written four different ways, and columns where a single value cannot tell you the format.</p>
 
 <h2>The formats you will actually see</h2>
 <table>
-<tr><th>Written as</th><th>Typical source</th><th>Value</th></tr>
-<tr><td><code>1,234.56</code></td><td>US, UK, Japan</td><td>1234.56</td></tr>
-<tr><td><code>1.234,56</code></td><td>Germany, Italy, Spain, the Netherlands, Brazil</td><td>1234.56</td></tr>
-<tr><td><code>1 234,56</code></td><td>France (the space is a narrow no-break space, U+202F)</td><td>1234.56</td></tr>
-<tr><td><code>1'234.56</code></td><td>Switzerland</td><td>1234.56</td></tr>
-<tr><td><code>12,34,567.89</code></td><td>India</td><td>1234567.89</td></tr>
+<tr><th>Written as</th><th>Locales (Intl.NumberFormat)</th></tr>
+<tr><td><code>1,234,567.89</code></td><td><code>en-US</code>, <code>en-GB</code>, <code>ja-JP</code></td></tr>
+<tr><td><code>1.234.567,89</code></td><td><code>de-DE</code>, <code>it-IT</code>, <code>es-ES</code>, <code>nl-NL</code>, <code>pt-BR</code></td></tr>
+<tr><td><code>1 234 567,89</code></td><td><code>fr-FR</code> (the space is a narrow no-break space, U+202F)</td></tr>
+<tr><td><code>1'234'567.89</code></td><td><code>de-CH</code></td></tr>
+<tr><td><code>12,34,567.89</code></td><td><code>en-IN</code> (Indian grouping)</td></tr>
 </table>
-<p>The separators in this table are the ones <code>Intl.NumberFormat</code> produces for <code>en-US</code>, <code>en-GB</code>, <code>ja-JP</code>, <code>de-DE</code>, <code>it-IT</code>, <code>es-ES</code>, <code>nl-NL</code>, <code>pt-BR</code>, <code>fr-FR</code>, <code>de-CH</code> and <code>en-IN</code> in Node.js. Our tests check each one, because these outputs come from the ICU library and can change between versions.</p>
-<p>Negative numbers add more variants: <code>-1.234,56</code>, the Unicode minus sign <code>−</code> (U+2212), accounting brackets <code>(1,234.56)</code>, and a minus at the end, <code>1.234,56-</code>. The last one comes from financial systems; Excel does not recognise <code>150-</code> as a negative number either (<a href="https://www.asap-utilities.com/blog/video-how-to-fix-trailing-minus-signs-in-excel-with-asaputilities-after-importing-data/">ASAP Utilities, 2007, updated 2021</a>).</p>
+<p>Each row is what <code>Intl.NumberFormat</code> produces in Node.js for 1234567.89, and our tests check every one. Smaller numbers are not always grouped: <code>it-IT</code>, <code>es-ES</code> and <code>pl-PL</code> format 1234.56 as <code>1234,56</code>. So never expect a separator in every value.</p>
+<p>Negative numbers add more variants: <code>-1.234,56</code>, the Unicode minus sign <code>−</code> (U+2212), accounting brackets <code>(1,234.56)</code>, and a minus at the end, <code>1.234,56-</code>. Some systems export the last form, which is why tools exist to convert it in Excel (<a href="https://www.asap-utilities.com/blog/video-how-to-fix-trailing-minus-signs-in-excel-with-asaputilities-after-importing-data/">ASAP Utilities, 2007, updated 2021</a>).</p>
 
 <h2>Step 1: separate the sign and remove the noise</h2>
-<p>First remove everything that is not part of the number: spaces of every kind, apostrophes used as thousands separators, currency symbols and three-letter codes like <code>EUR</code>. Then read the sign, wherever it is. The function returns the sign and a "body" that contains only digits, dots and commas, or <code>null</code> if the cell is not a number at all.</p>
-<pre><code>function splitSign(raw) {
-  let t = String(raw ?? &quot;&quot;).trim()
-    .replace(/[\s\u00a0\u202f&#x27;’]/g, &quot;&quot;)                // spaces, no-break spaces, apostrophes
-    .replace(/^[A-Z]{3}(?=[-+\u2212(\d.,])/i, &quot;&quot;)      // EUR 1.234,56
-    .replace(/([\d.,)\-\u2212])[A-Z]{3}$/i, &quot;$1&quot;)     // 1.234,56 EUR
-    .replace(/[$€£¥₹]|円$/g, &quot;&quot;);
-  let negative = false;
-  if (/^\(.+\)$/.test(t)) { negative = true; t = t.slice(1, -1); }   // (1,234.56)
-  if (/^[-\u2212]/.test(t)) { negative = !negative; t = t.slice(1); } // -1.234,56 and U+2212
-  else if (/[-\u2212]$/.test(t)) { negative = !negative; t = t.slice(0, -1); } // 1.234,56-
+<p>First remove what is not part of the number: one known currency symbol or code at either end, and the sign. The currency is removed again after the brackets and after the minus, so <code>(€5)</code>, <code>€(5)</code> and <code>-€5</code> all work. Then check spaces and apostrophes. They are only allowed as thousands separators, between groups of three digits. The function returns the sign and a "body" of digits, dots and commas, or <code>null</code> if the cell is not clearly a number.</p>
+<pre><code>const CURRENCY = &quot;R\\$|[$€£¥₹₽₩円]|kr\\.?|zł|EUR|USD|GBP|CHF|JPY|SEK|NOK|DKK|PLN|CZK|BRL|INR|CAD|AUD&quot;;
+const CURRENCY_START = new RegExp(`^(?:${CURRENCY})\\s*`, &quot;i&quot;);
+const CURRENCY_END = new RegExp(`\\s*(?:${CURRENCY})$`, &quot;i&quot;);
+const MINUS = /^[-\u2212]\s*|\s*[-\u2212]$/; // -5, 5- and the minus sign U+2212
+const GROUP_SPACE = &quot;[ \u00a0\u202f\u2009&#x27;’]&quot;; // space, no-break spaces, thin space, apostrophes
+const SPACED_GROUPS = new RegExp(`^[1-9]\\d{0,2}(${GROUP_SPACE})\\d{3}(?:\\1\\d{3})*(?:[.,]\\d+)?$`); // 1 234,56
+
+function splitSign(raw) {
+  let t = String(raw ?? &quot;&quot;).replace(/[\u200e\u200f\u061c]/g, &quot;&quot;).trim(); // direction marks (he-IL)
+  let negative = false, signs = 0, currencies = 0;
+  const stripCurrency = () =&gt; {
+    for (const re of [CURRENCY_START, CURRENCY_END]) {
+      const next = t.replace(re, &quot;&quot;);
+      if (next !== t) { currencies++; t = next; }
+    }
+  };
+  stripCurrency();
+  if (/^\(.+\)$/.test(t)) { negative = true; signs++; t = t.slice(1, -1).trim(); stripCurrency(); }
+  if (MINUS.test(t)) { negative = true; signs++; t = t.replace(MINUS, &quot;&quot;); }
   else if (t.startsWith(&quot;+&quot;)) t = t.slice(1);
+  stripCurrency();
+  if (signs &gt; 1 || currencies &gt; 1) return null; // &quot;(-5)&quot; or &quot;$5€&quot; is a mistake, not a number
+  if (/[\s&#x27;’]/.test(t)) {
+    if (!SPACED_GROUPS.test(t)) return null;    // &quot;10 20&quot;, &quot;1\n234&quot;, &quot;030 123&quot;, &quot;2,5 Mio&quot;
+    t = t.replace(new RegExp(GROUP_SPACE, &quot;g&quot;), &quot;&quot;);
+  }
   return /^[\d.,]*\d[\d.,]*$/.test(t) ? { negative, body: t } : null;
 }</code></pre>
-<p>Removing all spaces is safe because none of these formats uses a space as the decimal separator. The currency code is only removed when it sits right next to the number, so a cell like <code>12abc34</code> is rejected instead of becoming <code>1234</code>.</p>
+<p>Each restriction blocks a real way to get a wrong number:</p>
+<ul>
+<li><strong>Only known currencies are removed.</strong> A rule like "drop any three letters" turns <code>2,5 Mio</code> (2.5 million in a German report) into 2.5, and <code>ISO9001</code> into 9001. Here both are rejected. Add the currencies your users actually have.</li>
+<li><strong>Spaces and apostrophes must separate groups of three, the same way throughout.</strong> <code>1 234,56</code> and <code>1'234.50</code> pass. <code>10 20</code>, <code>1 234'567</code> and <code>030 123 456</code> (a leading zero) are rejected, and so is a cell with two values on two lines, because tabs and line breaks never count as separators.</li>
+<li><strong>Two signs or two currencies are an error.</strong> <code>(-5)</code> is a typo, not plus five. <code>$5€</code> is not a price.</li>
+</ul>
 
 <h2>Step 2: turn the body into a number, strictly</h2>
-<p>Once you know which character is the decimal separator, the other one must be a thousands separator. That is a strong rule, and you should enforce it: groups have three digits (or two, then three, for Indian lakh grouping), there is at most one decimal separator, and no thousands separator after it. Anything else is rejected.</p>
-<pre><code>const GROUPS = {
-  &quot;.&quot;: /^\d{1,3}(\.\d{3})+$|^\d{1,2}(\.\d{2})*\.\d{3}$/,
-  &quot;,&quot;: /^\d{1,3}(,\d{3})+$|^\d{1,2}(,\d{2})*,\d{3}$/, // also 12,34,567 (India)
-};
+<p>Once you know which character is the decimal separator, the other one can only be a thousands separator. Enforce that: groups of three digits, a first group that does not start with zero, at most one decimal separator, and no thousands separator after it.</p>
+<pre><code>const GROUPED = { &quot;.&quot;: /^[1-9]\d{0,2}(\.\d{3})+$/, &quot;,&quot;: /^[1-9]\d{0,2}(,\d{3})+$/ };
+const INDIAN = /^[1-9]\d?(,\d{2})*,\d{3}$/; // 12,34,567: only accepted for Indian locales
 
-function toNumber({ negative, body }, decimal) {
+function toNumber({ negative, body }, decimal, { indian = false } = {}) {
   const group = decimal === &quot;,&quot; ? &quot;.&quot; : &quot;,&quot;;
   const [int, frac, extra] = body.split(decimal);
-  if (extra !== undefined) return null;                    // 1,2,3 with &quot;,&quot; as decimal
-  if (frac !== undefined &amp;&amp; frac.includes(group)) return null; // 1,23.4 with &quot;,&quot; as decimal
-  if (int.includes(group) &amp;&amp; !GROUPS[group].test(int)) return null; // 1.23 with &quot;,&quot; as decimal
-  const n = Number(int.split(group).join(&quot;&quot;) + (frac !== undefined ? &quot;.&quot; + frac : &quot;&quot;));
+  if (extra !== undefined || frac === &quot;&quot;) return null;         // &quot;1,2,3&quot; or &quot;1,&quot;
+  if (frac !== undefined &amp;&amp; frac.includes(group)) return null;  // &quot;1,23.4&quot;
+  const grouped = GROUPED[group].test(int) || (indian &amp;&amp; group === &quot;,&quot; &amp;&amp; INDIAN.test(int));
+  if (int.includes(group) &amp;&amp; !grouped) return null;             // &quot;1.23&quot; or &quot;030.123&quot;
+  const digits = int.split(group).join(&quot;&quot;);
+  if (/^0\d/.test(digits)) return null;                         // &quot;01067&quot;: a code, not an amount
+  const plain = digits + (frac !== undefined ? &quot;.&quot; + frac : &quot;&quot;);
+  if (plain.replace(/\D/g, &quot;&quot;).length &gt; 15) return null;        // too long to be sure it is exact
+  const n = Number(plain);
   if (!Number.isFinite(n)) return null;
-  return negative ? -n : n;
+  return negative &amp;&amp; n !== 0 ? -n : n;
 }</code></pre>
-<p>The strictness is the point. With a comma as decimal separator, <code>1.23</code> is not a valid number, so it returns <code>null</code> rather than <code>123</code>. A rejected cell can be shown to the user. A wrong number goes straight into your database.</p>
+<p>With a comma as decimal separator, <code>1.23</code> returns <code>null</code> rather than 123. A leading zero also means "not an amount": the ID <code>030.123.456</code> and the German postcode <code>01067</code> both return <code>null</code>, while <code>0,5</code> is fine. So does <code>1,</code> with nothing after the separator. Indian grouping (<code>12,34,567</code>) is only accepted when you ask for it, because in any other locale two-digit groups are a typo.</p>
+<p>The length check matters for IDs. JavaScript numbers are 64-bit floats, so <code>Number("12345678901234567891")</code> gives 12345678901234567000. A value with more than 15 digits is rejected instead of silently rounded. Some of those would still be exact, but the simple limit is safe. Keep long IDs as strings.</p>
+<p>A rejected cell can be shown to the user. A wrong number goes straight into your database.</p>
 
 <h2>Step 3: when you know the locale</h2>
-<p>If the user has told you their locale (an account setting, or a choice on the import screen), ask <code>Intl.NumberFormat</code> which separators that locale uses. <code>formatToParts</code> splits a formatted number into labelled pieces, including <code>group</code> and <code>decimal</code>.</p>
-<pre><code>function localeSeparators(locale) {
-  const parts = new Intl.NumberFormat(locale).formatToParts(1234567.891);
-  const find = (type) =&gt; parts.find((p) =&gt; p.type === type)?.value ?? &quot;&quot;;
-  return { group: find(&quot;group&quot;), decimal: find(&quot;decimal&quot;) };
+<p>If the user has told you their locale (an account setting, or a choice on the import screen), ask <code>Intl.NumberFormat</code> which separators it uses. <code>formatToParts</code> splits a formatted number into labelled pieces, including <code>group</code> and <code>decimal</code>. The result is cached, so each locale is set up only once, not once per cell.</p>
+<pre><code>const separatorCache = new Map();
+
+function localeSeparators(locale) {
+  if (!separatorCache.has(locale)) {
+    let info = null;
+    try {
+      const format = new Intl.NumberFormat(locale);
+      const parts = format.formatToParts(1234567.891);
+      const find = (type) =&gt; parts.find((p) =&gt; p.type === type)?.value ?? &quot;&quot;;
+      info = { group: find(&quot;group&quot;), decimal: find(&quot;decimal&quot;), indian: format.format(1234567) === &quot;12,34,567&quot; };
+    } catch {
+      info = null; // not a valid locale string
+    }
+    separatorCache.set(locale, info);
+  }
+  return separatorCache.get(locale);
+}
+
+function readNumber(raw, { decimal, indian = false }) {
+  if (typeof raw === &quot;number&quot;) return Number.isFinite(raw) ? raw : null; // already a number
+  if (decimal !== &quot;.&quot; &amp;&amp; decimal !== &quot;,&quot;) return null; // e.g. &quot;٫&quot; in ar-EG: not handled here
+  const s = splitSign(raw);
+  return s ? toNumber(s, decimal, { indian }) : null;
 }
 
 function parseLocaleNumber(raw, locale) {
-  const s = splitSign(raw);
-  return s ? toNumber(s, localeSeparators(locale).decimal) : null;
+  const separators = localeSeparators(locale);
+  return separators ? readNumber(raw, separators) : null;
 }</code></pre>
-<p><code>parseLocaleNumber("1.234,56", "de-DE")</code> returns <code>1234.56</code>, and the same string with <code>"en-US"</code> returns <code>null</code>. Our test also formats <code>-1234567.891</code> in eleven locales and checks that parsing gives the same number back.</p>
-<p>Be careful with <code>navigator.language</code>. It tells you how the browser is set up, not where the file came from. An accountant in London can easily upload an export from the German office.</p>
+<p>What <code>readNumber</code> adds to steps 1 and 2:</p>
+<ul>
+<li><strong>Real numbers pass through.</strong> A typed cell from a spreadsheet library is already a JavaScript number. Converting it to a string and reading it as German would turn 1.234 into 1234.</li>
+<li><strong>Only the decimal separator comes from the locale.</strong> Any of the group styles from step 1 is accepted. This matters because <code>Intl</code> groups <code>de-AT</code>, <code>fr-FR</code> and <code>pl-PL</code> with no-break spaces, so a strict check would reject <code>1.234,56</code> there. Accepting any group style keeps it working in all three.</li>
+<li><strong>Unsupported locales return <code>null</code>.</strong> That covers locales whose decimal separator is neither a dot nor a comma, such as <code>ar-EG</code>, and invalid locale strings, which would otherwise make <code>Intl</code> throw.</li>
+</ul>
+<p><code>parseLocaleNumber("1.234,56", "de-DE")</code> returns 1234.56, and the same string with <code>"en-US"</code> returns <code>null</code>. Our test also formats -1234567.891 in eleven locales and checks that parsing gives the same number back.</p>
+<p>Don't infer the file's format from the visitor's language settings. An accountant in London can easily upload an export from the German office.</p>
 
 <h2>Step 4: when you don't know the locale, look at the whole column</h2>
-<p>One value can be ambiguous; a column usually is not. <code>1,234</code> could be one thousand two hundred thirty-four or one point two three four. But if the same column also contains <code>12,5</code> or <code>1.234,56</code>, the answer is clear. Each value casts a vote, and the column gets a format only if all votes agree.</p>
+<p>One value can be ambiguous; a column often is not. <code>1,234</code> could be one thousand two hundred thirty-four or one point two three four. But if the same column also contains <code>12,5</code> and <code>1.234,56</code>, the answer is clear. Each value casts a vote. The column gets a format only if at least two values vote for it and none votes against.</p>
 <pre><code>function decimalVote(body) {
   const dot = body.lastIndexOf(&quot;.&quot;), comma = body.lastIndexOf(&quot;,&quot;);
-  if (dot &gt;= 0 &amp;&amp; comma &gt;= 0) return dot &gt; comma ? &quot;.&quot; : &quot;,&quot;;  // 1.234,56 or 1,234.56
-  const sep = dot &gt;= 0 ? &quot;.&quot; : comma &gt;= 0 ? &quot;,&quot; : null;
-  if (!sep) return null;                                      // 1234: no evidence
-  const other = sep === &quot;.&quot; ? &quot;,&quot; : &quot;.&quot;;
-  if (body.indexOf(sep) !== body.lastIndexOf(sep)) return other; // 1.234.567: grouping
-  const [int, frac] = body.split(sep);
-  if (frac.length !== 3 || int === &quot;&quot; || int === &quot;0&quot;) return sep; // 12,5 / 0,125 / ,5
-  return null;                                                // 1,234 or 1.234: could be either
+  let vote = null;
+  if (dot &gt;= 0 &amp;&amp; comma &gt;= 0) vote = dot &gt; comma ? &quot;.&quot; : &quot;,&quot;;         // 1.234,56 or 1,234.56
+  else if (dot &gt;= 0 || comma &gt;= 0) {
+    const sep = dot &gt;= 0 ? &quot;.&quot; : &quot;,&quot;, other = sep === &quot;.&quot; ? &quot;,&quot; : &quot;.&quot;;
+    const [int, frac] = body.split(sep);
+    if (body.indexOf(sep) !== body.lastIndexOf(sep)) vote = other;      // 1.234.567: grouping
+    else if (frac.length !== 3 || int === &quot;&quot; || int === &quot;0&quot;) vote = sep; // 12,5 / 0,125 / ,5
+    // else 1,234 or 1.234: could be either, no vote
+  }
+  // A vote only counts if the value is valid under it, so 07.11.2026 never votes.
+  return vote &amp;&amp; toNumber({ negative: false, body }, vote) !== null ? vote : null;
 }
 
-function detectDecimalSeparator(values) {
-  const votes = new Set();
+function columnVotes(values) {
+  const votes = { &quot;.&quot;: 0, &quot;,&quot;: 0 };
   for (const v of values) {
+    if (typeof v === &quot;number&quot;) continue; // real numbers carry no format
     const s = splitSign(v);
     const vote = s &amp;&amp; decimalVote(s.body);
-    if (vote) votes.add(vote);
+    if (vote) votes[vote]++;
   }
-  return votes.size === 1 ? [...votes][0] : null; // none, or contradictory: ask the user
+  return votes;
+}
+
+function detectDecimalSeparator(values, minVotes = 2) {
+  const votes = columnVotes(values);
+  if (votes[&quot;.&quot;] &amp;&amp; votes[&quot;,&quot;]) return null;  // contradictory: ask the user
+  const sep = votes[&quot;.&quot;] ? &quot;.&quot; : &quot;,&quot;;
+  return votes[sep] &gt;= minVotes ? sep : null; // one value is not enough evidence
 }</code></pre>
 <p>The rules per value:</p>
 <ul>
 <li>Both a dot and a comma: the last one is the decimal separator.</li>
 <li>The same separator twice (<code>1.234.567</code>): it is a thousands separator.</li>
 <li>One separator not followed by exactly three digits (<code>12,5</code>, <code>99,90</code>): it is the decimal separator.</li>
-<li>One separator after a leading zero (<code>0,125</code>): decimal, because nobody writes a thousands separator after a zero.</li>
-<li>Exactly three digits after a single separator (<code>1,234</code>): no vote. This is the case that cannot be decided from the value.</li>
+<li>One separator after a lone zero (<code>0,125</code>): decimal, because a thousands separator never follows a lone zero.</li>
+<li>Exactly three digits after a single separator (<code>1,234</code>): no vote. The value alone cannot decide.</li>
+<li>A value that is not valid under its own vote, such as the date <code>07.11.2026</code>, does not vote.</li>
 </ul>
-<p>If the votes contradict each other, the function returns <code>null</code> too. A column with both <code>1.234,56</code> and <code>1,234.56</code> was probably pasted together from two sources, and someone needs to look at it.</p>
+<p>Why at least two votes? A column of <code>1,500</code>, <code>2,500</code> and <code>3,25</code> has one value that says "decimal comma". If that value is a typo, trusting it would turn the other two into 1.5 and 2.5. Raise <code>minVotes</code> for long files.</p>
+<p>Some values that are not amounts still vote: short dates without a leading zero (<code>7.11</code>), version numbers (<code>1.10</code>) and IP addresses (<code>192.168.100.200</code>). Run this only on columns you have already identified as numbers, not on every column of the file.</p>
 
 <h2>Step 5: put it together for an import</h2>
-<p>Detect from the data first. Use the locale the user chose only when the data gives no evidence. If neither is available, don't pick a default: show the column and ask.</p>
+<p>If the user chose a locale, use it, unless even one value in the column contradicts it. If nobody chose, use the data, but only when it is clear. In every other case, return a reason and ask.</p>
 <pre><code>function parseNumberColumn(values, chosenLocale) {
-  const decimal = detectDecimalSeparator(values)
-    ?? (chosenLocale ? localeSeparators(chosenLocale).decimal : null);
-  if (!decimal) return { decimal: null, numbers: null }; // show the column and ask
-  const numbers = values.map((v) =&gt; {
-    const s = splitSign(v);
-    return s ? toNumber(s, decimal) : null; // null: empty or not a number, flag the cell
-  });
-  return { decimal, numbers };
+  const ask = (reason) =&gt; ({ decimal: null, numbers: null, ask: reason });
+  let separators;
+  if (chosenLocale) {
+    separators = localeSeparators(chosenLocale);
+    if (!separators || !/^[.,]$/.test(separators.decimal)) return ask(&quot;locale not supported&quot;);
+    const other = separators.decimal === &quot;,&quot; ? &quot;.&quot; : &quot;,&quot;;
+    if (columnVotes(values)[other] &gt; 0) return ask(&quot;data disagrees with the chosen locale&quot;);
+  } else {
+    const decimal = detectDecimalSeparator(values);
+    if (!decimal) return ask(&quot;no clear format&quot;);
+    separators = { decimal, group: decimal === &quot;,&quot; ? &quot;.&quot; : &quot;,&quot; };
+  }
+  // null in numbers: the cell is empty or not a number, so flag it in the preview
+  return { decimal: separators.decimal, numbers: values.map((v) =&gt; readNumber(v, separators)), ask: null };
 }</code></pre>
-<p>For a German export with <code>1.234,56</code>, <code>-99,90 €</code>, <code>1.000-</code>, an empty cell and <code>n/a</code>, this returns <code>[1234.56, -99.9, -1000, null, null]</code>. The two <code>null</code> cells are the ones to highlight in your preview. A column with only <code>1,234</code> and <code>5,678</code> returns no format at all until the user picks one.</p>
+<p>For a German export with <code>1.234,56</code>, <code>-99,90 €</code>, <code>1.000-</code>, an empty cell and <code>n/a</code>, this returns <code>[1234.56, -99.9, -1000, null, null]</code>. Only the first two values vote (<code>1.000-</code> has three digits after its only separator, so it can't), and two votes are enough. Remove either of them and the function asks instead. The two <code>null</code> cells are the ones to highlight in your preview.</p>
+<p>If the user chose <code>de-DE</code> but the column contains <code>9.99</code>, the result is <code>ask: "data disagrees with the chosen locale"</code>, so <code>1,234</code> is never quietly read as 1.234.</p>
+<p>One case no code can solve: a German export where every value looks like <code>1.234</code>, <code>2.500</code> or <code>12.000</code>, uploaded by a user who chose <code>en-US</code>. Nothing in the data tells the two readings apart, so the user's choice wins and you get 1.234, 2.5 and 12. Show a preview of the parsed numbers before saving, so the user can spot it.</p>
 
 <h2>What this does not cover</h2>
 <ul>
-<li><strong>Numbers that are already numbers.</strong> Cells that a spreadsheet stored as real numbers don't have this problem. It is text that does: CSV files, and numbers typed into a cell as text.</li>
-<li><strong>Scientific notation</strong> such as <code>1,5E+03</code>. Add it only if your users' files contain it.</li>
-<li><strong>Arabic, Persian or Devanagari digits.</strong> These need a digit mapping step before step 1.</li>
+<li><strong>Scientific notation</strong> such as <code>1,5E+03</code>. These cells are rejected.</li>
+<li><strong>Scale words</strong> such as <code>Mio</code>, <code>TSD</code> or <code>k</code>. These cells are rejected. If your users write them, multiply after parsing, per column.</li>
+<li><strong>Other digits</strong>, such as Arabic <code>١٢٣</code> or full-width <code>１２３</code>. These are rejected too. To accept them, map each digit to 0–9 before step 1. (Invisible direction marks, which <code>he-IL</code> puts before negative numbers, are already removed.)</li>
+<li><strong>The en dash as a minus sign</strong> (<code>–5</code>). Rejected. Add <code>–</code> to <code>MINUS</code> if your files use it.</li>
+<li><strong>A minus at the end in non-financial columns.</strong> <code>2020-</code> becomes -2020. If a column is not from an accounting export, remove the trailing-minus rule from <code>MINUS</code>.</li>
 <li><strong>Percentages.</strong> Strip <code>%</code> in step 1 and divide by 100 afterwards, but only for columns you know are percentages.</li>
 </ul>
 

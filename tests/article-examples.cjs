@@ -73,123 +73,221 @@ ok("windows-1252 fallback", async () => assert.strictEqual(await readText(file([
 ok("shift_jis decoder exists", () => assert.strictEqual(new TextDecoder("shift_jis").decode(Uint8Array.from([0x93, 0xfa, 0x96, 0x7b])), "日本"));
 
 // --- blog/parse-european-number-formats-javascript ---
-ok("eu: the problem is real", () => { assert.strictEqual(parseFloat("1.234,56"), 1.234); assert(Number.isNaN(Number("1.234,56"))); assert(Number.isNaN(Number("1,234.56"))); assert.strictEqual(parseFloat("1,234.56"), 1); assert.strictEqual(typeof Intl.NumberFormat.prototype.parse, "undefined"); });
+const CURRENCY = "R\\$|[$€£¥₹₽₩円]|kr\\.?|zł|EUR|USD|GBP|CHF|JPY|SEK|NOK|DKK|PLN|CZK|BRL|INR|CAD|AUD";
+const CURRENCY_START = new RegExp(`^(?:${CURRENCY})\\s*`, "i");
+const CURRENCY_END = new RegExp(`\\s*(?:${CURRENCY})$`, "i");
+const MINUS = /^[-\u2212]\s*|\s*[-\u2212]$/; // -5, 5- and the minus sign U+2212
+const GROUP_SPACE = "[ \u00a0\u202f\u2009'’]"; // space, no-break spaces, thin space, apostrophes
+const SPACED_GROUPS = new RegExp(`^[1-9]\\d{0,2}(${GROUP_SPACE})\\d{3}(?:\\1\\d{3})*(?:[.,]\\d+)?$`); // 1 234,56
+
 function splitSign(raw) {
-  let t = String(raw ?? "").trim()
-    .replace(/[\s\u00a0\u202f'’]/g, "")                // spaces, no-break spaces, apostrophes
-    .replace(/^[A-Z]{3}(?=[-+\u2212(\d.,])/i, "")      // EUR 1.234,56
-    .replace(/([\d.,)\-\u2212])[A-Z]{3}$/i, "$1")     // 1.234,56 EUR
-    .replace(/[$€£¥₹]|円$/g, "");
-  let negative = false;
-  if (/^\(.+\)$/.test(t)) { negative = true; t = t.slice(1, -1); }   // (1,234.56)
-  if (/^[-\u2212]/.test(t)) { negative = !negative; t = t.slice(1); } // -1.234,56 and U+2212
-  else if (/[-\u2212]$/.test(t)) { negative = !negative; t = t.slice(0, -1); } // 1.234,56-
+  let t = String(raw ?? "").replace(/[\u200e\u200f\u061c]/g, "").trim(); // direction marks (he-IL)
+  let negative = false, signs = 0, currencies = 0;
+  const stripCurrency = () => {
+    for (const re of [CURRENCY_START, CURRENCY_END]) {
+      const next = t.replace(re, "");
+      if (next !== t) { currencies++; t = next; }
+    }
+  };
+  stripCurrency();
+  if (/^\(.+\)$/.test(t)) { negative = true; signs++; t = t.slice(1, -1).trim(); stripCurrency(); }
+  if (MINUS.test(t)) { negative = true; signs++; t = t.replace(MINUS, ""); }
   else if (t.startsWith("+")) t = t.slice(1);
+  stripCurrency();
+  if (signs > 1 || currencies > 1) return null; // "(-5)" or "$5€" is a mistake, not a number
+  if (/[\s'’]/.test(t)) {
+    if (!SPACED_GROUPS.test(t)) return null;    // "10 20", "1\n234", "030 123", "2,5 Mio"
+    t = t.replace(new RegExp(GROUP_SPACE, "g"), "");
+  }
   return /^[\d.,]*\d[\d.,]*$/.test(t) ? { negative, body: t } : null;
 }
 
-const GROUPS = {
-  ".": /^\d{1,3}(\.\d{3})+$|^\d{1,2}(\.\d{2})*\.\d{3}$/,
-  ",": /^\d{1,3}(,\d{3})+$|^\d{1,2}(,\d{2})*,\d{3}$/, // also 12,34,567 (India)
-};
+const GROUPED = { ".": /^[1-9]\d{0,2}(\.\d{3})+$/, ",": /^[1-9]\d{0,2}(,\d{3})+$/ };
+const INDIAN = /^[1-9]\d?(,\d{2})*,\d{3}$/; // 12,34,567: only accepted for Indian locales
 
-function toNumber({ negative, body }, decimal) {
+function toNumber({ negative, body }, decimal, { indian = false } = {}) {
   const group = decimal === "," ? "." : ",";
   const [int, frac, extra] = body.split(decimal);
-  if (extra !== undefined) return null;                    // 1,2,3 with "," as decimal
-  if (frac !== undefined && frac.includes(group)) return null; // 1,23.4 with "," as decimal
-  if (int.includes(group) && !GROUPS[group].test(int)) return null; // 1.23 with "," as decimal
-  const n = Number(int.split(group).join("") + (frac !== undefined ? "." + frac : ""));
+  if (extra !== undefined || frac === "") return null;         // "1,2,3" or "1,"
+  if (frac !== undefined && frac.includes(group)) return null;  // "1,23.4"
+  const grouped = GROUPED[group].test(int) || (indian && group === "," && INDIAN.test(int));
+  if (int.includes(group) && !grouped) return null;             // "1.23" or "030.123"
+  const digits = int.split(group).join("");
+  if (/^0\d/.test(digits)) return null;                         // "01067": a code, not an amount
+  const plain = digits + (frac !== undefined ? "." + frac : "");
+  if (plain.replace(/\D/g, "").length > 15) return null;        // too long to be sure it is exact
+  const n = Number(plain);
   if (!Number.isFinite(n)) return null;
-  return negative ? -n : n;
+  return negative && n !== 0 ? -n : n;
 }
 
+const separatorCache = new Map();
+
 function localeSeparators(locale) {
-  const parts = new Intl.NumberFormat(locale).formatToParts(1234567.891);
-  const find = (type) => parts.find((p) => p.type === type)?.value ?? "";
-  return { group: find("group"), decimal: find("decimal") };
+  if (!separatorCache.has(locale)) {
+    let info = null;
+    try {
+      const format = new Intl.NumberFormat(locale);
+      const parts = format.formatToParts(1234567.891);
+      const find = (type) => parts.find((p) => p.type === type)?.value ?? "";
+      info = { group: find("group"), decimal: find("decimal"), indian: format.format(1234567) === "12,34,567" };
+    } catch {
+      info = null; // not a valid locale string
+    }
+    separatorCache.set(locale, info);
+  }
+  return separatorCache.get(locale);
+}
+
+function readNumber(raw, { decimal, indian = false }) {
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null; // already a number
+  if (decimal !== "." && decimal !== ",") return null; // e.g. "٫" in ar-EG: not handled here
+  const s = splitSign(raw);
+  return s ? toNumber(s, decimal, { indian }) : null;
 }
 
 function parseLocaleNumber(raw, locale) {
-  const s = splitSign(raw);
-  return s ? toNumber(s, localeSeparators(locale).decimal) : null;
+  const separators = localeSeparators(locale);
+  return separators ? readNumber(raw, separators) : null;
 }
 
 function decimalVote(body) {
   const dot = body.lastIndexOf("."), comma = body.lastIndexOf(",");
-  if (dot >= 0 && comma >= 0) return dot > comma ? "." : ",";  // 1.234,56 or 1,234.56
-  const sep = dot >= 0 ? "." : comma >= 0 ? "," : null;
-  if (!sep) return null;                                      // 1234: no evidence
-  const other = sep === "." ? "," : ".";
-  if (body.indexOf(sep) !== body.lastIndexOf(sep)) return other; // 1.234.567: grouping
-  const [int, frac] = body.split(sep);
-  if (frac.length !== 3 || int === "" || int === "0") return sep; // 12,5 / 0,125 / ,5
-  return null;                                                // 1,234 or 1.234: could be either
+  let vote = null;
+  if (dot >= 0 && comma >= 0) vote = dot > comma ? "." : ",";         // 1.234,56 or 1,234.56
+  else if (dot >= 0 || comma >= 0) {
+    const sep = dot >= 0 ? "." : ",", other = sep === "." ? "," : ".";
+    const [int, frac] = body.split(sep);
+    if (body.indexOf(sep) !== body.lastIndexOf(sep)) vote = other;      // 1.234.567: grouping
+    else if (frac.length !== 3 || int === "" || int === "0") vote = sep; // 12,5 / 0,125 / ,5
+    // else 1,234 or 1.234: could be either, no vote
+  }
+  // A vote only counts if the value is valid under it, so 07.11.2026 never votes.
+  return vote && toNumber({ negative: false, body }, vote) !== null ? vote : null;
 }
 
-function detectDecimalSeparator(values) {
-  const votes = new Set();
+function columnVotes(values) {
+  const votes = { ".": 0, ",": 0 };
   for (const v of values) {
+    if (typeof v === "number") continue; // real numbers carry no format
     const s = splitSign(v);
     const vote = s && decimalVote(s.body);
-    if (vote) votes.add(vote);
+    if (vote) votes[vote]++;
   }
-  return votes.size === 1 ? [...votes][0] : null; // none, or contradictory: ask the user
+  return votes;
+}
+
+function detectDecimalSeparator(values, minVotes = 2) {
+  const votes = columnVotes(values);
+  if (votes["."] && votes[","]) return null;  // contradictory: ask the user
+  const sep = votes["."] ? "." : ",";
+  return votes[sep] >= minVotes ? sep : null; // one value is not enough evidence
 }
 
 function parseNumberColumn(values, chosenLocale) {
-  const decimal = detectDecimalSeparator(values)
-    ?? (chosenLocale ? localeSeparators(chosenLocale).decimal : null);
-  if (!decimal) return { decimal: null, numbers: null }; // show the column and ask
-  const numbers = values.map((v) => {
-    const s = splitSign(v);
-    return s ? toNumber(s, decimal) : null; // null: empty or not a number, flag the cell
-  });
-  return { decimal, numbers };
+  const ask = (reason) => ({ decimal: null, numbers: null, ask: reason });
+  let separators;
+  if (chosenLocale) {
+    separators = localeSeparators(chosenLocale);
+    if (!separators || !/^[.,]$/.test(separators.decimal)) return ask("locale not supported");
+    const other = separators.decimal === "," ? "." : ",";
+    if (columnVotes(values)[other] > 0) return ask("data disagrees with the chosen locale");
+  } else {
+    const decimal = detectDecimalSeparator(values);
+    if (!decimal) return ask("no clear format");
+    separators = { decimal, group: decimal === "," ? "." : "," };
+  }
+  // null in numbers: the cell is empty or not a number, so flag it in the preview
+  return { decimal: separators.decimal, numbers: values.map((v) => readNumber(v, separators)), ask: null };
 }
 
-ok("eu: splitSign", () => {
-  assert.deepStrictEqual(splitSign("1.234,56"), { negative: false, body: "1.234,56" });
-  assert.deepStrictEqual(splitSign("-1.234,56 €"), { negative: true, body: "1.234,56" });
-  assert.deepStrictEqual(splitSign("1.234,56-"), { negative: true, body: "1.234,56" });
-  assert.deepStrictEqual(splitSign("(1,234.56)"), { negative: true, body: "1,234.56" });
-  assert.deepStrictEqual(splitSign("−1 234,56"), { negative: true, body: "1234,56" });
-  assert.deepStrictEqual(splitSign("EUR 1.234,56"), { negative: false, body: "1.234,56" });
-  assert.deepStrictEqual(splitSign("1’234.50 CHF"), { negative: false, body: "1234.50" });
-  assert.deepStrictEqual(splitSign("-€1,234.56"), { negative: true, body: "1,234.56" });
-  assert.deepStrictEqual(splitSign("+12"), { negative: false, body: "12" });
-  assert.deepStrictEqual(splitSign("1 234,56 €"), { negative: false, body: "1234,56" });
-  assert.strictEqual(splitSign(""), null); assert.strictEqual(splitSign("n/a"), null); assert.strictEqual(splitSign("12abc34"), null); assert.strictEqual(splitSign("1.234,56EUR").body, "1.234,56"); assert.strictEqual(splitSign("EURO"), null); assert.strictEqual(splitSign(null), null);
+ok("eu: the problem is real", () => { assert.strictEqual(parseFloat("1.234,56"), 1.234); assert(Number.isNaN(Number("1.234,56"))); assert(Number.isNaN(Number("1,234.56"))); assert.strictEqual(parseFloat("1,234.56"), 1); assert.strictEqual(typeof Intl.NumberFormat.prototype.parse, "undefined"); assert.strictEqual(String(Number("12345678901234567891")), "12345678901234567000"); });
+ok("eu: splitSign accepts real formats", () => {
+  const b = (v) => { const s = splitSign(v); return s && (s.negative ? "-" : "") + s.body; };
+  const cases = {
+    "1.234,56": "1.234,56", "-1.234,56 €": "-1.234,56", "1.234,56-": "-1.234,56", "(1,234.56)": "-1,234.56",
+    "(€1,234.56)": "-1,234.56", "\u22121 234,56": "-1234,56", "EUR 1.234,56": "1.234,56", "1.234,56EUR": "1.234,56",
+    "1’234.50 CHF": "1234.50", "1'234'567.50": "1234567.50", "-€1,234.56": "-1,234.56", "€-1,234.56": "-1,234.56",
+    "+€5": "5", "€+5": "5", "R$ 1.234,56": "1.234,56", "kr 1 234,56": "1234,56", "1.234,56 kr.": "1.234,56",
+    "kr. 1.234,56": "1.234,56", "1 234,56 zł": "1234,56", "₩1,234": "1,234", "+12": "12",
+    "1 234,56\u202f€": "1234,56", "1\u00a0234,56": "1234,56", "1\u202f234\u202f567,89": "1234567,89",
+  };
+  for (const [input, want] of Object.entries(cases)) assert.strictEqual(b(input), want, input);
+});
+ok("eu: splitSign rejects what it cannot prove", () => {
+  for (const v of ["", null, "n/a", "12abc34", "ISO9001", "ABC123", "12 PCS", "2,5 Mio", "1,5 MRD", "100 TSD", "12k", "1,5E+03",
+                   "1$234", "$1$2", "1€2", "$5€", "10 20", "2026 11", "1 23,4", "12'3", "1'000'00", "030 123 456", "0 500", "1 234'567",
+                   "(-5)", "(\u22125)", "(5-)", "-5-", "EURO", "\u0661\u0662\u0663", "\uff11,234"])
+    assert.strictEqual(splitSign(v), null, String(v));
 });
 ok("eu: toNumber", () => {
-  const n = (b, d, neg = false) => toNumber({ negative: neg, body: b }, d);
+  const n = (b, d, opts) => toNumber({ negative: false, body: b }, d, opts);
   assert.strictEqual(n("1.234,56", ","), 1234.56); assert.strictEqual(n("1,234.56", "."), 1234.56);
-  assert.strictEqual(n("1.234.567", ","), 1234567); assert.strictEqual(n("12,34,567.89", "."), 1234567.89);
-  assert.strictEqual(n(",5", ","), 0.5); assert.strictEqual(n("1234,56", ",", true), -1234.56);
-  assert.strictEqual(n("1,2,3", ","), null); assert.strictEqual(n("1,23.4", ","), null); assert.strictEqual(n("1.23", ","), null); assert.strictEqual(n("1.2345", ","), null);
+  assert.strictEqual(n("1.234.567", ","), 1234567); assert.strictEqual(n(",5", ","), 0.5); assert.strictEqual(n("0,5", ","), 0.5);
+  assert.strictEqual(toNumber({ negative: true, body: "1234,56" }, ","), -1234.56);
+  assert.strictEqual(n("12,34,567.89", ".", { indian: true }), 1234567.89);
+  assert.strictEqual(n("123456789012345", "."), 123456789012345);
+  for (const [b, d] of [["1,2,3", ","], ["1,23.4", ","], ["1.23", ","], ["1.2345", ","], ["1,", ","], ["1.", "."], ["030.123.456", ","],
+                        ["07.11.2026", ","], ["12,34,567.89", "."], ["1.23.456", ","], ["12.34.567", ","], ["1234567890123456", "."],
+                        ["1.234.567.890.123.456.789", ","]])
+    assert.strictEqual(n(b, d), null, b);
+  assert.strictEqual(n("1.23.456", ",", { indian: true }), null); // Indian grouping only with commas
 });
 ok("eu: locale separators (ICU)", () => {
-  assert.deepStrictEqual(localeSeparators("de-DE"), { group: ".", decimal: "," });
-  assert.deepStrictEqual(localeSeparators("en-US"), { group: ",", decimal: "." });
-  assert.deepStrictEqual(localeSeparators("fr-FR"), { group: " ", decimal: "," });
+  assert.deepStrictEqual(localeSeparators("de-DE"), { group: ".", decimal: ",", indian: false });
+  assert.deepStrictEqual(localeSeparators("en-US"), { group: ",", decimal: ".", indian: false });
+  assert.deepStrictEqual(localeSeparators("fr-FR"), { group: "\u202f", decimal: ",", indian: false });
+  assert.deepStrictEqual(localeSeparators("en-IN"), { group: ",", decimal: ".", indian: true });
   const ch = localeSeparators("de-CH"); assert.strictEqual(ch.decimal, "."); assert.match(ch.group, /^['’]$/);
-  for (const l of ["de-DE", "fr-FR", "de-CH", "en-IN", "it-IT", "es-ES", "nl-NL", "pt-BR", "en-US", "en-GB", "ja-JP"]) assert.strictEqual(parseLocaleNumber(new Intl.NumberFormat(l).format(-1234567.891), l), -1234567.891, l);
-  assert.strictEqual(parseLocaleNumber("1.234,56", "de-DE"), 1234.56); assert.strictEqual(parseLocaleNumber("1.234,56", "en-US"), null);
+  assert.strictEqual(localeSeparators("xx_YY"), null);
+  const table = { "en-US": "1,234,567.89", "en-GB": "1,234,567.89", "ja-JP": "1,234,567.89", "de-DE": "1.234.567,89", "it-IT": "1.234.567,89",
+                  "es-ES": "1.234.567,89", "nl-NL": "1.234.567,89", "pt-BR": "1.234.567,89", "fr-FR": "1\u202f234\u202f567,89", "en-IN": "12,34,567.89" };
+  for (const [l, want] of Object.entries(table)) assert.strictEqual(new Intl.NumberFormat(l).format(1234567.89), want, l);
+  assert.match(new Intl.NumberFormat("de-CH").format(1234567.89), /^1['’]234['’]567\.89$/);
+  for (const l of ["es-ES", "it-IT", "pl-PL"]) assert.strictEqual(new Intl.NumberFormat(l).format(1234.56).replace(/\s/g, " "), "1234,56", l);
+  for (const l of [...Object.keys(table), "de-CH", "de-AT", "pl-PL", "he-IL", "sv-SE"])
+    assert.strictEqual(parseLocaleNumber(new Intl.NumberFormat(l).format(-1234567.891), l), -1234567.891, l);
+});
+ok("eu: parseLocaleNumber", () => {
+  assert.strictEqual(parseLocaleNumber("1.234,56", "de-DE"), 1234.56);
+  assert.strictEqual(parseLocaleNumber("1.234,56", "en-US"), null);
+  assert.strictEqual(parseLocaleNumber(1.234, "de-DE"), 1.234);
+  assert.strictEqual(parseLocaleNumber("1.234", "fr-FR"), 1234); assert.strictEqual(parseLocaleNumber(new Intl.NumberFormat("de-AT", { style: "currency", currency: "EUR" }).format(1234.5), "de-AT"), 1234.5); assert.strictEqual(parseLocaleNumber("1\n234", "en-US"), null); assert.strictEqual(parseLocaleNumber("1\t234", "en-US"), null); assert.strictEqual(parseLocaleNumber("01067", "de-DE"), null); assert.strictEqual(parseLocaleNumber("007", "en-US"), null); assert.ok(Object.is(parseLocaleNumber("-0", "en-US"), 0)); assert.ok(Object.is(parseLocaleNumber("(0)", "en-US"), 0)); assert.strictEqual(parseLocaleNumber("0,5", "de-DE"), 0.5); for (const l of ["de-AT", "fr-FR", "pl-PL"]) assert.strictEqual(parseLocaleNumber("1.234,56", l), 1234.56, l); for (const v of ["(€5)", "€(5)", "-€5"]) assert.strictEqual(parseLocaleNumber(v, "en-US"), -5, v);
+  assert.strictEqual(parseLocaleNumber("1 234,5", "fr-FR"), 1234.5);
+  assert.strictEqual(parseLocaleNumber("1.234", "ar-EG"), null);
+  assert.strictEqual(parseLocaleNumber("1", "xx_YY"), null);
+  assert.strictEqual(parseLocaleNumber("12,34,567", "en-IN"), 1234567);
+  assert.strictEqual(parseLocaleNumber("1,23,456", "en-US"), null);
+  assert.strictEqual(parseLocaleNumber("030 123 456", "de-DE"), null);
 });
 ok("eu: detect decimal separator", () => {
-  assert.strictEqual(detectDecimalSeparator(["1.234,56", "99"]), ",");
-  assert.strictEqual(detectDecimalSeparator(["1,234.56", "99"]), ".");
-  assert.strictEqual(detectDecimalSeparator(["12,5", "1.234"]), ",");
-  assert.strictEqual(detectDecimalSeparator(["1.234.567"]), ",");
-  assert.strictEqual(detectDecimalSeparator(["0,125"]), ",");
+  assert.strictEqual(detectDecimalSeparator(["1.234,56", "99,90"]), ",");
+  assert.strictEqual(detectDecimalSeparator(["1,234.56", "12.5", "99"]), ".");
+  assert.strictEqual(detectDecimalSeparator(["12,5", "1.234.567"]), ",");
+  assert.strictEqual(detectDecimalSeparator(["1.234,56", "99"]), null);
+  assert.strictEqual(detectDecimalSeparator(["1,500", "2,500", "3,25"]), null);
   assert.strictEqual(detectDecimalSeparator(["1,234", "5,678"]), null);
-  assert.strictEqual(detectDecimalSeparator(["1.234,56", "1,234.56"]), null);
+  assert.strictEqual(detectDecimalSeparator(["1.234,56", "2,5", "1,234.56"]), null);
+  assert.strictEqual(detectDecimalSeparator(["07.11.2026", "01.12.2026"]), null);
+  assert.strictEqual(detectDecimalSeparator(["07.11", "08.11", "1.234"]), null); assert.strictEqual(detectDecimalSeparator(["7.11", "8.11"]), "."); assert.strictEqual(detectDecimalSeparator(["1.10", "1.2"]), "."); assert.strictEqual(detectDecimalSeparator(["10.100.200.100", "192.168.100.200"]), ","); // short dates, versions and IPs can vote
+  assert.strictEqual(detectDecimalSeparator([1.5, 2.25, "3,5"]), null);
   assert.strictEqual(detectDecimalSeparator(["12", "", "n/a"]), null);
+  assert.deepStrictEqual(columnVotes(["1.234,56", "-99,90 €", "1.000-"]), { ".": 0, ",": 2 });
 });
 ok("eu: parse a column", () => {
-  assert.deepStrictEqual(parseNumberColumn(["1.234,56", "-99,90 €", "1.000-", "", "n/a"]), { decimal: ",", numbers: [1234.56, -99.9, -1000, null, null] });
-  assert.deepStrictEqual(parseNumberColumn(["1,234", "5,678"]), { decimal: null, numbers: null });
-  assert.deepStrictEqual(parseNumberColumn(["1,234", "5,678"], "de-DE"), { decimal: ",", numbers: [1.234, 5.678] });
+  assert.deepStrictEqual(parseNumberColumn(["1.234,56", "-99,90 €", "1.000-", "", "n/a"]), { decimal: ",", numbers: [1234.56, -99.9, -1000, null, null], ask: null });
+  assert.deepStrictEqual(parseNumberColumn(["1,234", "5,678"]), { decimal: null, numbers: null, ask: "no clear format" });
+  assert.deepStrictEqual(parseNumberColumn(["1,234", "5,678"], "de-DE"), { decimal: ",", numbers: [1.234, 5.678], ask: null });
+  assert.deepStrictEqual(parseNumberColumn(["1,234", "5,678", "9.99"], "de-DE").ask, "data disagrees with the chosen locale");
+  assert.deepStrictEqual(parseNumberColumn(["1.234", "2.500", "3,5"], "en-US").ask, "data disagrees with the chosen locale");
+  assert.deepStrictEqual(parseNumberColumn(["1.234", "2.500", "12.000"], "en-US").numbers, [1.234, 2.5, 12]); // nothing in the data can tell
+  assert.deepStrictEqual(parseNumberColumn(["1.234", "5.678"], "fr-FR").numbers, [1234, 5678]); assert.deepStrictEqual(parseNumberColumn(["1.234,56", "2.500,00", "99,90"], "de-AT").numbers, [1234.56, 2500, 99.9]);
+  assert.deepStrictEqual(parseNumberColumn(["1,5", "2,5"], "ar-EG").ask, "locale not supported");
+  assert.deepStrictEqual(parseNumberColumn(["1"], "xx_YY").ask, "locale not supported");
+  assert.deepStrictEqual(parseNumberColumn(["1.234,56", "1.000-", "", "n/a"]).ask, "no clear format");
+  assert.deepStrictEqual(parseNumberColumn(["-99,90 €", "1.000-", "", "n/a"]).ask, "no clear format");
+  assert.strictEqual(parseLocaleNumber("2020-", "en-US"), -2020);
+  assert.deepStrictEqual(parseNumberColumn([1.234, "2,5", "3,75"]), { decimal: ",", numbers: [1.234, 2.5, 3.75], ask: null });
 });
 
 const XLSX = require(process.env.XLSX_MODULE || "xlsx");
