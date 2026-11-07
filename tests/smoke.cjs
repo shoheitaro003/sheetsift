@@ -51,6 +51,15 @@ function check(name, ok, detail) {
     check("german: decimal comma", r.rows[0][2] === "1234.50|fixed", r.rows);
   }
 
+  // 2b. Negative and Swiss formats from accounting exports (see the European numbers article)
+  r = await page.evaluate(() => {
+    const p = window.SheetSiftEngine.parseNumber;
+    return [p("1.234,56-", true), p("\u22121.234,56", true), p("1'234.50", false), p("1\u2019234.50 CHF", false), p("CHF 99.90", false), p("(1,234.56)", false), p("-99,90 €", true), p("12abc34", false)];
+  });
+  check("numbers: trailing minus, U+2212, apostrophes, CHF", JSON.stringify(r) === JSON.stringify([-1234.56, -1234.56, 1234.5, 1234.5, 99.9, -1234.56, -99.9, null]), r);
+  r = await safe("ledger", "Konto;Saldo\nKasse;1.234,56-\nBank;2.000,00\nDebitoren;\u2212150,00\n");
+  if (r) check("ledger: negative formats become numbers", r.cols[1] === "number" && r.rows.map((x) => x[1]).join() === "-1234.56|fixed,2000.00|fixed,-150.00|fixed", r);
+
   // 3. Japanese headers, yen, Japanese dates
   r = await safe("japanese", "顧客一覧,,,\n氏名,メール,登録日,金額\n田中,tanaka@example.jp,2026年4月3日,\"¥1,200\"\n佐藤,sato@example.jp,2026/04/05,800円\n鈴木,suzuki@example.jp,2026-04-06,1500\n合計,,,3500\n");
   if (r) {

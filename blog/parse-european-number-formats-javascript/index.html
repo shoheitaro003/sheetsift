@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>How to parse European number formats in JavaScript (1.234,56 vs 1,234.56) without a library | SheetSift</title>
+<title>How to parse European number formats in JavaScript (1.234,56 vs 1,234.56) | SheetSift</title>
 <meta name="description" content="parseFloat(&quot;1.234,56&quot;) returns 1.234 without an error. Tested JavaScript to parse decimal commas, negative values and currency symbols, and to detect the format of a column.">
 <link rel="canonical" href="https://shoheitaro003.github.io/sheetsift/blog/parse-european-number-formats-javascript/">
-<meta property="og:title" content="How to parse European number formats in JavaScript (1.234,56 vs 1,234.56) without a library | SheetSift">
+<meta property="og:title" content="How to parse European number formats in JavaScript (1.234,56 vs 1,234.56) | SheetSift">
 <meta property="og:description" content="parseFloat(&quot;1.234,56&quot;) returns 1.234 without an error. Tested JavaScript to parse decimal commas, negative values and currency symbols, and to detect the format of a column.">
 <meta property="og:url" content="https://shoheitaro003.github.io/sheetsift/blog/parse-european-number-formats-javascript/">
 <meta property="og:site_name" content="SheetSift">
@@ -17,7 +17,7 @@
 <link rel="stylesheet" href="../../blog.css">
 <meta property="og:type" content="article">
 <meta property="article:published_time" content="2026-11-07">
-<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "How to parse European number formats in JavaScript (1.234,56 vs 1,234.56) without a library", "description": "parseFloat(\"1.234,56\") returns 1.234 without an error. Tested JavaScript to parse decimal commas, negative values and currency symbols, and to detect the format of a column.", "datePublished": "2026-11-07", "dateModified": "2026-11-07", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/parse-european-number-formats-javascript/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "How to parse European number formats in JavaScript (1.234,56 vs 1,234.56)", "description": "parseFloat(\"1.234,56\") returns 1.234 without an error. Tested JavaScript to parse decimal commas, negative values and currency symbols, and to detect the format of a column.", "datePublished": "2026-11-07", "dateModified": "2026-11-07", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/parse-european-number-formats-javascript/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
 </head>
 <body>
 <header class="top"><div class="wrap">
@@ -26,7 +26,7 @@
 </div></header>
 <main><div class="wrap">
 <article>
-<h1>How to parse European number formats in JavaScript (1.234,56 vs 1,234.56) without a library</h1>
+<h1>How to parse European number formats in JavaScript (1.234,56 vs 1,234.56)</h1>
 <p class="meta"><time datetime="2026-11-07">2026-11-07</time></p>
 <p>A customer in Germany uploads a CSV with a price column. The first value is <code>1.234,56</code>. Your importer calls <code>parseFloat</code>, stores <code>1.234</code>, and nobody notices until an invoice is off by a factor of a thousand.</p>
 <pre><code>parseFloat(&quot;1.234,56&quot;); // 1.234   (wrong, and no error)
