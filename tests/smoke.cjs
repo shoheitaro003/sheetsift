@@ -33,6 +33,10 @@ function check(name, ok, detail) {
     try { return await run(text); } catch (e) { check(name + " does not crash", false, String(e)); return null; }
   };
 
+  // 0. Visit counter: present, but never loads outside the public site (so tests and local runs are not counted)
+  const gcr = await page.evaluate(() => ({ inline: document.documentElement.innerHTML.includes("sheetsift.goatcounter.com/count"), loaded: !!document.querySelector('script[src*="gc.zgo.at"]') }));
+  check("counter: snippet present, not loaded on file://", gcr.inline && !gcr.loaded, gcr);
+
   // 1. Built-in sample
   let r = await page.evaluate(() => {
     const E = window.SheetSiftEngine; const res = E.process(E.parseCSV(window.__sheetsiftSample));

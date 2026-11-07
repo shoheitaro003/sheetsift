@@ -449,7 +449,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;
 <footer>
   <div class="wrap">
     <span>SheetSift · early access · <a href="blog/">Blog</a></span>
-    <span>Product names mentioned belong to their owners.</span>
+    <span>Product names mentioned belong to their owners. Visits are counted with <a href="https://www.goatcounter.com/">GoatCounter</a>, which does not track you across sites.</span>
   </div>
 </footer>
 
@@ -917,6 +917,15 @@ window.SheetSiftEngine = (function(){
     msg.className = "form-msg"; msg.textContent = "Sending…";
   });
 })();
+</script>
+<script>
+// Page view counter (GoatCounter). Only on the public site, so local runs and tests are never counted.
+if (location.hostname === "shoheitaro003.github.io") {
+  var gc = document.createElement("script");
+  gc.async = true; gc.src = "https://gc.zgo.at/count.js";
+  gc.setAttribute("data-goatcounter", "https://sheetsift.goatcounter.com/count");
+  document.body.appendChild(gc);
+}
 </script>
 </body>
 </html>
