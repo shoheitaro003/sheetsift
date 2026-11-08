@@ -1,5 +1,6 @@
 import sys; import os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from snippets import *
+hdr_cjs = HDR_SHEETJS.replace('// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz\nimport * as XLSX from "xlsx";\n', '')
 excel_cjs = EXCEL.replace('// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz\nimport * as XLSX from "xlsx";\n', 'const XLSX = require(process.env.XLSX_MODULE || "xlsx");\n')
 out = f'''// Runs every code example from the blog posts. Run: node tests/article-examples.cjs
 // Generated from the same source as the article, so the two never drift apart.
@@ -127,10 +128,138 @@ ok("eu: parse a column", () => {{
   assert.strictEqual(parseLocaleNumber("2020-", "en-US"), -2020);
   assert.deepStrictEqual(parseNumberColumn([1.234, "2,5", "3,75"]), {{ decimal: ",", numbers: [1.234, 2.5, 3.75], ask: null }});
 }});
+
+// --- blog/detect-header-row-spreadsheet-javascript ---
+{HDR_KIND}
+
+{HDR_SCORE}
+
+{HDR_FIND}
+
+{HDR_RECORDS}
+
+ok("hdr: the naive rules fail", () => {{
+  const kv = [["Report", "Monthly sales"], ["Owner", "Ken"], ["Date", "Amount", "Date", "Amount"], ["2026-01-01", "5", "2026-01-02", "6"]];
+  assert.strictEqual(findHeaderRow(kv), 0); // widest unique text row: duplicate names knock out the real header
+  assert.strictEqual(findHeader(kv).row, 2);
+}});
+ok("hdr: cellKind", () => {{
+  for (const v of [49, 0, true, new Date(), "49", "-5", "(1,234.56)", "1.234,56 €", "€ 99,90", "12%", "\\u22125", "1\\u00a0234,56", "2026-11-08", "08/11/2026", "8.11.2026", "2026-11-08 09:30", "09:30", "yui@example.jp"])
+    assert.strictEqual(cellKind(v), "value", String(v));
+  for (const v of ["Name", "E-mail", "Q1 2026", "MRR ($)", "Prepared by:", "090-1234-5678", "ID-0042", "2026-Q1", "May I help", "1/2"])
+    assert.strictEqual(cellKind(v), "label", v);
+  for (const v of ["2026-11-08T10:00:00Z", "2026-11-08T10:00:00.123+09:00", "10:30 AM", "TRUE", "false", "Nov 8, 2026", "November 8th, 2026", "8-Nov-2026", "8 Nov 26", "1e5", "-2.5E-3", "+81 90 1234 5678", "1.2.3.4"])
+    assert.strictEqual(cellKind(v), "value", v);
+  for (const v of ["", "  ", null, undefined, "N/A", "n/a", "#N/A", "-", "\u2014", "?", "null", "None"]) assert.strictEqual(cellKind(v), "empty", String(v));
+}});
+ok("hdr: finds the header in real layouts", () => {{
+  const cases = [
+    [[["Export (do not edit)"], [], ["Name", "Email", "Plan", "MRR"], ["Yui", "yui@example.jp", "Pro", "49"], ["Ken", "ken@example.com", "Free", "0"]], 2],
+    [[["Name", "Email"], ["A", "a@example.com"], ["B", "b@example.com"]], 0],
+    [[["Report", "Monthly sales"], ["Period", "2026-10"], ["Prepared by:", "Yui"], [], ["Product", "Units"], ["Tea", "12"], ["Rice", "40"], ["Miso", "7"]], 4],
+    [[["Report", "Monthly sales"], ["Prepared by", "Yui"], [], ["Product", "Units", "Price", "Date"], ["Tea", "12", "4.50", "2026-10-01"], ["Rice", "40", "2.00", "2026-10-02"]], 3],
+    [[["Report", "Q3"], ["Owner", "Ken"], ["Date", "Amount", "Date", "Amount"], ["2026-01-01", "5", "2026-01-02", "6"]], 2],
+    [[["Sales"], ["Name", "Joined", "Amount"], ["Yui", new Date(), 49.5], ["Ken", new Date(), 0]], 1],
+    [[["Title"], ["Name", "Email", "Phone", "Note"], ["Yui", "yui@example.jp", "", ""], ["Ken", "ken@example.com", "", ""], ["Ann", "ann@example.com", "", "x"]], 1],
+    [[["Email"], ["a@example.com"], ["b@example.com"]], 0],
+    [[["Name", "Amount"], ["Yui", "5"], ["Ken", "7"], ["Name", "Amount"], ["Ann", "3"]], 0],
+  ];
+  for (const [rows, want] of cases) assert.deepStrictEqual(findHeader(rows), {{ row: want, sure: true, why: "column names above typed values" }}, JSON.stringify(rows[want]));
+}});
+ok("hdr: says when it is not sure", () => {{
+  const why = (rows) => {{ const f = findHeader(rows); assert.strictEqual(f.sure, false); return [f.row, f.why]; }};
+  assert.deepStrictEqual(why([["Name", "City"], ["Yui", "Osaka"], ["Ken", "Kyoto"]]), [0, "no typed values under it, so the header cannot be confirmed"]);
+  assert.deepStrictEqual(why([["Name", "Amount"], ["Yui", "5"], ["Ken", "7"], [], ["Product", "Units"], ["Tea", "3"]]), [0, "another row is almost as likely"]);
+  assert.deepStrictEqual(why([["", "Q1", "", "Q2", ""], ["Name", "Revenue", "Cost", "Revenue", "Cost"], ["Tea", "100", "40", "120", "50"]]), [1, "the row above may be part of the header"]);
+  assert.deepStrictEqual(why([["Customer", "", "Contact", ""], ["Name", "Plan", "Email", "Phone"], ["Yui", "Pro", "yui@example.jp", "090-1234-5678"]]), [1, "the row above may be part of the header"]);
+  assert.deepStrictEqual(why([["Owner", "", "Ken"], ["Name", "Email", "MRR"], ["Yui", "yui@example.jp", "49"]]), [1, "the row above may be part of the header"]); // a false alarm: asks, never guesses
+  for (const rows of [[], [[], [], []], [["Yui", "yui@example.jp", "49"], ["Ken", "ken@example.com", "0"]], [["Region", "2024", "2025"], ["North", "1200", "1350"], ["South", "900", "1010"]], [[1, 2], [3, 4]]])
+    assert.deepStrictEqual(findHeader(rows), {{ row: null, sure: false, why: "no row looks like column names" }}, JSON.stringify(rows));
+}});
+ok("hdr: claims in the text", () => {{
+  assert.strictEqual(findHeader([["Region", "Product", "Channel", "2026"], ["North", "Tea", "Web", "1200"], ["South", "Rice", "Shop", "900"]]).row, 0); // one numeric header
+  assert.deepStrictEqual(findHeader([["Title"], ["Name", "MRR"], ["Yui", ""], ["Ken", "49"]]), {{ row: 1, sure: true, why: "column names above typed values" }}); // blank first value
+  const csv = "Monthly sales\\n\\nName,MRR\\nYui,49\\nKen,0".split("\\n").map((line) => line.split(","));
+  assert.strictEqual(findHeader(csv).row, 2);
+  const shortFile = [["Note 1"], ["Note 2"], ["Note 3"], ["Note 4"], ["Note 5"], ["Name", "MRR"], ["Yui", 49], ["Ken", 0]];
+  assert.strictEqual(findHeader(shortFile).row, 5); // notes outnumber data rows: contrast still wins
+}});
+ok("hdr: review findings", () => {{
+  assert.deepStrictEqual(findHeader([["Name", "Amount"], ["a", "N/A"], ["b", "-"], ["c", 3]]).row, 0);
+  for (const rows of [[["Name", "Email"], ["Ann", "Ann at acme"], ["Bob", "b@x.co"]], [["Name", "Email"], ["Ann", "Ann at acme"], ["Bob", "b@x.co"], ["Cy", "c@x.co"]]])
+    assert.deepStrictEqual(findHeader(rows), {{ row: 1, sure: false, why: "the row above may be part of the header" }}); // a bad first value: flagged, not trusted
+  assert.deepStrictEqual(findHeader([["Name", "Joined"], ["Yui", "2026-11-08T10:00:00Z"], ["Ken", "Nov 8, 2026"]]).sure, true);
+  assert.deepStrictEqual(findHeader([["Export"], ["Name", "Phone", "Plan", "MRR"], ["Yui", "090-1234-5678", "Pro", 49], ["Ken", "+81 90 1234 5678", "Free", 0]]), {{ row: 1, sure: false, why: "another row is almost as likely" }}); // mostly text columns: right row, flagged
+  const holes = [["A", "B"], , ["1", "2"], undefined, ["3", "4"]];
+  assert.strictEqual(findHeader(holes).row, 0);
+  assert.deepStrictEqual(toRecords(holes, 0).map((r) => r.row), [3, 5]);
+  assert.deepStrictEqual(findHeader([["Name", "Amount"], ["x", 1, 2, 3, 4], ["y", 5, 6, 7, 8]]).row, null); // narrower header: listed as a limit
+  assert.deepStrictEqual(toRecords([["A", "Column C", ""], [1, 2, 3]], 0)[0].values, {{ A: 1, "Column C": 2, "Column C (2)": 3 }});
+  for (const v of ["#DIV/0!", "#VALUE!", "#REF!", "#NAME?", "#N/A"]) assert.strictEqual(cellKind(v), "empty", v);
+  for (const v of ["No", "yes", "#ID", "#1", "Jan 2026"]) assert.strictEqual(cellKind(v), "label", v);
+  assert.deepStrictEqual(findHeader([["No", "Name", "Date"], [1, "Yui", "2026-01-01"], [2, "Ken", "2026-01-02"]]).row, 0);
+  assert.deepStrictEqual(findHeader([["#ID", "Name"], [1, "Yui"], [2, "Ken"]]).row, 0);
+  assert.deepStrictEqual(toRecords([["Yui"]], null), []);
+  for (const v of ["#NUM!", "#NULL!", "#SPILL!", "#CALC!"]) assert.strictEqual(cellKind(v), "empty", v);
+  for (const v of ["5 kg", "USD 5"]) assert.strictEqual(cellKind(v), "label", v); // listed as a limit
+  assert.deepStrictEqual(findHeader([["Report", "Sales"], ["Owner", "Ken"], ["Name", "Amount"], ["Yui", 5], ["Ken", 7]]), {{ row: 2, sure: false, why: "the row above may be part of the header" }});
+  assert.deepStrictEqual(findHeader([["Item", "Weight", "Price"], ["", "kg", "USD"], ["Tea", 5, 4.5], ["Rice", 2, 3]]).row, 1); // units row: flagged, listed as a limit
+  assert.strictEqual(findHeader([["Item", "Weight", "Price"], ["", "kg", "USD"], ["Tea", 5, 4.5], ["Rice", 2, 3]]).sure, false);
+  assert.deepStrictEqual(findHeader([["Name", "Email"]]), {{ row: 0, sure: false, why: "no typed values under it, so the header cannot be confirmed" }});
+  const proto = toRecords([["__proto__", "b"], ["x", 2]], 0)[0].values;
+  assert.strictEqual(Object.getPrototypeOf(proto), Object.prototype);
+  assert.deepStrictEqual(Object.keys(proto), ["__proto__", "b"]); assert.strictEqual(proto["__proto__"], "x");
+}});
+ok("hdr: scan limit", () => {{
+  const rows = [...Array.from({{ length: 25 }}, () => []), ["Name", "Amount"], ["Yui", 5], ["Ken", 7]];
+  assert.strictEqual(findHeader(rows).row, null);
+  assert.strictEqual(findHeader(rows, {{ scan: 30 }}).row, 25);
+}});
+ok("hdr: columnNames", () => {{
+  const none = () => false, all = () => true;
+  assert.deepStrictEqual(columnNames(["Amount", "amount", " Amount ", "", "Amount (2)"], none), ["Amount", "amount (3)", "Amount (4)", null, "Amount (2)"]);
+  assert.deepStrictEqual(columnNames(["Amount", "amount", "Amount (2)"], none), ["Amount", "amount (3)", "Amount (2)"]);
+  assert.deepStrictEqual(columnNames(["A", "", "Column B"], all), ["A", "Column B (2)", "Column B"]);
+  assert.deepStrictEqual(columnNames(["A", ""], all, 1), ["A", "Column C"]);
+  assert.deepStrictEqual([0, 25, 26, 27, 701, 702].map(columnLetter), ["A", "Z", "AA", "AB", "ZZ", "AAA"]);
+}});
+ok("hdr: toRecords", () => {{
+  const rows = [["Report"], [], ["Name", "Amount", "", "Amount"], ["Yui", 5, "", 6], [], ["Name", "Amount", "", "Amount"], ["Ken", 7, "x", 8], ["Ann"]];
+  assert.deepStrictEqual(toRecords(rows, 2), [
+    {{ row: 4, values: {{ Name: "Yui", Amount: 5, "Column C": "", "Amount (2)": 6 }} }},
+    {{ row: 7, values: {{ Name: "Ken", Amount: 7, "Column C": "x", "Amount (2)": 8 }} }},
+    {{ row: 8, values: {{ Name: "Ann", Amount: "", "Column C": "", "Amount (2)": "" }} }},
+  ]);
+  assert.deepStrictEqual(toRecords([["Name", ""], ["Yui", ""]], 0), [{{ row: 2, values: {{ Name: "Yui" }} }}]);
+  assert.deepStrictEqual(toRecords([["Name"], ["Yui"]], 0, {{ row: 4, col: 0 }})[0].row, 6);
+}});
 '''
 if len(sys.argv) > 1:
     out += f'''
 {excel_cjs}
+
+{hdr_cjs}
+ok("hdr: readTable with SheetJS", async () => {{
+  const sheet = XLSX.utils.aoa_to_sheet([["Export (do not edit)"], [], ["Name", "Joined", "MRR"], ["Yui", new Date(Date.UTC(2026, 3, 3)), 49], ["Ken", new Date(Date.UTC(2026, 3, 4)), 0]], {{ origin: "B3", cellDates: true }});
+  sheet["!ref"] = "B3:D7"; // as saved by tools that only record the used range
+  sheet["D6"].z = "#,##0.00 \\"€\\"";
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, sheet, "Data");
+  const bytes = XLSX.write(wb, {{ type: "array", bookType: "xlsx" }});
+  const raw = XLSX.utils.sheet_to_json(XLSX.read(bytes).Sheets.Data, {{ header: 1, defval: "", blankrows: true }});
+  assert.deepStrictEqual(raw[2], ["Name", "Joined", "MRR"]); // index 2, although the header is on row 5
+  const t = await readTable({{ arrayBuffer: async () => bytes }});
+  assert.strictEqual(t.sure, true); assert.strictEqual(t.headerRow, 5);
+  assert.deepStrictEqual(t.records.map((r) => r.row), [6, 7]);
+  assert.deepStrictEqual(Object.keys(t.records[0].values), ["Name", "Joined", "MRR"]);
+  assert.strictEqual(t.records[0].values.MRR, 49);
+  assert.ok(t.records[0].values.Joined instanceof Date);
+  const plain = XLSX.utils.sheet_to_json(XLSX.utils.aoa_to_sheet([["Date", "Amount", "Date", "Amount"], ["a", 1, "b", 2]]));
+  assert.deepStrictEqual(Object.keys(plain[0]), ["Date", "Amount", "Date_1", "Amount_1"]);
+  const repeated = XLSX.utils.sheet_to_json(XLSX.utils.aoa_to_sheet([["Name", "MRR"], ["Yui", 49], ["Name", "MRR"], ["Ken", 0]]));
+  assert.deepStrictEqual(repeated[1], {{ Name: "Name", MRR: "MRR" }}); // the default keeps a repeated header as data
+  const none = await readTable({{ arrayBuffer: async () => XLSX.write((() => {{ const w = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(w, XLSX.utils.aoa_to_sheet([[1, 2], [3, 4]]), "S"); return w; }})(), {{ type: "array", bookType: "xlsx" }}) }});
+  assert.deepStrictEqual([none.row, none.headerRow, none.records], [null, null, []]);
+}});
 ok("excel: skips empty first sheet and returns ISO dates", async () => {{
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([[]]), "Cover");

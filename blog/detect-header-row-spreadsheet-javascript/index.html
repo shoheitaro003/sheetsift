@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Detect the header row in Excel and CSV files with JavaScript | SheetSift</title>
+<meta name="description" content="Real exports put titles, notes and blank lines above the column names. Tested JavaScript that finds the header row and says when it is not sure.">
+<link rel="canonical" href="https://shoheitaro003.github.io/sheetsift/blog/detect-header-row-spreadsheet-javascript/">
+<meta property="og:title" content="Detect the header row in Excel and CSV files with JavaScript | SheetSift">
+<meta property="og:description" content="Real exports put titles, notes and blank lines above the column names. Tested JavaScript that finds the header row and says when it is not sure.">
+<meta property="og:url" content="https://shoheitaro003.github.io/sheetsift/blog/detect-header-row-spreadsheet-javascript/">
+<meta property="og:site_name" content="SheetSift">
+<meta name="twitter:card" content="summary">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400&display=swap">
+<link rel="stylesheet" href="../../blog.css">
+<meta property="og:type" content="article">
+<meta property="article:published_time" content="2026-11-08">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "Detect the header row in Excel and CSV files with JavaScript", "description": "Real exports put titles, notes and blank lines above the column names. Tested JavaScript that finds the header row and says when it is not sure.", "datePublished": "2026-11-08", "dateModified": "2026-11-08", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/detect-header-row-spreadsheet-javascript/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="logo" href="../../"><svg width="24" height="24" viewBox="0 0 26 26" aria-hidden="true"><rect x="1" y="1" width="24" height="24" rx="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M1 9h24M9 9v16" stroke="currentColor" stroke-width="2"/><rect x="11" y="12" width="12" height="4" fill="var(--mark)"/></svg> SheetSift</a>
+  <nav class="nav"><a href="../../blog/">Blog</a><a class="btn" href="../../#try">Try the demo</a></nav>
+</div></header>
+<main><div class="wrap">
+<article>
+<h1>Detect the header row in Excel and CSV files with JavaScript</h1>
+<p class="meta"><time datetime="2026-11-08">2026-11-08</time></p>
+<p>Your importer treats row 1 as the column names. The customer's file starts with <code>Monthly sales</code>, a date range and a blank line, so every field is mapped wrong, or the import fails with "column Email not found".</p>
+<p>This post builds a header detector in five steps. At the end you have a function that returns the header row, whether it is sure, and why, plus code that turns the rows below it into records with the row numbers your user sees in Excel. Every function, and every result quoted below, is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a>.</p>
+
+<h2>Why "the widest row of text" is not enough</h2>
+<p>Our post on <a href="../csv-importers-real-excel-files/">why CSV importers break on real Excel files</a> uses a short rule: take the widest row of unique text in the first 15 rows. It works for a title above the table. It fails on this file, which our tests check:</p>
+<table>
+<tr><th>Row</th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+<tr><td>1</td><td>Report</td><td>Q3</td><td></td><td></td></tr>
+<tr><td>2</td><td>Owner</td><td>Ken</td><td></td><td></td></tr>
+<tr><td>3</td><td>Date</td><td>Amount</td><td>Date</td><td>Amount</td></tr>
+<tr><td>4</td><td>2026-01-01</td><td>5</td><td>2026-01-02</td><td>6</td></tr>
+</table>
+<p>Row 3 has two columns named <code>Date</code>, so the uniqueness rule rejects it, and the short rule returns row 1. Nothing tells you it guessed. The version below picks row 3, and in the layouts it cannot decide, it says so.</p>
+
+<h2>The idea: column names sit above typed values</h2>
+<p>A header row has three properties that titles, notes and data rows rarely have together:</p>
+<ul>
+<li><strong>Fill:</strong> it spans most of the table's width. A title or a "Prepared by" line fills one or two cells.</li>
+<li><strong>Labels:</strong> its cells are words, not numbers, dates or emails.</li>
+<li><strong>Contrast:</strong> under its cells, the values change kind. <code>MRR</code> is a word; the cell under it is <code>49</code>. This is the strongest signal, because a data row of text (a name, a city) has text under it too.</li>
+</ul>
+<p>Each row in the first 20 gets a score from these three. The highest score wins, and three checks decide whether to trust it.</p>
+
+<h2>Step 1: label, value or empty</h2>
+<p>Every cell is put into one of three kinds. A <em>label</em> could be a column name. A <em>value</em> is data: a number, a date, a time, <code>TRUE</code>/<code>FALSE</code> or an email. (Not <code>Yes</code>/<code>No</code>: <code>No</code> is a common name for a row-number column.) Placeholders such as <code>N/A</code>, <code>-</code> and <code>null</code>, and Excel error values such as <code>#DIV/0!</code>, count as empty: they are neither data nor a name.</p>
+<p>Typed cells are values at once: when you read an .xlsx file as shown in step 5, a cell that holds a number arrives as a JavaScript number, however Excel formats it. For text, a few patterns decide. (In JavaScript, <code>\s</code> also matches no-break spaces, so <code>1&nbsp;234,56</code> with U+00A0 counts as a number.)</p>
+<pre><code>const asText = (value) =&gt; String(value ?? &quot;&quot;).trim();
+
+const LOOKS_NUMBER = /^[-+(\u2212]?\s?([$€£¥]\s?)?\d[\d\s.,&#x27;]*%?(\s?[$€£¥])?\)?$/;
+const LOOKS_SCIENTIFIC = /^[-+]?\d+(\.\d+)?e[-+]?\d+$/i;
+const LOOKS_DATE = /^\d{1,4}[\/.\-]\d{1,2}[\/.\-]\d{1,4}([ T]\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?\s?(Z|[+-]\d{2}:?\d{2})?)?$/i;
+const MONTH = &quot;(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?&quot;;
+const LOOKS_MONTH_DATE = new RegExp(
+  `^(\\d{1,2}[ -]${MONTH}[ ,-]*\\d{2,4}|${MONTH} \\d{1,2}(st|nd|rd|th)?,? \\d{4})$`, &quot;i&quot;);
+const LOOKS_TIME = /^\d{1,2}:\d{2}(:\d{2})?\s?(am|pm)?$/i;
+const LOOKS_BOOLEAN = /^(true|false)$/i; // not yes/no: &quot;No&quot; is a common column name
+const LOOKS_EMAIL = /^\S+@\S+\.\S+$/;
+// &quot;No value&quot; (and Excel errors such as #DIV/0!): neither data nor a name.
+const PLACEHOLDER =
+  /^(n\/?a|-+|\u2013|\u2014|\?|null|none|#(DIV\/0!|N\/A|REF!|NAME\?|VALUE!|NUM!|NULL!|SPILL!|CALC!))$/i;
+
+const VALUE_PATTERNS = [LOOKS_NUMBER, LOOKS_SCIENTIFIC, LOOKS_DATE, LOOKS_MONTH_DATE,
+                        LOOKS_TIME, LOOKS_BOOLEAN, LOOKS_EMAIL];
+
+// &quot;label&quot; = could be a column name, &quot;value&quot; = data, &quot;empty&quot; = nothing
+function cellKind(cell) {
+  if (typeof cell === &quot;number&quot; || typeof cell === &quot;boolean&quot; || cell instanceof Date) return &quot;value&quot;;
+  const t = asText(cell);
+  if (!t || PLACEHOLDER.test(t)) return &quot;empty&quot;;
+  return VALUE_PATTERNS.some((re) =&gt; re.test(t)) ? &quot;value&quot; : &quot;label&quot;;
+}</code></pre>
+<p>The patterns are deliberately loose, because they only need to separate "looks like data" from "looks like a name". <code>1.234,56 €</code>, <code>(1,234.56)</code>, <code>12%</code>, <code>1e5</code>, <code>08/11/2026</code>, <code>2026-11-08T10:00:00Z</code>, <code>Nov 8, 2026</code> and <code>10:30 AM</code> are values. <code>E-mail</code>, <code>MRR ($)</code>, <code>Q1 2026</code> and <code>Prepared by:</code> are labels.</p>
+<p>Loose patterns misfile some cells. <code>090-1234-5678</code> and <code>ID-0042</code> are labels, while <code>+81 90 1234 5678</code> and <code>1.2.3.4</code> are values. The other columns usually decide. In our test, a Name, Phone, Plan, MRR table with two rows (Yui, <code>090-1234-5678</code>, Pro, 49 and Ken, <code>+81 90 1234 5678</code>, Free, 0) still picks the header, but with <code>sure: false</code>: the more text columns a table has, the less evidence there is. (Reading the numbers correctly is a separate job, covered in our post on <a href="../parse-european-number-formats-javascript/">European number formats</a>.)</p>
+
+<h2>Step 2: score each row</h2>
+<p>The input to everything below is an array of rows, each an array of cells, as any spreadsheet or CSV parser returns. To measure fill you need the table's width. The number of filled cells that appears in the most rows is a good estimate, because data rows usually outnumber everything else. When they do not (five one-cell notes above two data rows, say), contrast still decides: our tests include that file.</p>
+<pre><code>// The most common number of filled cells per row: data rows outnumber everything else.
+function tableWidth(rows) {
+  const counts = new Map();
+  for (const row of rows) {
+    const filled = row.filter((c) =&gt; cellKind(c) !== &quot;empty&quot;).length;
+    if (filled) counts.set(filled, (counts.get(filled) || 0) + 1);
+  }
+  let width = 0, seen = 0;
+  for (const [w, n] of counts) {
+    if (n &gt; seen || (n === seen &amp;&amp; w &gt; width)) [width, seen] = [w, n];
+  }
+  return width;
+}
+
+// Kind of the first non-empty cell under rows[i][col], at most 3 rows down.
+function kindBelow(rows, i, col) {
+  for (let r = i + 1; r &lt; Math.min(rows.length, i + 4); r++) {
+    const kind = cellKind(rows[r][col]);
+    if (kind !== &quot;empty&quot;) return kind;
+  }
+  return &quot;empty&quot;;
+}
+
+function scoreRow(rows, i, width) {
+  const filled = rows[i]
+    .map((cell, col) =&gt; ({ cell, col, kind: cellKind(cell) }))
+    .filter((c) =&gt; c.kind !== &quot;empty&quot;);
+  if (!filled.length) return null;
+  const labels = filled.filter((c) =&gt; c.kind === &quot;label&quot;);
+  const fill = Math.min(filled.length / width, 1);
+  const labelShare = labels.length / filled.length;
+  if (fill &lt; 0.5 || labelShare &lt; 0.75) return null; // titles, notes and data rows stop here
+  const typedBelow = labels.filter((c) =&gt; kindBelow(rows, i, c.col) === &quot;value&quot;);
+  const contrast = typedBelow.length / labels.length;
+  const names = labels.map((c) =&gt; asText(c.cell).toLowerCase());
+  const duplicates = names.length - new Set(names).size;
+  return { contrast, score: fill + labelShare + 2 * contrast - 0.25 * duplicates };
+}</code></pre>
+<p>Two filters run before any score: at least half the table's width must be filled, and at least three quarters of the filled cells must be labels. That removes titles, notes and most data rows. The "three quarters" leaves room for one odd header such as <code>2026</code> in a four-column table.</p>
+<p>For contrast, the function looks up to three rows down for the first non-empty cell in each column, so a blank first data row does not hide the change. Contrast counts twice because it is the strongest evidence that a row names the columns under it. Key-value lines such as <code>Period | 2026-01-01</code> also have a value under a label, but they never reach scoring: half their cells are values. Duplicate names cost a little, but do not disqualify the row: real headers repeat names, as in the example above.</p>
+
+<h2>Step 3: pick the best row and decide whether to trust it</h2>
+<p>A detector that always answers will sometimes be wrong without telling anyone. This one returns <code>sure: false</code> and a reason in three cases, and <code>row: null</code> when no row qualifies, so your import screen can ask the user instead. Missing rows (<code>undefined</code> entries some parsers leave) are treated as empty.</p>
+<pre><code>// Same text in the same columns -&gt; same key (trailing empty cells ignored).
+const rowKey = (row) =&gt;
+  row.map((c) =&gt; asText(c).toLowerCase()).join(&quot;\u0000&quot;).replace(/\u0000+$/, &quot;&quot;);
+
+function findHeader(input, { scan = 20 } = {}) {
+  const rows = Array.from(input, (row) =&gt; row ?? []); // parsers can leave holes
+  const width = tableWidth(rows.slice(0, 200));
+  const candidates = [];
+  for (let i = 0; i &lt; Math.min(rows.length, scan); i++) {
+    const scored = scoreRow(rows, i, width);
+    if (scored) candidates.push({ row: i, ...scored });
+  }
+  const answer = (row, sure, why) =&gt; ({ row, sure, why });
+  if (!candidates.length) return answer(null, false, &quot;no row looks like column names&quot;);
+
+  // Highest score wins; on a tie, the row nearer the top.
+  const best = candidates.reduce((a, b) =&gt; (b.score &gt; a.score ? b : a));
+  // A copy of the header further down (after a page break) is not a rival.
+  const key = rowKey(rows[best.row]);
+  const rivals = candidates.filter((c) =&gt; rowKey(rows[c.row]) !== key).map((c) =&gt; c.score);
+
+  if (best.contrast === 0)
+    return answer(best.row, false, &quot;no typed values under it, so the header cannot be confirmed&quot;);
+  if (rivals.length &amp;&amp; best.score - Math.max(...rivals) &lt; 0.5)
+    return answer(best.row, false, &quot;another row is almost as likely&quot;);
+  if (best.row &gt; 0 &amp;&amp; couldBeHeaderToo(rows[best.row - 1], rows[best.row]))
+    return answer(best.row, false, &quot;the row above may be part of the header&quot;);
+  return answer(best.row, true, &quot;column names above typed values&quot;);
+}
+
+// The row right above the winner is all labels and either has gaps
+// (&quot;Q1&quot; and &quot;Q2&quot; above merged cells) or is as wide as the winner
+// (a two-row header, or a text-only first data row under the real header).
+function couldBeHeaderToo(above, best) {
+  const kinds = above.map(cellKind);
+  const labels = kinds.filter((k) =&gt; k === &quot;label&quot;).length;
+  if (labels &lt; 2 || kinds.includes(&quot;value&quot;)) return false;
+  const filled = kinds.flatMap((k, col) =&gt; (k === &quot;empty&quot; ? [] : [col]));
+  const hasGap = filled[filled.length - 1] - filled[0] + 1 &gt; filled.length;
+  const bestWidth = best.filter((c) =&gt; cellKind(c) !== &quot;empty&quot;).length;
+  return hasGap || labels &gt;= bestWidth;
+}</code></pre>
+<p>Read <code>sure: true</code> as "a row of labels above at least one typed column, with no close rival", not as proof. A table that is all text except one number column passes on that one column.</p>
+<p>When two rows are exactly the same (a header repeated after a page break in a printed report), they are not treated as rivals. This table is the result for each layout in our tests:</p>
+<table>
+<tr><th>Layout above the data</th><th>Picks</th><th>sure</th><th>why</th></tr>
+<tr><td>Title, blank line, header</td><td>header</td><td>true</td><td>column names above typed values</td></tr>
+<tr><td>"Report / Period / Prepared by:" lines, blank, header</td><td>header</td><td>true</td><td>column names above typed values</td></tr>
+<tr><td>Header with duplicate names under two key-value lines</td><td>header</td><td>true</td><td>column names above typed values</td></tr>
+<tr><td>Header repeated further down</td><td>first one</td><td>true</td><td>column names above typed values</td></tr>
+<tr><td>Text only (names and cities)</td><td>first row</td><td>false</td><td>no typed values under it, so the header cannot be confirmed</td></tr>
+<tr><td>Two tables in one sheet</td><td>first table</td><td>false</td><td>another row is almost as likely</td></tr>
+<tr><td>Group labels such as Q1 and Q2 above the header</td><td>lower row</td><td>false</td><td>the row above may be part of the header</td></tr>
+<tr><td>Name and Email header, first email typed as <code>Ann at acme</code></td><td>first data row (wrong)</td><td>false</td><td>the row above may be part of the header</td></tr>
+<tr><td>No header, or headers that are numbers (<code>2024</code>, <code>2025</code>)</td><td><code>null</code></td><td>false</td><td>no row looks like column names</td></tr>
+</table>
+<p>The last check looks at the row right above the winner. If it is all labels and either has gaps (group labels over merged cells) or is as wide as the winner, either row could be the header. That catches two-row headers and a bad first value, as in the Email example.</p>
+<p>It also raises false alarms. A two-column table directly under key-value lines such as <code>Owner | Ken</code> (no blank line between) is always flagged, and so is <code>Owner | (blank) | Ken</code> above a wider table. In the layouts we tested, every wrong pick comes with <code>sure: false</code>, so the cost is a click, not a silent wrong import.</p>
+<p>When <code>sure</code> is false, show the user the first 20 rows with the detected row highlighted and let them click the right one. When <code>row</code> is <code>null</code>, ask whether the file has a header at all.</p>
+
+<h2>Step 4: turn the rows below into records</h2>
+<p>Once you have the header, three details decide whether the records are usable: duplicate names, columns without a name, and the row numbers you show in error messages.</p>
+<pre><code>// 0 -&gt; &quot;A&quot;, 27 -&gt; &quot;AB&quot;
+const columnLetter = (i) =&gt; (i &gt;= 26 ? columnLetter(Math.floor(i / 26) - 1) : &quot;&quot;) + String.fromCharCode(65 + (i % 26));
+
+// Real names are kept first; duplicates and unnamed columns with data get a free name.
+// [&quot;Amount&quot;, &quot;amount&quot;, &quot;Amount (2)&quot;] -&gt; [&quot;Amount&quot;, &quot;amount (3)&quot;, &quot;Amount (2)&quot;]
+function columnNames(header, hasData, firstCol = 0) {
+  const used = new Set();
+  const names = header.map((cell) =&gt; {
+    const name = asText(cell);
+    if (!name || used.has(name.toLowerCase())) return null;
+    used.add(name.toLowerCase());
+    return name;
+  });
+  const free = (base) =&gt; {
+    let name = base;
+    for (let n = 2; used.has(name.toLowerCase()); n++) name = `${base} (${n})`;
+    used.add(name.toLowerCase());
+    return name;
+  };
+  header.forEach((cell, col) =&gt; {
+    if (names[col]) return;
+    if (asText(cell)) names[col] = free(asText(cell)); // a duplicate
+    else if (hasData(col)) names[col] = free(`Column ${columnLetter(firstCol + col)}`);
+  });
+  return names; // null = blank column without data, dropped
+}
+
+// origin: where rows[0][0] sits in the sheet, 0-based ({ row: 0, col: 0 } for a CSV).
+function toRecords(input, headerIndex, origin = { row: 0, col: 0 }) {
+  if (headerIndex === null) return []; // findHeader found nothing: ask the user first
+  const rows = Array.from(input, (row) =&gt; row ?? []);
+  const headerKey = rowKey(rows[headerIndex]);
+  const body = rows.slice(headerIndex + 1);
+  const hasData = (col) =&gt; body.some((row) =&gt; cellKind(row[col]) !== &quot;empty&quot;);
+  const names = columnNames(rows[headerIndex], hasData, origin.col);
+  const records = [];
+  body.forEach((row, offset) =&gt; {
+    if (row.every((c) =&gt; cellKind(c) === &quot;empty&quot;)) return;
+    if (rowKey(row) === headerKey) return; // header repeated after a page break
+    // fromEntries defines own properties, so a column named &quot;__proto__&quot; is safe.
+    const values = Object.fromEntries(
+      names.flatMap((name, col) =&gt; (name ? [[name, row[col] ?? &quot;&quot;]] : [])));
+    // The row number the user sees in Excel (1-based).
+    records.push({ row: origin.row + headerIndex + offset + 2, values });
+  });
+  return records;
+}</code></pre>
+<ul>
+<li><strong>Duplicates get a suffix,</strong> compared without case: <code>Amount</code>, <code>amount</code> becomes <code>Amount</code>, <code>amount (2)</code>. Without this, the second column silently overwrites the first in your object.</li>
+<li><strong>A column without a name</strong> is dropped if it is empty, and named after its Excel column letter, such as <code>Column C</code>, if it holds data.</li>
+<li><strong>Real names are kept first.</strong> Duplicates and generated names only take names no real column uses: for <code>Amount</code>, <code>amount</code>, <code>Amount (2)</code> the second column becomes <code>amount (3)</code>, and the real <code>Amount (2)</code> keeps its name.</li>
+<li><strong>Records are built with <code>Object.fromEntries</code>,</strong> not by assigning keys. A header cell named <code>__proto__</code> then becomes an ordinary key instead of changing the object's prototype.</li>
+<li><strong>A <code>null</code> header index gives no records,</strong> so you can pass <code>found.row</code> straight in and ask the user when it is empty.</li>
+<li><strong>Blank rows and repeated header rows are skipped.</strong> A short row is padded with <code>""</code>.</li>
+<li><strong><code>row</code> is the number the user sees in Excel,</strong> so "row 7: invalid date" points at the right line even though rows were skipped.</li>
+</ul>
+
+<h2>Step 5: wire it to SheetJS</h2>
+<p><a href="https://sheetjs.com/">SheetJS</a> (the <code>xlsx</code> package) reads a spreadsheet file into a worksheet object. <code>sheet_to_json</code> with <code>header: 1</code> returns an array of rows, which is the input the functions above expect. Our test suite runs this function against SheetJS 0.20.3.</p>
+<pre><code>// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
+import * as XLSX from &quot;xlsx&quot;;
+
+async function readTable(file) {
+  const workbook = XLSX.read(await file.arrayBuffer(), { cellDates: true });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, {
+    header: 1, defval: &quot;&quot;, blankrows: true, raw: true,
+  });
+  // rows[0][0] is the top-left cell of the sheet&#x27;s stored range, which may not be A1.
+  const origin = XLSX.utils.decode_range(sheet[&quot;!ref&quot;] ?? &quot;A1&quot;).s; // { r, c }, 0-based
+  const found = findHeader(rows);
+  if (found.row === null) return { ...found, headerRow: null, records: [] };
+  return {
+    ...found,
+    headerRow: origin.r + found.row + 1,
+    records: toRecords(rows, found.row, { row: origin.r, col: origin.c }),
+  };
+}</code></pre>
+<p>Why each option is there:</p>
+<ul>
+<li><strong><code>raw: true</code> with <code>cellDates: true</code></strong> returns numbers as numbers and dates as <code>Date</code> objects, so step 1 does not have to guess from formatted text such as <code>1.234,00 €</code>.</li>
+<li><strong><code>blankrows: true</code></strong> keeps empty rows in the array, so an array index still maps to one spreadsheet row.</li>
+<li><strong><code>origin</code></strong> fixes an offset that is easy to miss. The array starts at the top-left cell of the sheet's stored range (<code>!ref</code>), not at A1. Our test saves a sheet whose range starts at B3: the header on spreadsheet row 5 comes back at index 2. Without the offset, every row number in your error messages is off by two, and generated column letters are off by one.</li>
+</ul>
+<p>Why not let <code>sheet_to_json</code> build the objects? You can, but its default names duplicate columns <code>Date</code>, <code>Amount</code>, <code>Date_1</code>, <code>Amount_1</code> (also checked in our tests) and it does not skip repeated header rows. With <code>toRecords</code> you control both.</p>
+<p><code>findHeader</code> and <code>toRecords</code> do not depend on SheetJS. Any CSV parser that returns an array of rows works; its cells are usually all text, and step 1 then uses its patterns for every cell.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Headers below row 20.</strong> Raise <code>scan</code> if your files have long cover notes.</li>
+<li><strong>Two-row headers.</strong> They are detected, not merged. If you need <code>Q1 Revenue</code>, combine the two rows yourself after the user confirms.</li>
+<li><strong>Headers that are numbers</strong> (years, months as 1 to 12). They return <code>null</code>; ask the user.</li>
+<li><strong>A units row under the header</strong> (<code>kg</code>, <code>USD</code>). It is picked as the header, with <code>sure: false</code>.</li>
+<li><strong>Values with units</strong> (<code>5 kg</code>, <code>USD 5</code>) count as labels, so tables of them give weak evidence.</li>
+<li><strong>A header narrower than the data</strong>, such as two names above five filled columns. The fill filter rejects it and you get <code>null</code>.</li>
+<li><strong>Value formats step 1 does not know</strong>, such as fractions (<code>1/2</code>) or dates in other languages. Add patterns for the files your users send.</li>
+<li><strong>Several tables on one sheet, or a table turned sideways</strong> (names in column A). Flagged or not found, never split.</li>
+<li><strong>Rows with more values than headers.</strong> Extra cells are ignored here. They often mean an unquoted comma in a CSV, which needs its own check.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer that finds the header row under titles and blank lines, skips totals rows, and flags dates that could be read two ways instead of guessing. It runs in the browser, so files never leave your app. You can drop a file into the demo on our homepage and see what it does. Nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. The functions in this post are simplified versions of the ideas it uses, and you are free to use them in your own code.</p>
+
+</article>
+</div></main>
+<footer><div class="wrap"><span>SheetSift · a drop-in importer for messy Excel and CSV files</span><a href="../../#waitlist">Join the waitlist</a></div>
+<div class="wrap"><small>Visits are counted with <a href="https://www.goatcounter.com/">GoatCounter</a>, which does not track you across sites.</small></div></footer>
+<script>
+// Page view counter (GoatCounter). Only on the public site, so local runs and tests are never counted.
+if (location.hostname === "shoheitaro003.github.io") {
+  var gc = document.createElement("script");
+  gc.async = true; gc.src = "https://gc.zgo.at/count.js";
+  gc.setAttribute("data-goatcounter", "https://sheetsift.goatcounter.com/count");
+  document.body.appendChild(gc);
+}
+</script>
+</body>
+</html>

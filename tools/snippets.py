@@ -195,3 +195,180 @@ EU_COLUMN = r'''function parseNumberColumn(values, chosenLocale) {
   // null in numbers: the cell is empty or not a number, so flag it in the preview
   return { decimal: separators.decimal, numbers: values.map((v) => readNumber(v, separators)), ask: null };
 }'''
+
+# --- blog/detect-header-row-spreadsheet-javascript ---
+HDR_KIND = r'''const asText = (value) => String(value ?? "").trim();
+
+const LOOKS_NUMBER = /^[-+(\u2212]?\s?([$€£¥]\s?)?\d[\d\s.,']*%?(\s?[$€£¥])?\)?$/;
+const LOOKS_SCIENTIFIC = /^[-+]?\d+(\.\d+)?e[-+]?\d+$/i;
+const LOOKS_DATE = /^\d{1,4}[\/.\-]\d{1,2}[\/.\-]\d{1,4}([ T]\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?\s?(Z|[+-]\d{2}:?\d{2})?)?$/i;
+const MONTH = "(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?";
+const LOOKS_MONTH_DATE = new RegExp(
+  `^(\\d{1,2}[ -]${MONTH}[ ,-]*\\d{2,4}|${MONTH} \\d{1,2}(st|nd|rd|th)?,? \\d{4})$`, "i");
+const LOOKS_TIME = /^\d{1,2}:\d{2}(:\d{2})?\s?(am|pm)?$/i;
+const LOOKS_BOOLEAN = /^(true|false)$/i; // not yes/no: "No" is a common column name
+const LOOKS_EMAIL = /^\S+@\S+\.\S+$/;
+// "No value" (and Excel errors such as #DIV/0!): neither data nor a name.
+const PLACEHOLDER =
+  /^(n\/?a|-+|\u2013|\u2014|\?|null|none|#(DIV\/0!|N\/A|REF!|NAME\?|VALUE!|NUM!|NULL!|SPILL!|CALC!))$/i;
+
+const VALUE_PATTERNS = [LOOKS_NUMBER, LOOKS_SCIENTIFIC, LOOKS_DATE, LOOKS_MONTH_DATE,
+                        LOOKS_TIME, LOOKS_BOOLEAN, LOOKS_EMAIL];
+
+// "label" = could be a column name, "value" = data, "empty" = nothing
+function cellKind(cell) {
+  if (typeof cell === "number" || typeof cell === "boolean" || cell instanceof Date) return "value";
+  const t = asText(cell);
+  if (!t || PLACEHOLDER.test(t)) return "empty";
+  return VALUE_PATTERNS.some((re) => re.test(t)) ? "value" : "label";
+}'''
+
+HDR_SCORE = r'''// The most common number of filled cells per row: data rows outnumber everything else.
+function tableWidth(rows) {
+  const counts = new Map();
+  for (const row of rows) {
+    const filled = row.filter((c) => cellKind(c) !== "empty").length;
+    if (filled) counts.set(filled, (counts.get(filled) || 0) + 1);
+  }
+  let width = 0, seen = 0;
+  for (const [w, n] of counts) {
+    if (n > seen || (n === seen && w > width)) [width, seen] = [w, n];
+  }
+  return width;
+}
+
+// Kind of the first non-empty cell under rows[i][col], at most 3 rows down.
+function kindBelow(rows, i, col) {
+  for (let r = i + 1; r < Math.min(rows.length, i + 4); r++) {
+    const kind = cellKind(rows[r][col]);
+    if (kind !== "empty") return kind;
+  }
+  return "empty";
+}
+
+function scoreRow(rows, i, width) {
+  const filled = rows[i]
+    .map((cell, col) => ({ cell, col, kind: cellKind(cell) }))
+    .filter((c) => c.kind !== "empty");
+  if (!filled.length) return null;
+  const labels = filled.filter((c) => c.kind === "label");
+  const fill = Math.min(filled.length / width, 1);
+  const labelShare = labels.length / filled.length;
+  if (fill < 0.5 || labelShare < 0.75) return null; // titles, notes and data rows stop here
+  const typedBelow = labels.filter((c) => kindBelow(rows, i, c.col) === "value");
+  const contrast = typedBelow.length / labels.length;
+  const names = labels.map((c) => asText(c.cell).toLowerCase());
+  const duplicates = names.length - new Set(names).size;
+  return { contrast, score: fill + labelShare + 2 * contrast - 0.25 * duplicates };
+}'''
+
+HDR_FIND = r'''// Same text in the same columns -> same key (trailing empty cells ignored).
+const rowKey = (row) =>
+  row.map((c) => asText(c).toLowerCase()).join("\u0000").replace(/\u0000+$/, "");
+
+function findHeader(input, { scan = 20 } = {}) {
+  const rows = Array.from(input, (row) => row ?? []); // parsers can leave holes
+  const width = tableWidth(rows.slice(0, 200));
+  const candidates = [];
+  for (let i = 0; i < Math.min(rows.length, scan); i++) {
+    const scored = scoreRow(rows, i, width);
+    if (scored) candidates.push({ row: i, ...scored });
+  }
+  const answer = (row, sure, why) => ({ row, sure, why });
+  if (!candidates.length) return answer(null, false, "no row looks like column names");
+
+  // Highest score wins; on a tie, the row nearer the top.
+  const best = candidates.reduce((a, b) => (b.score > a.score ? b : a));
+  // A copy of the header further down (after a page break) is not a rival.
+  const key = rowKey(rows[best.row]);
+  const rivals = candidates.filter((c) => rowKey(rows[c.row]) !== key).map((c) => c.score);
+
+  if (best.contrast === 0)
+    return answer(best.row, false, "no typed values under it, so the header cannot be confirmed");
+  if (rivals.length && best.score - Math.max(...rivals) < 0.5)
+    return answer(best.row, false, "another row is almost as likely");
+  if (best.row > 0 && couldBeHeaderToo(rows[best.row - 1], rows[best.row]))
+    return answer(best.row, false, "the row above may be part of the header");
+  return answer(best.row, true, "column names above typed values");
+}
+
+// The row right above the winner is all labels and either has gaps
+// ("Q1" and "Q2" above merged cells) or is as wide as the winner
+// (a two-row header, or a text-only first data row under the real header).
+function couldBeHeaderToo(above, best) {
+  const kinds = above.map(cellKind);
+  const labels = kinds.filter((k) => k === "label").length;
+  if (labels < 2 || kinds.includes("value")) return false;
+  const filled = kinds.flatMap((k, col) => (k === "empty" ? [] : [col]));
+  const hasGap = filled[filled.length - 1] - filled[0] + 1 > filled.length;
+  const bestWidth = best.filter((c) => cellKind(c) !== "empty").length;
+  return hasGap || labels >= bestWidth;
+}'''
+
+HDR_RECORDS = r'''// 0 -> "A", 27 -> "AB"
+const columnLetter = (i) => (i >= 26 ? columnLetter(Math.floor(i / 26) - 1) : "") + String.fromCharCode(65 + (i % 26));
+
+// Real names are kept first; duplicates and unnamed columns with data get a free name.
+// ["Amount", "amount", "Amount (2)"] -> ["Amount", "amount (3)", "Amount (2)"]
+function columnNames(header, hasData, firstCol = 0) {
+  const used = new Set();
+  const names = header.map((cell) => {
+    const name = asText(cell);
+    if (!name || used.has(name.toLowerCase())) return null;
+    used.add(name.toLowerCase());
+    return name;
+  });
+  const free = (base) => {
+    let name = base;
+    for (let n = 2; used.has(name.toLowerCase()); n++) name = `${base} (${n})`;
+    used.add(name.toLowerCase());
+    return name;
+  };
+  header.forEach((cell, col) => {
+    if (names[col]) return;
+    if (asText(cell)) names[col] = free(asText(cell)); // a duplicate
+    else if (hasData(col)) names[col] = free(`Column ${columnLetter(firstCol + col)}`);
+  });
+  return names; // null = blank column without data, dropped
+}
+
+// origin: where rows[0][0] sits in the sheet, 0-based ({ row: 0, col: 0 } for a CSV).
+function toRecords(input, headerIndex, origin = { row: 0, col: 0 }) {
+  if (headerIndex === null) return []; // findHeader found nothing: ask the user first
+  const rows = Array.from(input, (row) => row ?? []);
+  const headerKey = rowKey(rows[headerIndex]);
+  const body = rows.slice(headerIndex + 1);
+  const hasData = (col) => body.some((row) => cellKind(row[col]) !== "empty");
+  const names = columnNames(rows[headerIndex], hasData, origin.col);
+  const records = [];
+  body.forEach((row, offset) => {
+    if (row.every((c) => cellKind(c) === "empty")) return;
+    if (rowKey(row) === headerKey) return; // header repeated after a page break
+    // fromEntries defines own properties, so a column named "__proto__" is safe.
+    const values = Object.fromEntries(
+      names.flatMap((name, col) => (name ? [[name, row[col] ?? ""]] : [])));
+    // The row number the user sees in Excel (1-based).
+    records.push({ row: origin.row + headerIndex + offset + 2, values });
+  });
+  return records;
+}'''
+
+HDR_SHEETJS = r'''// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
+import * as XLSX from "xlsx";
+
+async function readTable(file) {
+  const workbook = XLSX.read(await file.arrayBuffer(), { cellDates: true });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, {
+    header: 1, defval: "", blankrows: true, raw: true,
+  });
+  // rows[0][0] is the top-left cell of the sheet's stored range, which may not be A1.
+  const origin = XLSX.utils.decode_range(sheet["!ref"] ?? "A1").s; // { r, c }, 0-based
+  const found = findHeader(rows);
+  if (found.row === null) return { ...found, headerRow: null, records: [] };
+  return {
+    ...found,
+    headerRow: origin.r + found.row + 1,
+    records: toRecords(rows, found.row, { row: origin.r, col: origin.c }),
+  };
+}'''

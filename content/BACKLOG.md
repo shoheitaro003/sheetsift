@@ -5,7 +5,7 @@ Take the top unchecked item. Add new ideas from questions people send.
 - [x] Why CSV importers break on real Excel files (published 2026-11-05)
 - [x] Flatfile is now Obvious: what should importer users do? (published 2026-11-05)
 - [x] How to parse European number formats in JavaScript without a library (published 2026-11-07)
-- [ ] Detecting the header row in a spreadsheet: a heuristic that works on real exports
+- [x] Detecting the header row in a spreadsheet: a heuristic that works on real exports (published 2026-11-08)
 - [ ] Reading Excel dates correctly with SheetJS (serial numbers, 1900 leap-year bug, time zones, dateNF)
 - [ ] Shift_JIS, Windows-1252 and UTF-16: decoding CSV files from legacy systems in the browser
 - [ ] Column mapping without AI: matching "E-mail", "Email address" and "mail" to one field
