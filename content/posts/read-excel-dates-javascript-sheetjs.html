@@ -1,0 +1,95 @@
+title: Read Excel dates in JavaScript without off-by-one-day bugs
+description: Excel stores dates as serial numbers. Tested SheetJS code that turns them into ISO dates with no time zone shift and no 1900 or 1904 date system errors.
+date: 2026-11-09
+---
+<p>A customer uploads an .xlsx file and the date column arrives as <code>46027</code>. You convert it, and it shows as 4 January for users in California and 5 January in Tokyo. Or the whole column is four years and one day off, because the file came from an old Mac.</p>
+<p>This post shows where each of these errors comes from, then builds three small functions that turn every date cell into ISO 8601 text (<code>2026-01-05</code>, <code>2026-01-05T13:30:00</code>, <code>18:00:00</code>) that is the same on every machine. Cells that cannot be a real date come back with a reason instead of a wrong value. Every result quoted below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> with SheetJS 0.20.3 on Node, in several time zones.</p>
+
+<h2>What is actually in a date cell</h2>
+<p>An Excel date is a number, the <em>serial number</em>: the count of days since the start of the workbook's date system. The time of day is the fraction (<code>0.5</code> is noon). What makes the cell look like a date is its <em>number format</em>, a code such as <code>dd/mm/yyyy</code> stored next to the number. So to read a date you need three things: the number, the format code and the workbook's date system.</p>
+<table>
+<tr><th>Stored number</th><th>Format code</th><th>Means</th></tr>
+<tr><td><code>46027</code></td><td><code>yyyy-mm-dd</code></td><td>2026-01-05</td></tr>
+<tr><td><code>46027.5625</code></td><td><code>dd/mm/yyyy hh:mm</code></td><td>2026-01-05 13:30</td></tr>
+<tr><td><code>0.75</code></td><td><code>h:mm AM/PM</code></td><td>6:00 PM, no date</td></tr>
+<tr><td><code>1.25</code></td><td><code>[h]:mm</code></td><td>30 hours, a duration</td></tr>
+<tr><td><code>44565</code></td><td><code>m/d/yy</code>, 1904 system</td><td>2026-01-05</td></tr>
+<tr><td><code>60</code></td><td><code>m/d/yy</code></td><td>29 February 1900, a day that never existed</td></tr>
+</table>
+<p>Two date systems exist. In the default 1900 system, day 1 is 1 January 1900. In the 1904 system, day 0 is 1 January 1904, and the same date has a serial number 1,462 lower. Microsoft says the 1904 system was the default in earlier versions of Excel for Mac, and that it is a setting of each workbook (<a href="https://support.microsoft.com/en-us/office/date-systems-in-excel-e7fe7167-48a9-4b96-bb53-5612a800b487">Date systems in Excel</a>, Microsoft Support, updated June 2026). Old files and files saved from them can still use it.</p>
+<p>The 1900 system also has a deliberate bug. Lotus 1-2-3 assumed 1900 was a leap year, and Excel kept that assumption so its serial numbers matched Lotus (<a href="https://learn.microsoft.com/en-us/troubleshoot/microsoft-365-apps/excel/wrongly-assumes-1900-is-leap-year">Excel incorrectly assumes that the year 1900 is a leap year</a>, Microsoft Learn, updated 30 March 2026). Serial 60 is the fake 29 February 1900, and every serial after it is one day ahead of a plain day count.</p>
+
+<h2>Three ways to get it wrong</h2>
+<h3>1. The one-line formula</h3>
+<p>The formula you usually find converts the serial number to a JavaScript <code>Date</code>. The <code>Date</code> it builds is midnight in UTC. Read it with local-time methods and every user west of UTC sees the day before:</p>
+{{code:XD_FORMULA}}
+<p>It also ignores the 1904 system, and it is one day off for serials below 60, before the fake leap day.</p>
+
+<h3>2. SheetJS <code>cellDates</code></h3>
+<p>SheetJS stores dates as numbers by default. With <code>cellDates: true</code> it creates <code>Date</code> objects, and handles the 1904 system for you. But the same file gives different <code>Date</code> values depending on how you read it and where the code runs:</p>
+{{code:XD_CELLDATES}}
+<p>With <code>cellDates</code>, <code>cell.v</code> is a <code>Date</code> at midnight UTC. <code>sheet_to_json</code> builds a new <code>Date</code> at midnight in the local time zone, unless you pass <code>UTC: true</code>. The SheetJS docs describe both: the date epoch "is based on the system timezone", and <code>UTC</code> makes dates "correct when interpreted in UTC" (<a href="https://docs.sheetjs.com/docs/csf/features/dates">SheetJS: Dates and Times</a>, updated 3 August 2026). A server in UTC and a browser in Tokyo can therefore store different days. And serial 60 stays a number, so code that expects a <code>Date</code> in a date column fails on it.</p>
+<p>If you already use <code>sheet_to_json</code> and only need the day to stop moving, this is the smallest fix. Pass <code>UTC: true</code> and read the result with UTC methods only:</p>
+{{code:XD_QUICKFIX}}
+<p>It still leaves serial 60 as a number, turns time-only cells into dates in December 1899, and does not tell dates from durations. The rest of this post handles those.</p>
+
+<h3>3. Dates in CSV files</h3>
+<p>A CSV has no format codes, only text. By default SheetJS tries to read text that looks like a date, in US order, and leaves what it cannot read as text:</p>
+{{code:XD_CSV}}
+<p>Here <code>03/04/2026</code> was probably 3 April, since the next row is day-first. The <code>raw</code> option turns this off for CSV and other text formats, and has no effect on XLSX, XLSB or XLS (<a href="https://docs.sheetjs.com/docs/api/parse-options">SheetJS: Reading Files</a>, updated 3 August 2026). With <code>raw</code>, every CSV cell is text, numbers included (<code>"12.5"</code>). Deciding the order of text dates is a separate problem, covered in <a href="../csv-importers-real-excel-files/">why CSV importers break on real Excel files</a>, and text numbers in <a href="../parse-european-number-formats-javascript/">parsing European number formats</a>.</p>
+
+<h2>Step 1: tell date formats from number formats</h2>
+<p>Since the number alone does not say "date", the format code decides. A code is a date if it contains day or year letters, a time if it contains hours or seconds, and a duration if the hours, minutes or seconds are in square brackets (<code>[h]:mm</code> keeps counting past 24 hours). Before looking for letters, remove the parts that are not codes: quoted text such as <code>"Due "</code>, escaped characters, color and locale tags such as <code>[Red]</code> and <code>[$-409]</code>, and <code>AM/PM</code>.</p>
+{{code:XD_KIND}}
+<p>A lone <code>m</code> is ambiguous: it means minutes next to hours or seconds, and months otherwise, so <code>mmmm</code> is a month and <code>mm:ss</code> is a time. For the 32 format codes in our tests, including <code>yyyy"年"m"月"d"日"</code>, <code>#,##0.00 "€"</code> and <code>_(* #,##0_)</code>, the function agrees with SheetJS's own <code>XLSX.SSF.is_date</code> on whether the code is a date, and adds which kind it is.</p>
+
+<h2>Step 2: convert the serial number with plain arithmetic</h2>
+<p>The conversion never creates a local-time <code>Date</code>. It counts days from the start of the date system in UTC and only formats the result, so the time zone of the machine cannot change it. The leap-year bug is handled in two lines: serial 60 is rejected, and serials after it move back one day.</p>
+{{code:XD_SERIAL}}
+<ul>
+<li><strong>Times are rounded to the nearest second.</strong> In the stored number for 2026-01-05 14:30, the fraction times 86,400 is 52,199.99…, so cutting off the decimals gives 14:29:59, as it does for 704 of the 1,440 minutes of that day.</li>
+<li><strong>Dates drop the time part instead of rounding it.</strong> So <code>46027.9999999</code> is <code>2026-01-05</code> under a date format and <code>2026-01-06T00:00:00</code> under a date-time format. Only float noise (<code>46027.99999999999</code>, a formula result) is snapped to the next day first. SheetJS's formatter gives the same results.</li>
+<li><strong>Time formats drop the date.</strong> <code>46027.75</code> shown as <code>h:mm</code> comes back as <code>18:00:00</code>, because that is all the cell shows. If you need the day too, ask for a date-time format in your template.</li>
+<li><strong>Day 0 is an error.</strong> SheetJS formats it as <code>1900-01-00</code>. A time-only value under a date-time format (<code>0.5</code> as <code>yyyy-mm-dd hh:mm</code>) falls on day 0 too, and is flagged rather than dated 31 December 1899.</li>
+<li><strong>The last valid day is 9999-12-31</strong>, the latest date Microsoft lists for Excel (<a href="https://support.microsoft.com/en-us/office/excel-specifications-and-limits-1672b34d-7043-467e-8e27-269d656771c3">Excel specifications and limits</a>, Microsoft Support, updated June 2026).</li>
+</ul>
+<p>Our tests compare <code>serialToISO</code> with the SheetJS formatter for 20,000 random serial numbers, in both date systems and for date, date-time and time output. They give the same text every time.</p>
+<p>SheetJS also has <code>XLSX.SSF.parse_date_code(serial, { date1904 })</code>, which returns the year, month, day and time as numbers, and <code>cell.w</code>, the text Excel would show. Both are fine for display. Neither tells you a cell is a date in the first place, and both turn serial 60 into 29 February 1900 without a warning, which is why step 2 does its own arithmetic.</p>
+
+<h2>Step 3: read the workbook</h2>
+<p>Three read options do the work. <code>cellNF: true</code> keeps each cell's format code in <code>cell.z</code>; without it, our tests show <code>z</code> is missing. Leaving out <code>cellDates</code> keeps dates as serial numbers, so no time zone applies. And <code>raw: true</code> stops CSV dates from being guessed. The date system comes from <code>workbook.Workbook.WBProps.date1904</code>. Without <code>cellDates</code>, the SheetJS docs say all parsers "generate number cells" for dates (<a href="https://docs.sheetjs.com/docs/csf/features/dates">Dates and Times</a>), so no <code>Date</code> object reaches <code>readCell</code>.</p>
+{{code:XD_READ}}
+<p>Each cell becomes <code>{ value }</code>, plus <code>kind</code> for date and time cells and <code>problem</code> for cells your user needs to look at. The problem text includes the cell address (<code>C8</code>), so you can show it next to the row it belongs to. What comes back, from the test workbook:</p>
+<table>
+<tr><th>Cell</th><th>Result</th></tr>
+<tr><td><code>46027</code>, <code>dd/mm/yyyy</code></td><td><code>{ value: "2026-01-05", kind: "date" }</code></td></tr>
+<tr><td><code>46027.5625</code>, <code>dd/mm/yyyy hh:mm</code></td><td><code>{ value: "2026-01-05T13:30:00", kind: "datetime" }</code></td></tr>
+<tr><td><code>0.75</code>, <code>h:mm AM/PM</code></td><td><code>{ value: "18:00:00", kind: "time" }</code></td></tr>
+<tr><td><code>1.25</code>, <code>[h]:mm</code></td><td><code>{ value: 108000, kind: "duration" }</code> (seconds)</td></tr>
+<tr><td><code>12.5</code>, <code>#,##0.00</code></td><td><code>{ value: 12.5 }</code></td></tr>
+<tr><td><code>60</code>, <code>m/d/yy</code></td><td><code>{ value: null, kind: "date", problem: "C8: 1900-02-29 does not exist …" }</code></td></tr>
+<tr><td>Text <code>05.01.2026</code></td><td><code>{ value: "05.01.2026" }</code>, unchanged</td></tr>
+<tr><td>Error <code>#N/A</code></td><td><code>{ value: null, problem: "C11: Excel error #N/A" }</code></td></tr>
+<tr><td><code>44565</code>, 1904 workbook</td><td><code>{ value: "2026-01-05", kind: "date" }</code></td></tr>
+</table>
+<p>The date-time value has no time zone suffix on purpose: as the SheetJS page above notes, Excel has no universal time, so a cell holds the clock time the author typed, with no zone attached. If you need an instant, take the zone from your user, for example as a setting on the import screen, and apply it on purpose.</p>
+<p>Be careful when you turn these strings back into <code>Date</code> objects. JavaScript reads <code>new Date("2026-01-05")</code> as midnight UTC, but <code>new Date("2026-01-05T13:30:00")</code> as 13:30 in the local time zone. Our tests check both. If you only need the day, keep the string.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Dates stored as plain numbers</strong> with the General format, as some scripts and libraries write them. They come back as <code>46027</code>. If a column's name says date, flag it for your user instead of converting it silently.</li>
+<li><strong>Dates typed as text</strong> inside an .xlsx (<code>05.01.2026</code> stored as text, not as a number). They come back unchanged; parse them like CSV dates, with the column's order decided from all its values.</li>
+<li><strong>Format codes with conditions</strong> such as <code>[&lt;1]hh:mm;yyyy-mm-dd</code>. Step 1 reads only the first section, so check these by hand if your users' files have them.</li>
+<li><strong>The <code>e</code> year code</strong> and calendar codes for other eras. SheetJS treats <code>e</code> as a date; step 1 does not, because it cannot be told apart from the <code>E</code> in <code>0.00E+00</code> without more parsing.</li>
+<li><strong>Fractions of a second</strong>, which are rounded away, and negative serial numbers, which are rejected.</li>
+<li><strong>Writing dates back to .xlsx</strong>, and .ods or Apple Numbers files, which we have not tested here.</li>
+<li><strong>Other sheets than the first.</strong> Pick the sheet with data first, as shown in <a href="../detect-header-row-spreadsheet-javascript/">detecting the header row</a>.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer. In the demo on our homepage, Excel date cells are read from the stored date, so a <code>dd/mm/yyyy</code> display and a 1904-system workbook both become ISO dates, and 29 February 1900 is flagged as a date that does not exist. It runs in your browser: drop in a file and nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. The functions in this post are simplified versions of the ideas it uses, and you are free to use them in your own code.</p>

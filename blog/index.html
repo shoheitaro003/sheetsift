@@ -25,6 +25,7 @@
 <h1>The SheetSift blog</h1>
 <p class="meta">Practical notes on importing the spreadsheets real customers send.</p>
 <ul class="posts">
+<li><a href="read-excel-dates-javascript-sheetjs/">Read Excel dates in JavaScript without off-by-one-day bugs</a><p>Excel stores dates as serial numbers. Tested SheetJS code that turns them into ISO dates with no time zone shift and no 1900 or 1904 date system errors.</p></li>
 <li><a href="detect-header-row-spreadsheet-javascript/">Detect the header row in Excel and CSV files with JavaScript</a><p>Real exports put titles, notes and blank lines above the column names. Tested JavaScript that finds the header row and says when it is not sure.</p></li>
 <li><a href="parse-european-number-formats-javascript/">How to parse European number formats in JavaScript</a><p>parseFloat(&quot;1.234,56&quot;) returns 1.234 with no error. Tested JavaScript for decimal commas, negative values, currencies and detecting a column&#x27;s format.</p></li>
 <li><a href="csv-importers-real-excel-files/">Why CSV importers break on real Excel files, and how to fix each case in JavaScript</a><p>Six ways real customer spreadsheets differ from a clean CSV (header rows, totals, ambiguous dates, decimal commas, Excel quirks, encodings) with tested JavaScript for each.</p></li>

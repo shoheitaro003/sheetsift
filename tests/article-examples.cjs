@@ -604,3 +604,274 @@ ok("excel: skips empty first sheet and returns ISO dates", async () => {
   assert.deepStrictEqual(rows[0], ["Name", "Joined"]);
   assert.match(String(rows[1][1]), /^2026-04-0[23]$/);
 });
+
+// --- blog/read-excel-dates-javascript-sheetjs ---
+// What a cell's number format says about its value:
+// "date", "datetime", "time", "duration" or null (an ordinary number).
+function dateFormatKind(format) {
+  if (typeof format !== "string") return null;
+  let code = format
+    .replace(/"[^"]*"/g, "")      // quoted text, as in "Due "yyyy-mm-dd
+    .replace(/\\./g, "")          // escaped characters, as in yyyy\-mm\-dd
+    .replace(/[_*]./g, "")        // padding and fill characters
+    .split(";")[0];               // the section used for positive numbers
+  if (/\[(h+|m+|s+)\]/i.test(code)) return "duration"; // [h]:mm counts hours past 24
+  code = code.replace(/\[[^\]]*\]/g, "").replace(/AM\/PM|A\/P/gi, ""); // [$-409], [Red], AM/PM
+  if (/general/i.test(code)) return null;
+  const hasTime = /[hs]/i.test(code);
+  const hasDate = /[yd]/i.test(code) || (/m/i.test(code) && !hasTime); // "mmm" alone is a month
+  if (hasDate) return hasTime ? "datetime" : "date";
+  return hasTime ? "time" : null;
+}
+
+const DAY_MS = 86400000;
+const DAY_ZERO_1900 = Date.UTC(1899, 11, 31); // serial 1 is 1900-01-01
+const DAY_ZERO_1904 = Date.UTC(1904, 0, 1);   // serial 0 is 1904-01-01
+
+// Excel serial number -> ISO 8601 text, with no time zone involved.
+// Returns { value } or { error } so a caller can show why a cell was rejected.
+function serialToISO(serial, kind, date1904 = false) {
+  if (typeof serial !== "number" || !Number.isFinite(serial) || serial < 0)
+    return { error: "not a valid Excel date number" };
+  // Times: round to the nearest second. Fractions of a day are rarely exact in binary,
+  // so 2026-01-05 14:30 is 52199.99... seconds into the day, not 52200.
+  // Dates: drop the time part, after snapping to the millisecond so that a formula
+  // result of 46027.99999999999 counts as the next day (as SheetJS's formatter does).
+  const seconds = Math.round(serial * 86400);
+  let day = kind === "date" ? Math.floor(Math.round(serial * DAY_MS) / DAY_MS) : Math.floor(seconds / 86400);
+  const timeOfDay = seconds % 86400;
+  const time = [Math.floor(timeOfDay / 3600), Math.floor(timeOfDay / 60) % 60, timeOfDay % 60]
+    .map((n) => String(n).padStart(2, "0")).join(":");
+
+  if (kind === "time") return { value: time };
+  if (kind === "duration") return { value: seconds }; // elapsed seconds, not a date
+  if (kind !== "date" && kind !== "datetime") return { error: "not a date format" };
+
+  if (!date1904) {
+    if (day === 0) return { error: "day 0 of the 1900 system (shown as 1900-01-00)" };
+    if (day === 60) return { error: "1900-02-29 does not exist (Excel's 1900 leap-year bug)" };
+    if (day > 60) day -= 1; // every serial after the fake 29 February is one day ahead
+  }
+  const ms = (date1904 ? DAY_ZERO_1904 : DAY_ZERO_1900) + day * DAY_MS;
+  if (ms > Date.UTC(9999, 11, 31)) return { error: "after 9999-12-31" };
+  const date = new Date(ms).toISOString().slice(0, 10); // safe: ms is UTC midnight
+  return { value: kind === "date" ? date : `${date}T${time}` };
+}
+
+
+async function readSheetCells(file) {
+  const workbook = XLSX.read(await file.arrayBuffer(), {
+    cellNF: true, // keep each cell's number format in cell.z
+    raw: true,    // CSV and other text files: keep "03/04/2026" as text, do not guess
+  });             // no cellDates: dates stay serial numbers, so no time zone applies
+  const date1904 = Boolean(workbook.Workbook?.WBProps?.date1904);
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  if (!sheet["!ref"]) return []; // an empty sheet
+  const range = XLSX.utils.decode_range(sheet["!ref"]);
+  const rows = [];
+  for (let r = range.s.r; r <= range.e.r; r++) {
+    const row = [];
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const address = XLSX.utils.encode_cell({ r, c });
+      row.push(readCell(sheet[address], date1904, address));
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+function readCell(cell, date1904, address) {
+  if (!cell || cell.t === "z") return { value: null };
+  if (cell.t === "e") return { value: null, problem: `${address}: Excel error ${cell.w ?? ""}`.trim() };
+  if (cell.t !== "n") return { value: cell.v }; // text and TRUE/FALSE as stored
+  const kind = dateFormatKind(cell.z);
+  if (!kind) return { value: cell.v };          // an ordinary number
+  const result = serialToISO(cell.v, kind, date1904);
+  return result.error
+    ? { value: null, kind, problem: `${address}: ${result.error}` }
+    : { value: result.value, kind };
+}
+
+const { execFileSync } = require("child_process");
+const XLSX_PATH = require.resolve(process.env.XLSX_MODULE || "xlsx");
+// Runs a snippet exactly as printed, in a fresh Node process with the given time zone,
+// and returns the value of every line that ends in a comment such as `x; // 4`.
+function runSnippet(tz, setup, snippet) {
+  const body = snippet.split("\n").map((line) => {
+    const m = /^([^/ ].*?);\s*\/\/ /.exec(line);
+    return m && !/^(const|let) /.test(m[1]) ? `out.push(${m[1]});` : line;
+  }).join("\n");
+  const code = `const XLSX = require(${JSON.stringify(XLSX_PATH)}); const out = [];\n${setup}\n${body}\nprocess.stdout.write(JSON.stringify(out));`;
+  return JSON.parse(execFileSync(process.execPath, ["-e", code], { env: { ...process.env, TZ: tz } }).toString());
+}
+const XD_JOINED_SETUP = `const bytes = XLSX.write({ SheetNames: ["Sheet1"], Sheets: { Sheet1: { "!ref": "A1:A3",
+  A1: { t: "s", v: "Joined" }, A2: { t: "n", v: 46027, z: "yyyy-mm-dd" }, A3: { t: "n", v: 60, z: "m/d/yy" } } } }, { type: "buffer", bookType: "xlsx" });`;
+
+ok("xd: the one-line formula depends on the time zone", () => {
+  const snippet = "// The usual one-liner: 25569 is the serial number of 1970-01-01.\nconst toDate = (serial) => new Date((serial - 25569) * 86400000);\n\ntoDate(46027).toISOString();               // \"2026-01-05T00:00:00.000Z\"\ntoDate(46027).getDate();                   // 4 in Los Angeles, 5 in Tokyo\ntoDate(46027).toLocaleDateString(\"en-US\"); // \"1/4/2026\" in Los Angeles\ntoDate(59).toISOString().slice(0, 10);     // \"1900-02-27\", but Excel shows 2/28/1900";
+  assert.deepStrictEqual(runSnippet("America/Los_Angeles", "", snippet), ["2026-01-05T00:00:00.000Z", 4, "1/4/2026", "1900-02-27"]);
+  assert.deepStrictEqual(runSnippet("Asia/Tokyo", "", snippet), ["2026-01-05T00:00:00.000Z", 5, "1/5/2026", "1900-02-27"]);
+  assert.strictEqual(XLSX.SSF.format("m/d/yyyy", 59), "2/28/1900");
+  assert.strictEqual(XLSX.SSF.format("m/d/yyyy", 60), "2/29/1900");
+});
+ok("xd: cellDates gives UTC dates in cells but local dates from sheet_to_json", () => {
+  const snippet = "// Joined.xlsx: A1 \"Joined\", A2 = 2026-01-05, A3 = serial 60, all formatted as dates\nconst workbook = XLSX.read(bytes, { cellDates: true });\nconst sheet = workbook.Sheets[workbook.SheetNames[0]];\n\nsheet.A2.v.toISOString(); // \"2026-01-05T00:00:00.000Z\" on every machine\nconst rows = XLSX.utils.sheet_to_json(sheet, { header: 1 });\nrows[1][0].toISOString(); // \"2026-01-04T15:00:00.000Z\" in Tokyo: local midnight\nrows[2][0];               // 60: the cell for 29 February 1900 is still a number";
+  assert.deepStrictEqual(runSnippet("Asia/Tokyo", XD_JOINED_SETUP, snippet), ["2026-01-05T00:00:00.000Z", "2026-01-04T15:00:00.000Z", 60]);
+  assert.deepStrictEqual(runSnippet("America/Los_Angeles", XD_JOINED_SETUP, snippet), ["2026-01-05T00:00:00.000Z", "2026-01-05T08:00:00.000Z", 60]);
+  assert.deepStrictEqual(runSnippet("UTC", XD_JOINED_SETUP, snippet), ["2026-01-05T00:00:00.000Z", "2026-01-05T00:00:00.000Z", 60]);
+  const wb1904 = XLSX.write({ SheetNames: ["S"], Sheets: { S: { "!ref": "A1", A1: { t: "n", v: 44565, z: "m/d/yy" } } }, Workbook: { WBProps: { date1904: true } } }, { type: "buffer", bookType: "xlsx" });
+  assert.strictEqual(XLSX.read(wb1904, { cellDates: true }).Sheets.S.A1.v.toISOString(), "2026-01-05T00:00:00.000Z"); // handles 1904
+  assert.strictEqual(XLSX.read(wb1904).Sheets.S.A1.v, 44565); // numbers by default
+});
+ok("xd: the smallest fix for sheet_to_json", () => {
+  const snippet = "const workbook = XLSX.read(bytes, { cellDates: true });\nconst sheet = workbook.Sheets[workbook.SheetNames[0]];\nconst rows = XLSX.utils.sheet_to_json(sheet, { header: 1, UTC: true });\n\nrows[1][0].toISOString().slice(0, 10); // \"2026-01-05\" in every time zone\nrows[1][0].getUTCDate();               // 5 (getDate() would still give 4 in Los Angeles)";
+  for (const tz of ["America/Los_Angeles", "Asia/Tokyo", "UTC"]) assert.deepStrictEqual(runSnippet(tz, XD_JOINED_SETUP, snippet), ["2026-01-05", 5], tz);
+  const left = runSnippet("America/Los_Angeles", XD_JOINED_SETUP, snippet + "\nrows[2][0]; // 60\nrows[1][0].getDate(); // 4");
+  assert.deepStrictEqual(left, ["2026-01-05", 5, 60, 4]);
+  const timeOnly = runSnippet("UTC", `const bytes = XLSX.write({ SheetNames: ["S"], Sheets: { S: { "!ref": "A1", A1: { t: "n", v: 0.75, z: "hh:mm" } } } }, { type: "buffer", bookType: "xlsx" });
+    const t = XLSX.utils.sheet_to_json(XLSX.read(bytes, { cellDates: true }).Sheets.S, { header: 1, UTC: true })[0][0];`, "t.toISOString(); // x");
+  assert.deepStrictEqual(timeOnly, ["1899-12-31T18:00:00.000Z"]); // a time becomes a date in December 1899
+});
+ok("xd: ISO strings back to Date", () => {
+  assert.deepStrictEqual(runSnippet("America/Los_Angeles", "", 'new Date("2026-01-05").toISOString(); // a\nnew Date("2026-01-05T13:30:00").toISOString(); // b'),
+    ["2026-01-05T00:00:00.000Z", "2026-01-05T21:30:00.000Z"]);
+});
+ok("xd: no Date cells without cellDates, raw CSV is all text", () => {
+  const ws = { "!ref": "A1:A2", A1: { t: "d", v: new Date(Date.UTC(2026, 0, 5)) }, A2: { t: "d", v: new Date(Date.UTC(2026, 0, 5, 13, 30)), z: "yyyy-mm-dd hh:mm" } };
+  for (const opts of [{}, { cellDates: true }]) {
+    const back = XLSX.read(XLSX.write({ SheetNames: ["S"], Sheets: { S: ws } }, { type: "buffer", bookType: "xlsx", ...opts }), { cellNF: true }).Sheets.S;
+    assert.deepStrictEqual([back.A1.t, back.A1.v, back.A2.t, back.A2.v], ["n", 46027, "n", 46027.5625]);
+  }
+  const csv = XLSX.read("a\n12.5\n2026-01-05", { type: "string", raw: true }).Sheets.Sheet1;
+  assert.deepStrictEqual([csv.A2.v, csv.A3.v], ["12.5", "2026-01-05"]);
+  assert.deepStrictEqual(XLSX.SSF.parse_date_code(60), { D: 60, T: 0, u: 0, y: 1900, m: 2, d: 29, H: 0, M: 0, S: 0, q: 3 }); // no warning
+  assert.strictEqual(XLSX.SSF.parse_date_code(44565, { date1904: true }).y, 2026);
+});
+ok("xd: SheetJS reads CSV dates month first unless raw is set", () => {
+  const snippet = "const csv = \"Joined\\n03/04/2026\\n31/12/2026\\n\";\n\nconst guessed = XLSX.read(csv, { type: \"string\" }).Sheets.Sheet1;\nguessed.A2.v; // 46085, the serial number of 2026-03-04 (read month first)\nguessed.A3.v; // \"31/12/2026\", left as text in the same column\n\nconst kept = XLSX.read(csv, { type: \"string\", raw: true }).Sheets.Sheet1;\nkept.A2.v;    // \"03/04/2026\", text you can check with the rest of the column";
+  for (const tz of ["UTC", "Asia/Tokyo"]) assert.deepStrictEqual(runSnippet(tz, "", snippet), [46085, "31/12/2026", "03/04/2026"]);
+  assert.strictEqual(serialToISO(46085, "date").value, "2026-03-04");
+});
+ok("xd: dateFormatKind", () => {
+  const cases = {
+    "yyyy-mm-dd": "date", "m/d/yy": "date", "dd/mm/yyyy;@": "date", "[$-409]mmmm d, yyyy": "date", "mmm-yy": "date",
+    "mmmm": "date", "d-mmm": "date", "yyyy\\-mm\\-dd": "date", '"Due "yyyy-mm-dd': "date", 'yyyy"年"m"月"d"日"': "date",
+    "yyyy-mm-dd hh:mm": "datetime", "dd.mm.yyyy hh:mm:ss": "datetime", "m/d/yy h:mm AM/PM": "datetime",
+    "hh:mm": "time", "mm:ss": "time", "h:mm AM/PM": "time", "[h]:mm:ss": "duration", "[mm]:ss": "duration",
+    "0.00": null, "General": null, "#,##0": null, "[Red]0.00": null, "0%": null, "0.00E+00": null, "@": null,
+    '"h"0': null, '0.00" days"': null, '#,##0.00 "€"': null, "[$€-407] #,##0.00": null, "_(* #,##0_)": null,
+    "0;[Red]-0": null, "": null,
+  };
+  for (const [format, want] of Object.entries(cases)) {
+    assert.strictEqual(dateFormatKind(format), want, format);
+    assert.strictEqual(XLSX.SSF.is_date(format), want !== null, "SheetJS agrees: " + format);
+  }
+  for (const v of [undefined, null, 14]) assert.strictEqual(dateFormatKind(v), null);
+});
+ok("xd: serialToISO edge cases", () => {
+  const v = (...a) => serialToISO(...a).value, e = (...a) => serialToISO(...a).error;
+  assert.strictEqual(v(46027, "date"), "2026-01-05");
+  assert.strictEqual(v(46027.5625, "datetime"), "2026-01-05T13:30:00");
+  assert.strictEqual(v(46027.5625, "date"), "2026-01-05");
+  assert.strictEqual(v(0.604166666666667, "time"), "14:30:00");
+  assert.strictEqual(v(0.75, "time"), "18:00:00");
+  assert.strictEqual(v(46027.75, "time"), "18:00:00");
+  assert.strictEqual(v(1.25, "duration"), 108000);
+  const t1430 = 46027 + 870 / 1440; // 2026-01-05 14:30
+  assert.strictEqual(Math.floor((t1430 % 1) * 86400), 52199); // cutting off the decimals gives 14:29:59
+  assert.strictEqual(v(t1430, "datetime"), "2026-01-05T14:30:00");
+  let cut = 0;
+  for (let minute = 0; minute < 1440; minute++) {
+    const serial = 46027 + minute / 1440;
+    if (Math.floor((serial % 1) * 86400) !== minute * 60) cut++;
+    assert.strictEqual(v(serial, "time"), `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00`);
+  }
+  assert.strictEqual(cut, 704);
+  assert.strictEqual(XLSX.SSF.format("yyyy-mm-dd", 0), "1900-01-00");
+  assert.strictEqual(new Date((1 - 25569) * 86400000).toISOString().slice(0, 10), "1899-12-31"); // the one-liner, serial 1
+  assert.strictEqual(v(46027 + 86399.6 / 86400, "datetime"), "2026-01-06T00:00:00"); // rounds into the next day
+  assert.strictEqual(v(46027 + 86399.6 / 86400, "date"), "2026-01-05");
+  assert.strictEqual(v(46027.9999999, "date"), "2026-01-05");
+  for (const near of [46027.99999999999, 46027.9999999999, 46027.999999999, 46027.99999999, 46028.000000001])
+    assert.strictEqual(v(near, "date"), XLSX.SSF.format("yyyy-mm-dd", near), String(near));
+  assert.strictEqual(v(46027.99999999999, "date"), "2026-01-06");
+  assert.strictEqual(v(46027.9999999, "datetime"), "2026-01-06T00:00:00");
+  assert.strictEqual(XLSX.SSF.format("yyyy-mm-dd", 46027.9999999), "2026-01-05");
+  assert.strictEqual(XLSX.SSF.format("yyyy-mm-dd hh:mm:ss", 46027.9999999), "2026-01-06 00:00:00");
+  assert.match(e(0.5, "datetime"), /day 0/);
+  assert.strictEqual(v(1, "date"), "1900-01-01");
+  assert.strictEqual(v(59, "date"), "1900-02-28");
+  assert.match(e(60, "date"), /1900-02-29 does not exist/);
+  assert.match(e(60.5, "datetime"), /1900-02-29/);
+  assert.strictEqual(v(61, "date"), "1900-03-01");
+  assert.match(e(0, "date"), /day 0/);
+  assert.strictEqual(v(2958465, "date"), "9999-12-31");
+  assert.match(e(2958466, "date"), /after 9999-12-31/);
+  assert.strictEqual(v(44565, "date", true), "2026-01-05");
+  assert.strictEqual(v(46027, "date") , v(46027 - 1462, "date", true)); // 1,462 days apart
+  assert.strictEqual(v(0, "date", true), "1904-01-01");
+  assert.strictEqual(v(60, "date", true), "1904-03-01"); // no fake day in the 1904 system
+  assert.match(e(2957004, "date", true), /after 9999-12-31/);
+  for (const bad of [-1, NaN, Infinity, "46027", null, undefined]) assert.match(e(bad, "date"), /not a valid Excel date number/, String(bad));
+  assert.match(e(46027, null), /not a date format/);
+});
+ok("xd: serialToISO agrees with the SheetJS formatter", () => {
+  let seed = 7;
+  const random = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let i = 0; i < 20000; i++) {
+    const serial = 61 + random() * 60000;
+    assert.strictEqual(serialToISO(serial, "date").value, XLSX.SSF.format("yyyy-mm-dd", serial), String(serial));
+    assert.strictEqual(serialToISO(serial, "datetime").value, XLSX.SSF.format("yyyy-mm-dd hh:mm:ss", serial).replace(" ", "T"), String(serial));
+    assert.strictEqual(serialToISO(serial, "time").value, XLSX.SSF.format("hh:mm:ss", serial), String(serial));
+    assert.strictEqual(serialToISO(serial, "date", true).value, XLSX.SSF.format("yyyy-mm-dd", serial, { date1904: true }), "1904 " + serial);
+  }
+  for (let serial = 1; serial < 60; serial++) assert.strictEqual(serialToISO(serial, "date").value, XLSX.SSF.format("yyyy-mm-dd", serial));
+});
+const xdFile = (wb) => ({ arrayBuffer: async () => XLSX.write(wb, { type: "array", bookType: "xlsx" }) });
+ok("xd: readSheetCells on a workbook", async () => {
+  const n = (v, z) => ({ t: "n", v, z });
+  const sheet = { "!ref": "B2:C11",
+    B2: { t: "s", v: "What" }, C2: { t: "s", v: "Value" },
+    B3: { t: "s", v: "dd/mm/yyyy" }, C3: n(46027, "dd/mm/yyyy"),
+    B4: { t: "s", v: "date-time" }, C4: n(46027.5625, "dd/mm/yyyy hh:mm"),
+    B5: { t: "s", v: "time" }, C5: n(0.75, "h:mm AM/PM"),
+    B6: { t: "s", v: "duration" }, C6: n(1.25, "[h]:mm"),
+    B7: { t: "s", v: "amount" }, C7: n(12.5, "#,##0.00"),
+    B8: { t: "s", v: "fake day" }, C8: n(60, "m/d/yy"),
+    B9: { t: "s", v: "text" }, C9: { t: "s", v: "05.01.2026" },
+    B10: { t: "s", v: "flag" }, C10: { t: "b", v: true },
+    B11: { t: "s", v: "error" }, C11: { t: "e", v: 0x2a, w: "#N/A" } };
+  const rows = await readSheetCells(xdFile({ SheetNames: ["S"], Sheets: { S: sheet } }));
+  assert.strictEqual(rows.length, 10);
+  assert.deepStrictEqual(rows.map((r) => r[1]), [
+    { value: "Value" },
+    { value: "2026-01-05", kind: "date" },
+    { value: "2026-01-05T13:30:00", kind: "datetime" },
+    { value: "18:00:00", kind: "time" },
+    { value: 108000, kind: "duration" },
+    { value: 12.5 },
+    { value: null, kind: "date", problem: "C8: 1900-02-29 does not exist (Excel's 1900 leap-year bug)" },
+    { value: "05.01.2026" },
+    { value: true },
+    { value: null, problem: "C11: Excel error #N/A" },
+  ]);
+});
+ok("xd: readSheetCells handles the 1904 system, built-in formats, CSV and every time zone", async () => {
+  const one = (cell, props) => xdFile({ SheetNames: ["S"], Sheets: { S: { "!ref": "A1", A1: cell } }, Workbook: props });
+  assert.deepStrictEqual((await readSheetCells(one({ t: "n", v: 44565, z: "m/d/yy" }, { WBProps: { date1904: true } })))[0][0], { value: "2026-01-05", kind: "date" });
+  assert.deepStrictEqual((await readSheetCells(one({ t: "n", v: 44565, z: "m/d/yy" })))[0][0], { value: "2022-01-04", kind: "date" }); // same number, 1900 system
+  const typed = XLSX.utils.aoa_to_sheet([[new Date(Date.UTC(2026, 0, 5))]]); // stored with built-in format 14
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, typed, "S");
+  const back = XLSX.read(XLSX.write(wb, { type: "array", bookType: "xlsx" }), { cellNF: true }).Sheets.S.A1;
+  assert.strictEqual(back.z, "m/d/yy");
+  assert.strictEqual(XLSX.read(XLSX.write(wb, { type: "array", bookType: "xlsx" })).Sheets.S.A1.z, undefined); // without cellNF there is no format code
+  const csv = { arrayBuffer: async () => new TextEncoder().encode("Joined\n03/04/2026\n2026-03-04\n").buffer };
+  assert.deepStrictEqual((await readSheetCells(csv)).map((r) => r[0].value), ["Joined", "03/04/2026", "2026-03-04"]);
+  const empty = { "!ref": "A1:B1", A1: { t: "s", v: "x" } };
+  assert.deepStrictEqual(await readSheetCells(xdFile({ SheetNames: ["S"], Sheets: { S: empty } })), [[{ value: "x" }, { value: null }]]);
+  assert.deepStrictEqual(await readSheetCells(xdFile({ SheetNames: ["S"], Sheets: { S: {} } })), []);
+  const code = `${dateFormatKind}\n${serialToISO}\nconst DAY_MS = 86400000, DAY_ZERO_1900 = Date.UTC(1899, 11, 31), DAY_ZERO_1904 = Date.UTC(1904, 0, 1);
+    out.push(serialToISO(46027.5625, "datetime").value, serialToISO(46027, "date").value);`;
+  for (const tz of ["America/Los_Angeles", "Asia/Tokyo", "Pacific/Kiritimati"])
+    assert.deepStrictEqual(runSnippet(tz, "", code), ["2026-01-05T13:30:00", "2026-01-05"], tz);
+});

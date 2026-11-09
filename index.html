@@ -764,6 +764,15 @@ window.SheetSiftEngine = (function(){
   });
 
   var lastName = "messy-sample.csv";
+  function isoDateCells(ws, date1904){
+    Object.keys(ws).forEach(function(addr){
+      var c = ws[addr];
+      if (addr.charAt(0) === "!" || !c || c.t !== "n" || !c.z || !XLSX.SSF.is_date(c.z)) return;
+      var code = String(c.z).replace(/"[^"]*"/g, "").replace(/\[[^\]]*\]/g, "");
+      if (!/[yd]/i.test(code)) return; // a time of day or a duration: keep Excel's own text
+      c.w = XLSX.SSF.format(/[hs]/i.test(code) ? "yyyy-mm-dd hh:mm" : "yyyy-mm-dd", c.v, {date1904: date1904});
+    });
+  }
   function runGrid(grid, name){
     lastName = name;
     try {
@@ -789,7 +798,11 @@ window.SheetSiftEngine = (function(){
     if (/\.(xlsx|xls)$/i.test(f.name)){
       if (!window.XLSX){ summary.innerHTML = tag("bad", "Excel support didn't load. Try a CSV file."); return; }
       f.arrayBuffer().then(function(buf){
-        var wb = XLSX.read(buf, {type:"array", cellDates:true, dateNF:"yyyy-mm-dd"});
+        // Keep dates as Excel serial numbers with their format codes, then write each date cell
+        // as ISO text, so a dd/mm/yyyy display is never re-read as an ambiguous text date.
+        var wb = XLSX.read(buf, {type:"array", cellNF:true, dateNF:"yyyy-mm-dd"});
+        var date1904 = !!(wb.Workbook && wb.Workbook.WBProps && wb.Workbook.WBProps.date1904);
+        wb.SheetNames.forEach(function(n){ isoDateCells(wb.Sheets[n], date1904); });
         var name0 = wb.SheetNames.filter(function(n){
           var rows = XLSX.utils.sheet_to_json(wb.Sheets[n], {header:1, defval:""});
           return rows.some(function(r){ return r.join("").trim(); });

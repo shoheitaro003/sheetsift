@@ -112,6 +112,34 @@ function check(name, ok, detail) {
   check("xlsx: header found on row 3", /row 3/.test(xs), xs);
   check("xlsx: date cell is ISO", /^2026-04-0[34]$/.test(firstDate.trim()), firstDate);
 
+  // 6a. Excel date cells are read from the stored date, not from their display text:
+  // dd/mm/yyyy display, a 1904-system workbook, date-times, and serial 60 (1900-02-29, a day that never existed).
+  const datesB64 = await page.evaluate(() => {
+    const cell = (v, z) => ({ t: "n", v, z });
+    const ws = { "!ref": "A1:B5",
+      A1: { t: "s", v: "Name" }, B1: { t: "s", v: "Joined" },
+      A2: { t: "s", v: "A" }, B2: cell(46027, "dd/mm/yyyy"),
+      A3: { t: "s", v: "B" }, B3: cell(46059, "dd/mm/yyyy"),
+      A4: { t: "s", v: "C" }, B4: cell(46027.5625, "dd/mm/yyyy hh:mm"),
+      A5: { t: "s", v: "D" }, B5: cell(60, "dd/mm/yyyy") };
+    const wb = { SheetNames: ["S"], Sheets: { S: ws } };
+    const ws1904 = { "!ref": "A1:B2", A1: { t: "s", v: "Name" }, B1: { t: "s", v: "Joined" }, A2: { t: "s", v: "A" }, B2: cell(44565, "m/d/yy") };
+    return [XLSX.write(wb, { type: "base64", bookType: "xlsx" }),
+            XLSX.write({ SheetNames: ["S"], Sheets: { S: ws1904 }, Workbook: { WBProps: { date1904: true } } }, { type: "base64", bookType: "xlsx" })];
+  });
+  const datesPath = path.join(os.tmpdir(), "sheetsift-dates.xlsx");
+  fs.writeFileSync(datesPath, Buffer.from(datesB64[0], "base64"));
+  await page.setInputFiles("#file", datesPath);
+  await page.waitForTimeout(800);
+  const dateCells = await page.locator("#out tbody tr td:nth-child(3)").allInnerTexts();
+  check("xlsx: dd/mm/yyyy date cells become ISO, not ambiguous", dateCells.slice(0, 3).map((s) => s.trim()).join() === "2026-01-05,2026-02-06,2026-01-05", dateCells);
+  check("xlsx: serial 60 (1900-02-29) is flagged", /1900-02-29/.test(dateCells[3] || "") && /does not exist/i.test(await page.locator("#out tbody tr:nth-child(4)").innerHTML()), dateCells[3]);
+  fs.writeFileSync(datesPath, Buffer.from(datesB64[1], "base64"));
+  await page.setInputFiles("#file", datesPath);
+  await page.waitForTimeout(800);
+  const d1904 = await page.locator("#out tbody tr:first-child td:nth-child(3)").innerText().catch(() => "");
+  check("xlsx: 1904 date system", d1904.trim() === "2026-01-05", d1904);
+
   // 6b. Excel with an empty first sheet uses the sheet that has data
   const multiB64 = await page.evaluate(() => {
     const wb = XLSX.utils.book_new();

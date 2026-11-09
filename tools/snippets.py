@@ -372,3 +372,127 @@ async function readTable(file) {
     records: toRecords(rows, found.row, { row: origin.r, col: origin.c }),
   };
 }'''
+
+
+# --- blog/read-excel-dates-javascript-sheetjs ---
+XD_FORMULA = r'''// The usual one-liner: 25569 is the serial number of 1970-01-01.
+const toDate = (serial) => new Date((serial - 25569) * 86400000);
+
+toDate(46027).toISOString();               // "2026-01-05T00:00:00.000Z"
+toDate(46027).getDate();                   // 4 in Los Angeles, 5 in Tokyo
+toDate(46027).toLocaleDateString("en-US"); // "1/4/2026" in Los Angeles
+toDate(59).toISOString().slice(0, 10);     // "1900-02-27", but Excel shows 2/28/1900'''
+
+XD_CELLDATES = r'''// Joined.xlsx: A1 "Joined", A2 = 2026-01-05, A3 = serial 60, all formatted as dates
+const workbook = XLSX.read(bytes, { cellDates: true });
+const sheet = workbook.Sheets[workbook.SheetNames[0]];
+
+sheet.A2.v.toISOString(); // "2026-01-05T00:00:00.000Z" on every machine
+const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+rows[1][0].toISOString(); // "2026-01-04T15:00:00.000Z" in Tokyo: local midnight
+rows[2][0];               // 60: the cell for 29 February 1900 is still a number'''
+
+XD_QUICKFIX = r'''const workbook = XLSX.read(bytes, { cellDates: true });
+const sheet = workbook.Sheets[workbook.SheetNames[0]];
+const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, UTC: true });
+
+rows[1][0].toISOString().slice(0, 10); // "2026-01-05" in every time zone
+rows[1][0].getUTCDate();               // 5 (getDate() would still give 4 in Los Angeles)'''
+
+XD_CSV = r'''const csv = "Joined\n03/04/2026\n31/12/2026\n";
+
+const guessed = XLSX.read(csv, { type: "string" }).Sheets.Sheet1;
+guessed.A2.v; // 46085, the serial number of 2026-03-04 (read month first)
+guessed.A3.v; // "31/12/2026", left as text in the same column
+
+const kept = XLSX.read(csv, { type: "string", raw: true }).Sheets.Sheet1;
+kept.A2.v;    // "03/04/2026", text you can check with the rest of the column'''
+
+XD_KIND = r'''// What a cell's number format says about its value:
+// "date", "datetime", "time", "duration" or null (an ordinary number).
+function dateFormatKind(format) {
+  if (typeof format !== "string") return null;
+  let code = format
+    .replace(/"[^"]*"/g, "")      // quoted text, as in "Due "yyyy-mm-dd
+    .replace(/\\./g, "")          // escaped characters, as in yyyy\-mm\-dd
+    .replace(/[_*]./g, "")        // padding and fill characters
+    .split(";")[0];               // the section used for positive numbers
+  if (/\[(h+|m+|s+)\]/i.test(code)) return "duration"; // [h]:mm counts hours past 24
+  code = code.replace(/\[[^\]]*\]/g, "").replace(/AM\/PM|A\/P/gi, ""); // [$-409], [Red], AM/PM
+  if (/general/i.test(code)) return null;
+  const hasTime = /[hs]/i.test(code);
+  const hasDate = /[yd]/i.test(code) || (/m/i.test(code) && !hasTime); // "mmm" alone is a month
+  if (hasDate) return hasTime ? "datetime" : "date";
+  return hasTime ? "time" : null;
+}'''
+
+XD_SERIAL = r'''const DAY_MS = 86400000;
+const DAY_ZERO_1900 = Date.UTC(1899, 11, 31); // serial 1 is 1900-01-01
+const DAY_ZERO_1904 = Date.UTC(1904, 0, 1);   // serial 0 is 1904-01-01
+
+// Excel serial number -> ISO 8601 text, with no time zone involved.
+// Returns { value } or { error } so a caller can show why a cell was rejected.
+function serialToISO(serial, kind, date1904 = false) {
+  if (typeof serial !== "number" || !Number.isFinite(serial) || serial < 0)
+    return { error: "not a valid Excel date number" };
+  // Times: round to the nearest second. Fractions of a day are rarely exact in binary,
+  // so 2026-01-05 14:30 is 52199.99... seconds into the day, not 52200.
+  // Dates: drop the time part, after snapping to the millisecond so that a formula
+  // result of 46027.99999999999 counts as the next day (as SheetJS's formatter does).
+  const seconds = Math.round(serial * 86400);
+  let day = kind === "date" ? Math.floor(Math.round(serial * DAY_MS) / DAY_MS) : Math.floor(seconds / 86400);
+  const timeOfDay = seconds % 86400;
+  const time = [Math.floor(timeOfDay / 3600), Math.floor(timeOfDay / 60) % 60, timeOfDay % 60]
+    .map((n) => String(n).padStart(2, "0")).join(":");
+
+  if (kind === "time") return { value: time };
+  if (kind === "duration") return { value: seconds }; // elapsed seconds, not a date
+  if (kind !== "date" && kind !== "datetime") return { error: "not a date format" };
+
+  if (!date1904) {
+    if (day === 0) return { error: "day 0 of the 1900 system (shown as 1900-01-00)" };
+    if (day === 60) return { error: "1900-02-29 does not exist (Excel's 1900 leap-year bug)" };
+    if (day > 60) day -= 1; // every serial after the fake 29 February is one day ahead
+  }
+  const ms = (date1904 ? DAY_ZERO_1904 : DAY_ZERO_1900) + day * DAY_MS;
+  if (ms > Date.UTC(9999, 11, 31)) return { error: "after 9999-12-31" };
+  const date = new Date(ms).toISOString().slice(0, 10); // safe: ms is UTC midnight
+  return { value: kind === "date" ? date : `${date}T${time}` };
+}'''
+
+XD_READ = r'''// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
+import * as XLSX from "xlsx";
+
+async function readSheetCells(file) {
+  const workbook = XLSX.read(await file.arrayBuffer(), {
+    cellNF: true, // keep each cell's number format in cell.z
+    raw: true,    // CSV and other text files: keep "03/04/2026" as text, do not guess
+  });             // no cellDates: dates stay serial numbers, so no time zone applies
+  const date1904 = Boolean(workbook.Workbook?.WBProps?.date1904);
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  if (!sheet["!ref"]) return []; // an empty sheet
+  const range = XLSX.utils.decode_range(sheet["!ref"]);
+  const rows = [];
+  for (let r = range.s.r; r <= range.e.r; r++) {
+    const row = [];
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const address = XLSX.utils.encode_cell({ r, c });
+      row.push(readCell(sheet[address], date1904, address));
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+function readCell(cell, date1904, address) {
+  if (!cell || cell.t === "z") return { value: null };
+  if (cell.t === "e") return { value: null, problem: `${address}: Excel error ${cell.w ?? ""}`.trim() };
+  if (cell.t !== "n") return { value: cell.v }; // text and TRUE/FALSE as stored
+  const kind = dateFormatKind(cell.z);
+  if (!kind) return { value: cell.v };          // an ordinary number
+  const result = serialToISO(cell.v, kind, date1904);
+  return result.error
+    ? { value: null, kind, problem: `${address}: ${result.error}` }
+    : { value: result.value, kind };
+}'''
+
