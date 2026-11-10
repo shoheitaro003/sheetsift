@@ -25,3 +25,9 @@ claims; every behaviour it states is checked by tests (Node 20/22, Chromium in s
 10. CTA: "decodes CSV files the same way" vs disclosure "simplified versions": use "the same approach".
 11. "Every one of its 256 bytes maps..." -> add "in TextDecoder".
 12. Add the actual scores to the not-sure rows of the table.
+
+## Found in CI on 2026-11-10
+Node 20 (CI) decoded "windows-1252" as ISO-8859-1: byte 80 became U+0080 instead of the euro
+sign, 93 became U+0093 instead of a curly quote. Node 22 (local) and Chromium follow the
+Windows-1252 table. CI now runs Node 22 (Node 20 is past end of life). The post must say
+"Node 22" (not "Node 20 and 22"), and this is worth a trap of its own if it can be sourced.
