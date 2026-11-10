@@ -82,7 +82,7 @@ function isTotalsRow(row) {
   values.some((v) =&gt; /^-?\d{1,3}(\.\d{3})*,\d{1,2}$/.test(String(v).trim()));
 
 function parseAmount(raw, decimalComma) {
-  let t = String(raw).trim().replace(/[\s ]/g, &quot;&quot;).replace(/^[$€£¥]|[$€£¥円]$/g, &quot;&quot;);
+  let t = String(raw).trim().replace(/[\s\u00a0]/g, &quot;&quot;).replace(/^[$€£¥]|[$€£¥円]$/g, &quot;&quot;);
   t = decimalComma ? t.replace(/\./g, &quot;&quot;).replace(&quot;,&quot;, &quot;.&quot;) : t.replace(/,/g, &quot;&quot;);
   return /^-?\d+(\.\d+)?$/.test(t) ? Number(t) : null;
 }</code></pre>

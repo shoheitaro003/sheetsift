@@ -81,9 +81,9 @@ function check(name, ok, detail) {
     ["header only", "Name,Email\n"],
     ["single column", "Name\nA\nB\n"],
     ["quoted newline", "Name,Note\nA,\"line one\nline two\"\nB,ok\n"],
-    ["BOM and CRLF", "﻿Name,Email\r\nA,a@example.com\r\nB,b@example.com\r\n"],
+    ["BOM and CRLF", "\ufeffName,Email\r\nA,a@example.com\r\nB,b@example.com\r\n"],
     ["tab separated", "Name\tEmail\nA\ta@example.com\n"],
-    ["garbage", "\u0000\u0001PK\u0003\u0004 binary junk ��"],
+    ["garbage", "\u0000\u0001PK\u0003\u0004 binary junk \ufffd\ufffd"],
     ["unclosed quote", "Name,Note\nA,\"never closed\nB,x\n"],
     ["ragged rows", "a,b,c\n1\n1,2,3,4,5\n"],
   ]) {
@@ -167,6 +167,43 @@ function check(name, ok, detail) {
   await page.waitForTimeout(300);
   const ps = await page.locator("#summary").innerText();
   check("pdf: refused with a message", /CSV or Excel/i.test(ps), ps);
+
+  // 7b. CSV files that are not UTF-8
+  const upload = async (name, bytes) => {
+    const p = path.join(os.tmpdir(), name);
+    fs.writeFileSync(p, bytes);
+    await page.setInputFiles("#file", p);
+    await page.waitForTimeout(500);
+    return { summary: await page.locator("#summary").innerText(), table: await page.locator("#out").innerText().catch(() => "") };
+  };
+  let enc = await upload("sjis.csv", Buffer.from("8e8196bc2c8be08a7a0a8e52936391be98592c313230300a8db293a189d48e712c3830300a", "hex"));
+  check("encoding: Shift_JIS CSV is decoded", /山田太郎/.test(enc.table) && /佐藤花子/.test(enc.table) && /shift_jis/i.test(enc.summary), enc);
+  enc = await upload("latin.csv", Buffer.from("4e616d652c436974790a4dfc6c6c65722c4bf66c6e0a4a6f73e92c53e36f205061756c6f0a", "hex"));
+  check("encoding: Windows-1252 CSV is decoded", /Müller/.test(enc.table) && /São Paulo/.test(enc.table) && /windows-1252/i.test(enc.summary), enc);
+  enc = await upload("utf16.txt", Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("Name\tCity\nYui\t東京\nAnna\tKöln\n", "utf16le")]));
+  check("encoding: UTF-16LE with BOM (tab-separated) is decoded", /東京/.test(enc.table) && /Köln/.test(enc.table), enc);
+  enc = await upload("utf8bom.csv", Buffer.from("\ufeffName,City\nYui,東京\n", "utf8"));
+  check("encoding: UTF-8 BOM is not part of the first header", /Name/.test(enc.table) && !/\ufeff/.test(enc.table) && !/utf-8|encoding/i.test(enc.summary), enc);
+  enc = await upload("renamed.csv", Buffer.from(await page.evaluate(() => XLSX.write({ SheetNames: ["S"], Sheets: { S: XLSX.utils.aoa_to_sheet([["a"]]) } }, { type: "base64", bookType: "xlsx" })), "base64"));
+  check("encoding: an .xlsx renamed to .csv is refused with a reason", /xlsx/i.test(enc.summary) && /bad/.test(await page.locator("#summary .tag").first().getAttribute("class")), enc);
+  enc = await upload("old.csv", Buffer.from("d0cf11e0a1b11ae1000000000000000000000000", "hex"));
+  check("encoding: an old .xls renamed to .csv is refused with a reason", /old \.xls/.test(enc.summary), enc);
+  enc = await upload("crdamaged.csv", Buffer.concat([Buffer.from("Name,City\rYui,東京\r", "utf8"), Buffer.from([0x4a, 0x6f, 0x73, 0xe9, 0x2c, 0x58, 0x0d]), Buffer.from("Ken,大阪\r", "utf8")]));
+  check("encoding: damaged UTF-8 with CR-only line breaks reports the right line", /line 3/.test(enc.summary), enc);
+  enc = await upload("damaged.csv", Buffer.concat([Buffer.from("Name,City\nYui,東京\n", "utf8"), Buffer.from([0x4a, 0x6f, 0x73, 0xe9, 0x2c, 0x58, 0x0a]), Buffer.from("Ken,大阪\n", "utf8")]));
+  check("encoding: damaged UTF-8 is read and flagged with the line", /大阪/.test(enc.table) && /line 3/.test(enc.summary), enc);
+
+  enc = await upload("yen.csv", Buffer.from("4974656d2c50726963650a50656e2c313030897e0a426f6f6b2c31323030897e0a", "hex"));
+  check("encoding: Shift_JIS prices with 円 and no kana", /Book\t1200/.test(enc.table) && /shift_jis/i.test(enc.summary) && !/Encoding:/.test(enc.summary), enc);
+  enc = await upload("quotes.csv", Buffer.from("4e6f74650a6c92e974e92c204a6f73e9927320636166e90a", "hex"));
+  check("encoding: Windows-1252 with curly apostrophes", /l’été/.test(enc.table) && /windows-1252/i.test(enc.summary) && !/Encoding:/.test(enc.summary), enc);
+
+  // 7c. Blob.text() in Chromium (used by the encodings draft in content/drafts)
+  const blobText = await page.evaluate(async () => [
+    await new Blob([new Uint8Array([0x43, 0x61, 0x66, 0xe9])]).text(),
+    await new Blob([new Uint8Array([0xff, 0xfe, 0x48, 0x00, 0x69, 0x00])]).text(),
+  ]);
+  check("encoding: Chromium Blob.text() reads Windows-1252 as UTF-8 but honours a UTF-16 BOM", blobText[0] === "Caf\ufffd" && blobText[1] === "Hi", blobText);
 
   // 8. Waitlist form
   const key = await page.locator('#wl input[name="access_key"]').inputValue();

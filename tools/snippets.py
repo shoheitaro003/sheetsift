@@ -35,7 +35,7 @@ NUMBERS = r'''const usesDecimalComma = (values) =>
   values.some((v) => /^-?\d{1,3}(\.\d{3})*,\d{1,2}$/.test(String(v).trim()));
 
 function parseAmount(raw, decimalComma) {
-  let t = String(raw).trim().replace(/[\s ]/g, "").replace(/^[$€£¥]|[$€£¥円]$/g, "");
+  let t = String(raw).trim().replace(/[\s\u00a0]/g, "").replace(/^[$€£¥]|[$€£¥円]$/g, "");
   t = decimalComma ? t.replace(/\./g, "").replace(",", ".") : t.replace(/,/g, "");
   return /^-?\d+(\.\d+)?$/.test(t) ? Number(t) : null;
 }'''
@@ -495,4 +495,186 @@ function readCell(cell, date1904, address) {
     ? { value: null, kind, problem: `${address}: ${result.error}` }
     : { value: result.value, kind };
 }'''
+
+
+# --- blog/decode-shift-jis-windows-1252-utf-16-csv-javascript ---
+DEC_PROBLEM = r'''const cafe = new Uint8Array([0x43, 0x61, 0x66, 0xe9]); // "Café" saved as Windows-1252
+await new Blob([cafe]).text();                 // "Caf\uFFFD"
+new TextDecoder().decode(cafe);                // "Caf\uFFFD"
+new TextDecoder("windows-1252").decode(cafe);  // "Café"
+
+const nihon = new Uint8Array([0x93, 0xfa, 0x96, 0x7b]); // "日本" saved as Shift_JIS
+new TextDecoder("shift_jis").decode(nihon);    // "日本"
+new TextDecoder("windows-1252").decode(nihon); // "“ú–{"'''
+DEC_TRAPS = r'''// 1. Several labels give the same decoder.
+new TextDecoder("latin1").encoding;      // "windows-1252"
+new TextDecoder("iso-8859-1").encoding;  // "windows-1252"
+new TextDecoder("ascii").encoding;       // "windows-1252"
+new TextDecoder("sjis").encoding;        // "shift_jis"
+new TextDecoder("windows-31j").encoding; // "shift_jis"
+new TextDecoder("utf-16").encoding;      // "utf-16le"
+new TextDecoder("utf-32");               // throws RangeError
+
+// 2. A byte order mark only helps if you picked the right decoder already.
+// "Hi" in UTF-16LE, with a BOM:
+const hi = new Uint8Array([0xff, 0xfe, 0x48, 0x00, 0x69, 0x00]);
+new TextDecoder("utf-16le").decode(hi);  // "Hi"
+new TextDecoder("utf-8").decode(hi);     // "\uFFFD\uFFFDH\u0000i\u0000"
+
+// 3. Windows-1252 accepts every byte, so "no error" proves nothing.
+const strict1252 = new TextDecoder("windows-1252", { fatal: true });
+strict1252.decode(new Uint8Array([0x81, 0x8d])); // "\u0081\u008d"
+
+// 4. Chunks decoded separately break characters that cross a chunk boundary.
+const tokyo = new TextEncoder().encode("東京"); // 6 bytes, 3 per character
+const decoder = new TextDecoder();
+decoder.decode(tokyo.slice(0, 4)) + decoder.decode(tokyo.slice(4)); // "東\uFFFD\uFFFD\uFFFD"
+decoder.decode(tokyo.slice(0, 4), { stream: true }) + decoder.decode(tokyo.slice(4)); // "東京"'''
+DEC_SNIFF = r'''const BOMS = [ // byte order marks; UTF-32 before UTF-16, because FF FE starts both
+  { bytes: [0xef, 0xbb, 0xbf], encoding: "utf-8" },
+  { bytes: [0xff, 0xfe, 0x00, 0x00], encoding: null }, // UTF-32LE: TextDecoder cannot read it
+  { bytes: [0x00, 0x00, 0xfe, 0xff], encoding: null }, // UTF-32BE
+  { bytes: [0xff, 0xfe], encoding: "utf-16le" },
+  { bytes: [0xfe, 0xff], encoding: "utf-16be" },
+];
+
+function sniffBom(bytes) {
+  return BOMS.find((bom) => bom.bytes.every((b, i) => bytes[i] === b)) ?? null;
+}
+
+// UTF-16 without a BOM: commas, digits and line breaks are 2 bytes with one zero,
+// so zeros pile up on one side of each byte pair ("," is 2C 00 in UTF-16LE).
+function guessUtf16(bytes) {
+  const end = Math.min(bytes.length, 4096) & ~1; // whole 2-byte units only
+  let evenZeros = 0, oddZeros = 0;
+  for (let i = 0; i < end; i += 2) {
+    if (bytes[i] === 0) evenZeros++;
+    if (bytes[i + 1] === 0) oddZeros++;
+  }
+  const units = end / 2;
+  const enough = Math.max(units / 10, 4); // a stray zero byte in a short file is not UTF-16
+  if (oddZeros >= enough && evenZeros < oddZeros / 4) return "utf-16le";
+  if (evenZeros >= enough && oddZeros < evenZeros / 4) return "utf-16be";
+  return null;
+}
+
+function decodeStrict(bytes, encoding) {
+  try {
+    return new TextDecoder(encoding, { fatal: true }).decode(bytes);
+  } catch {
+    return null; // the bytes are not valid in this encoding
+  }
+}'''
+DEC_DAMAGE = r'''// Share of non-ASCII bytes that form valid UTF-8 sequences, and where the first bad byte is.
+// Close to 1: a UTF-8 file with a few broken bytes. Close to 0: another encoding.
+function utf8Damage(bytes) {
+  let valid = 0, invalid = 0, firstInvalid = -1;
+  for (let i = 0; i < bytes.length; ) {
+    const b = bytes[i];
+    if (b < 0x80) { i++; continue; }
+    const length = b >= 0xc2 && b <= 0xdf ? 2 : b >= 0xe0 && b <= 0xef ? 3 : b >= 0xf0 && b <= 0xf4 ? 4 : 0;
+    // The second byte has a narrower range after E0, ED, F0 and F4 (no overlong forms or surrogates).
+    const [low, high] = b === 0xe0 ? [0xa0, 0xbf] : b === 0xed ? [0x80, 0x9f] : b === 0xf0 ? [0x90, 0xbf] : b === 0xf4 ? [0x80, 0x8f] : [0x80, 0xbf];
+    let ok = length > 0 && bytes[i + 1] >= low && bytes[i + 1] <= high;
+    for (let k = 2; ok && k < length; k++) ok = (bytes[i + k] & 0xc0) === 0x80; // 10xxxxxx
+    if (ok) { valid += length; i += length; continue; }
+    if (firstInvalid < 0) firstInvalid = i;
+    invalid++;
+    i++;
+  }
+  return { share: valid / (valid + invalid || 1), firstInvalid };
+}
+
+function lineAt(bytes, offset) { // counts LF, CRLF and CR-only line breaks
+  let line = 1;
+  for (let i = 0; i < offset; i++) if (bytes[i] === 0x0a || (bytes[i] === 0x0d && bytes[i + 1] !== 0x0a)) line++;
+  return line;
+}'''
+DEC_SCORE = r'''// Symbols that wrongly decoded Japanese produces often and real Western text almost never uses.
+const RARE_SYMBOLS = /[\u0192\u02c6\u02dc\u2020\u2021\u2030\u00a4\u00a6\u00a8\u00af\u00b8\u2039\u203a]/;
+
+function charClass(c) {
+  if (c === undefined || c < "\u0080") return /[0-9]/.test(c ?? "") ? "digit" : "ascii";
+  if (/[\p{Cc}\p{Co}\p{Cn}\uFFFD]/u.test(c) || RARE_SYMBOLS.test(c)) return "junk"; // controls, private use, unassigned
+  if (/[\u3000-\u30ff\uff01-\uff60]/.test(c)) return "kana"; // kana, CJK and full-width punctuation
+  if (/\p{Script=Han}/u.test(c)) return "han";
+  if (/[\uff61-\uff9f]/.test(c)) return "halfKana";
+  if (/\p{L}/u.test(c)) return "letter";
+  if (/[\p{Pi}\p{Pf}]/u.test(c)) return "quote"; // “ ” ‘ ’ « »
+  return "symbol";
+}
+
+// From 0 to 1: the share of non-ASCII characters that sit where real text puts them.
+function plausibility(text) {
+  const classes = Array.from(text.slice(0, 100000)).map(charClass); // a sample is enough
+  const hasKana = classes.includes("kana");
+  const latin = (s) => s === "ascii" || s === "digit" || s === "letter" || s === "quote";
+  let nonAscii = 0, good = 0;
+  classes.forEach((cls, i) => {
+    if (cls === "ascii" || cls === "digit") return;
+    nonAscii++;
+    const sides = [classes[i - 1] ?? "ascii", classes[i + 1] ?? "ascii"];
+    const fits = {
+      junk: false,
+      kana: true,
+      han: hasKana || sides.some((s) => s === "han" || s === "kana" || s === "digit"), // 東京, 100円
+      halfKana: sides.includes("halfKana"),
+      letter: sides.every(latin), // Müller, l’été
+      quote: sides.every(latin),
+      symbol: sides.every((s) => s === "ascii" || s === "digit"), // 1.234,50 €
+    }[cls];
+    if (fits) good++;
+  });
+  return nonAscii === 0 ? 1 : good / nonAscii;
+}'''
+DEC_DECODE = r'''// legacy: the encodings your users' older software writes, most likely first.
+function decodeCsv(bytes, legacy = ["windows-1252"]) {
+  const result = (encoding, text, sure, reason, options = []) => ({ encoding, text, sure, reason, options });
+  const refuse = (reason) => result(null, null, false, reason);
+
+  const startsWith = (...signature) => signature.every((b, i) => bytes[i] === b);
+  if (startsWith(0x50, 0x4b, 0x03, 0x04)) return refuse("this is a ZIP file, probably an .xlsx renamed to .csv");
+  if (startsWith(0xd0, 0xcf, 0x11, 0xe0)) return refuse("this is an old .xls file renamed to .csv");
+  const bom = sniffBom(bytes);
+  if (bom && !bom.encoding) return refuse("UTF-32 file: save it as UTF-8 and try again");
+  const unicode = bom ? bom.encoding : guessUtf16(bytes);
+  if (unicode) {
+    const text = decodeStrict(bytes, unicode); // also removes the BOM
+    if (text === null) return refuse(`looks like ${unicode} but is not valid ${unicode}`);
+    return result(unicode, text, true, bom ? "byte order mark" : "UTF-16 zero-byte pattern");
+  }
+  if (bytes.includes(0)) return refuse("contains zero bytes: a binary file, or UTF-16 without a byte order mark");
+
+  const utf8 = decodeStrict(bytes, "utf-8");
+  if (utf8 !== null) return result("utf-8", utf8, true, "valid UTF-8");
+  const damage = utf8Damage(bytes);
+  if (damage.share >= 0.9) {
+    const line = lineAt(bytes, damage.firstInvalid);
+    return result("utf-8", new TextDecoder().decode(bytes), false, `UTF-8 with invalid bytes, first on line ${line}`);
+  }
+
+  const options = legacy
+    .map((encoding) => ({ encoding, text: decodeStrict(bytes, encoding) }))
+    .filter((option) => option.text !== null)
+    .map((option) => ({ ...option, score: plausibility(option.text) }))
+    .sort((a, b) => b.score - a.score);
+  if (options.length === 0) return refuse(`not valid UTF-8 or ${legacy.join(", ")}`);
+  const [best, next] = options;
+  const scores = options.map(({ encoding, score }) => ({ encoding, score })); // for an encoding picker
+  if (best.score < 0.9)
+    return result(best.encoding, best.text, false, `no encoding gives clean text (best guess: ${best.encoding})`, scores);
+  if (next && best.score - next.score < 0.3)
+    return result(best.encoding, best.text, false, `${best.encoding} and ${next.encoding} both give clean text`, scores);
+  return result(best.encoding, best.text, true, `not UTF-8, clean as ${best.encoding}`, scores);
+}'''
+DEC_USE = r'''async function readCsvText(file, legacy) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const decoded = decodeCsv(bytes, legacy);
+  // When decoded.sure is false, show a preview and let the user pick another encoding.
+  // decodeAs returns null if the bytes are not valid in the chosen encoding.
+  const decodeAs = (encoding) => decodeStrict(bytes, encoding);
+  return { ...decoded, decodeAs };
+}
+
+const { encoding, text, sure, reason, options, decodeAs } = await readCsvText(file, ["windows-1252", "shift_jis"]);'''
 

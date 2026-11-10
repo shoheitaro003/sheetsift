@@ -7,7 +7,7 @@ Take the top unchecked item. Add new ideas from questions people send.
 - [x] How to parse European number formats in JavaScript without a library (published 2026-11-07)
 - [x] Detecting the header row in a spreadsheet: a heuristic that works on real exports (published 2026-11-08)
 - [x] Reading Excel dates correctly with SheetJS (published 2026-11-09)
-- [ ] Shift_JIS, Windows-1252 and UTF-16: decoding CSV files from legacy systems in the browser
+- [ ] Shift_JIS, Windows-1252 and UTF-16: decoding CSV files from legacy systems in the browser (draft in content/drafts/, review 8/8/7 on 2026-11-10; see the .NOTES.md file)
 - [ ] Column mapping without AI: matching "E-mail", "Email address" and "mail" to one field
 - [ ] Why your importer should never silently guess (ambiguous dates, unquoted commas, duplicate headers)
 - [ ] Parsing a 100,000-row CSV in the browser without freezing the page (Web Workers, streaming)
