@@ -577,6 +577,66 @@ ok("dec: damaged UTF-8 is flagged with the line, not re-read as a legacy encodin
   assert.strictEqual(lineAt(hex("41 0d 0a 42 0d 0a 43"), 6), 3); // CRLF
   assert.strictEqual(lineAt(hex("41 0d 42 0d 43"), 4), 3); // CR only (old Mac files)
 }});
+ok("dec: damaged UTF-8 still lists the legacy candidates for a picker", () => {{
+  const bytes = Uint8Array.from([...new TextEncoder().encode("名前,都市\\n山田,東京\\n"), ...hex("4361 66e9 2c50 6172 6973 0a"), ...new TextEncoder().encode("佐藤,大阪\\n")]);
+  assert.deepStrictEqual(decodeCsv(bytes, ["windows-1252", "shift_jis"]).options.map((o) => o.encoding), ["windows-1252"]); // not valid Shift_JIS
+}});
+ok("dec: UTF-8 cut off in the middle of a character at the end", () => {{
+  const whole = new TextEncoder().encode("名前,都市\\n山田,東京\\n佐藤,大阪");
+  for (const drop of [1, 2]) {{
+    const r = decodeCsv(whole.subarray(0, whole.length - drop), ["windows-1252", "shift_jis"]);
+    assert.deepStrictEqual([r.encoding, r.sure, r.reason], ["utf-8", false, "UTF-8 cut off in the middle of a character at the end (line 3)"]);
+    assert(r.text.startsWith("名前,都市\\n山田,東京\\n佐藤,大") && r.text.endsWith("\\uFFFD"));
+  }}
+  assert.strictEqual(cutCharacterAtEnd(whole), -1);
+  assert.strictEqual(cutCharacterAtEnd(new Uint8Array([])), -1);
+  assert.strictEqual(cutCharacterAtEnd(hex("41 f0 9f 98")), 1);
+  // A Windows-1252 file ending in é (E9) is not mistaken for cut-off UTF-8: the rest is plain ASCII.
+  assert.deepStrictEqual([decodeCsv(hex("43 61 66 e9")).encoding, decodeCsv(hex("43 61 66 e9")).sure], ["windows-1252", true]);
+}});
+ok("dec: UTF-16 without a BOM and without ASCII is refused, not misread", () => {{
+  const r = decodeCsv(Uint8Array.from(Buffer.from("東京都千代田区\\n大阪府大阪市\\n", "utf16le")), ["windows-1252", "shift_jis"]);
+  assert.strictEqual(r.reason, "contains zero bytes: a binary file, or UTF-16 without a byte order mark");
+}});
+ok("dec: Node's Blob.text() ignores a UTF-16 byte order mark", async () => {{
+  assert.strictEqual(await new Blob([new Uint8Array([0xff, 0xfe, 0x48, 0x00, 0x69, 0x00])]).text(), "\\uFFFD\\uFFFDH\\u0000i\\u0000");
+}});
+ok("dec: scores in the not-sure rows of the table", () => {{
+  const rows = [
+    ["kanjiDate:cp932", ["windows-1252", "shift_jis"], [["windows-1252", 1], ["shift_jis", 1]]],
+    ["japanese:cp932", ["windows-1252"], [["windows-1252", 0.23]]],
+    ["japanese:cp932", ["shift_jis", "gb18030"], [["shift_jis", 1], ["gb18030", 1]]],
+    ["cyrillic:cp1251", ["windows-1252", "windows-1251"], [["windows-1252", 1], ["windows-1251", 1]]],
+    ["ellipsis:cp1252", ["windows-1252", "shift_jis"], [["windows-1252", 0], ["shift_jis", 0]]],
+  ];
+  for (const [k, legacy, want] of rows)
+    assert.deepStrictEqual(decodeCsv(hex(DEC_SAMPLES_HEX[k]), legacy).options.map((o) => [o.encoding, Math.round(o.score * 100) / 100]), want, k);
+}});
+ok("dec: a real per-mille sign or dagger in Windows-1252 is a false alarm", () => {{
+  for (const hexText of ["4e616d652c526174650a4b6f63682c35890a", "4e616d652c4e6f74650a536d6974682c8631393930"]) {{ // "Koch,5‰", "Smith,†1990"
+    const r = decodeCsv(hex(hexText), ["windows-1252", "shift_jis"]);
+    assert.deepStrictEqual([r.encoding, r.sure], ["windows-1252", false], r.reason);
+  }}
+}});
+ok("dec: utf8SequenceLength", () => {{
+  assert.deepStrictEqual([0x41, 0x80, 0xc1, 0xc2, 0xdf, 0xe0, 0xef, 0xf0, 0xf4, 0xf5, 0xff].map(utf8SequenceLength), [1, 0, 0, 2, 2, 3, 3, 4, 4, 0, 0]);
+}});
+ok("dec: decodeAs can switch back to damaged UTF-8", async () => {{
+  const bytes = Uint8Array.from([...new TextEncoder().encode("名前,都市\\n山田,東京\\n"), ...hex("4361 66e9 2c50 6172 6973 0a"), ...new TextEncoder().encode("佐藤,大阪\\n")]);
+  const AsyncFunction = (async () => {{}}).constructor;
+  const got = await new AsyncFunction("file", "decodeCsv", "decodeStrict", {_json.dumps(DEC_USE)} + "\\nreturn {{ encoding, text, back: decodeAs('utf-8'), other: decodeAs('windows-1252') }};")(new Blob([bytes]), decodeCsv, decodeStrict);
+  assert.strictEqual(got.encoding, "utf-8");
+  assert.strictEqual(got.back, got.text);
+  assert(got.other.includes("Café,Paris"));
+}});
+ok("dec: sample counts quoted in step 3", () => {{
+  const valid = (keys, e) => keys.filter((k) => decodeStrict(hex(DEC_SAMPLES_HEX[k]), e) !== null).length;
+  const western = ["latin:cp1252", "latinEnd:cp1252", "quotes:cp1252", "ellipsis:cp1252"];
+  const sjis = ["japanese:cp932", "kanjiOnly:cp932", "halfKana:cp932", "yen:cp932", "kanjiDate:cp932"];
+  assert.strictEqual(valid(western, "shift_jis"), 1); // 3 of 4 Windows-1252 samples are not valid Shift_JIS
+  assert.strictEqual(valid(sjis, "euc-jp"), 1); // 4 of 5 Shift_JIS samples are not valid EUC-JP
+  assert.strictEqual(valid(sjis, "gb18030"), 4); // 4 of 5 Shift_JIS samples are valid GB18030
+}});
 const DEC_TABLE = [
   // sample, saved as, candidates, expected encoding, expected sure
   ["latin", "cp1252", ["windows-1252"], "windows-1252", true],

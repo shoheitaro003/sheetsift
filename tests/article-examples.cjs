@@ -913,6 +913,19 @@ function decodeStrict(bytes, encoding) {
   }
 }
 
+// How many bytes a UTF-8 character starting with this byte has (0: not a valid first byte).
+function utf8SequenceLength(b) {
+  if (b < 0x80) return 1;
+  if (b >= 0xc2 && b <= 0xdf) return 2;
+  if (b >= 0xe0 && b <= 0xef) return 3;
+  if (b >= 0xf0 && b <= 0xf4) return 4;
+  return 0;
+}
+
+// After these first bytes the second byte has a narrower range: no overlong forms,
+// no surrogates (ED A0-BF), nothing above U+10FFFF (F4 90-BF).
+const SECOND_BYTE = { 0xe0: [0xa0, 0xbf], 0xed: [0x80, 0x9f], 0xf0: [0x90, 0xbf], 0xf4: [0x80, 0x8f] };
+
 // Share of non-ASCII bytes that form valid UTF-8 sequences, and where the first bad byte is.
 // Close to 1: a UTF-8 file with a few broken bytes. Close to 0: another encoding.
 function utf8Damage(bytes) {
@@ -920,9 +933,8 @@ function utf8Damage(bytes) {
   for (let i = 0; i < bytes.length; ) {
     const b = bytes[i];
     if (b < 0x80) { i++; continue; }
-    const length = b >= 0xc2 && b <= 0xdf ? 2 : b >= 0xe0 && b <= 0xef ? 3 : b >= 0xf0 && b <= 0xf4 ? 4 : 0;
-    // The second byte has a narrower range after E0, ED, F0 and F4 (no overlong forms or surrogates).
-    const [low, high] = b === 0xe0 ? [0xa0, 0xbf] : b === 0xed ? [0x80, 0x9f] : b === 0xf0 ? [0x90, 0xbf] : b === 0xf4 ? [0x80, 0x8f] : [0x80, 0xbf];
+    const length = utf8SequenceLength(b);
+    const [low, high] = SECOND_BYTE[b] ?? [0x80, 0xbf];
     let ok = length > 0 && bytes[i + 1] >= low && bytes[i + 1] <= high;
     for (let k = 2; ok && k < length; k++) ok = (bytes[i + k] & 0xc0) === 0x80; // 10xxxxxx
     if (ok) { valid += length; i += length; continue; }
@@ -931,6 +943,18 @@ function utf8Damage(bytes) {
     i++;
   }
   return { share: valid / (valid + invalid || 1), firstInvalid };
+}
+
+// An upload limit or a broken copy can cut a file in the middle of a character.
+// Returns where that incomplete last character starts, or -1.
+function cutCharacterAtEnd(bytes) {
+  for (let back = 1; back <= 3 && back <= bytes.length; back++) {
+    const b = bytes[bytes.length - back];
+    if ((b & 0xc0) === 0x80) continue; // 10xxxxxx: a continuation byte, keep looking for the first byte
+    const length = utf8SequenceLength(b);
+    return length > back ? bytes.length - back : -1;
+  }
+  return -1;
 }
 
 function lineAt(bytes, offset) { // counts LF, CRLF and CR-only line breaks
@@ -945,7 +969,7 @@ const RARE_SYMBOLS = /[\u0192\u02c6\u02dc\u2020\u2021\u2030\u00a4\u00a6\u00a8\u0
 function charClass(c) {
   if (c === undefined || c < "\u0080") return /[0-9]/.test(c ?? "") ? "digit" : "ascii";
   if (/[\p{Cc}\p{Co}\p{Cn}\uFFFD]/u.test(c) || RARE_SYMBOLS.test(c)) return "junk"; // controls, private use, unassigned
-  if (/[\u3000-\u30ff\uff01-\uff60]/.test(c)) return "kana"; // kana, CJK and full-width punctuation
+  if (/[\u3000-\u30ff\uff01-\uff60]/.test(c)) return "kana"; // kana, plus the CJK and full-width punctuation used with it
   if (/\p{Script=Han}/u.test(c)) return "han";
   if (/[\uff61-\uff9f]/.test(c)) return "halfKana";
   if (/\p{L}/u.test(c)) return "letter";
@@ -953,26 +977,30 @@ function charClass(c) {
   return "symbol";
 }
 
+// Does a non-ASCII character of this class look real next to these neighbours?
+function fitsBetween(cls, sides, hasKana) {
+  const latin = (s) => s === "ascii" || s === "digit" || s === "letter" || s === "quote";
+  switch (cls) {
+    case "kana": return true;
+    case "han": return hasKana || sides.some((s) => s === "han" || s === "kana" || s === "digit"); // 東京, 100円
+    case "halfKana": return sides.includes("halfKana");
+    case "letter": // Müller, l’été
+    case "quote": return sides.every(latin);
+    case "symbol": return sides.every((s) => s === "ascii" || s === "digit"); // 1.234,50 €
+    default: return false; // junk
+  }
+}
+
 // From 0 to 1: the share of non-ASCII characters that sit where real text puts them.
 function plausibility(text) {
   const classes = Array.from(text.slice(0, 100000)).map(charClass); // a sample is enough
   const hasKana = classes.includes("kana");
-  const latin = (s) => s === "ascii" || s === "digit" || s === "letter" || s === "quote";
   let nonAscii = 0, good = 0;
   classes.forEach((cls, i) => {
     if (cls === "ascii" || cls === "digit") return;
     nonAscii++;
     const sides = [classes[i - 1] ?? "ascii", classes[i + 1] ?? "ascii"];
-    const fits = {
-      junk: false,
-      kana: true,
-      han: hasKana || sides.some((s) => s === "han" || s === "kana" || s === "digit"), // 東京, 100円
-      halfKana: sides.includes("halfKana"),
-      letter: sides.every(latin), // Müller, l’été
-      quote: sides.every(latin),
-      symbol: sides.every((s) => s === "ascii" || s === "digit"), // 1.234,50 €
-    }[cls];
-    if (fits) good++;
+    if (fitsBetween(cls, sides, hasKana)) good++;
   });
   return nonAscii === 0 ? 1 : good / nonAscii;
 }
@@ -997,20 +1025,24 @@ function decodeCsv(bytes, legacy = ["windows-1252"]) {
 
   const utf8 = decodeStrict(bytes, "utf-8");
   if (utf8 !== null) return result("utf-8", utf8, true, "valid UTF-8");
-  const damage = utf8Damage(bytes);
-  if (damage.share >= 0.9) {
-    const line = lineAt(bytes, damage.firstInvalid);
-    return result("utf-8", new TextDecoder().decode(bytes), false, `UTF-8 with invalid bytes, first on line ${line}`);
-  }
 
   const options = legacy
     .map((encoding) => ({ encoding, text: decodeStrict(bytes, encoding) }))
     .filter((option) => option.text !== null)
     .map((option) => ({ ...option, score: plausibility(option.text) }))
     .sort((a, b) => b.score - a.score);
+  const scores = options.map(({ encoding, score }) => ({ encoding, score })); // for an encoding picker
+  const flagUtf8 = (reason) => result("utf-8", new TextDecoder().decode(bytes), false, reason, scores);
+
+  const cut = cutCharacterAtEnd(bytes);
+  const before = cut > 0 ? bytes.subarray(0, cut) : null;
+  if (before && before.some((b) => b >= 0x80) && decodeStrict(before, "utf-8") !== null)
+    return flagUtf8(`UTF-8 cut off in the middle of a character at the end (line ${lineAt(bytes, cut)})`);
+  const damage = utf8Damage(bytes);
+  if (damage.share >= 0.9) return flagUtf8(`UTF-8 with invalid bytes, first on line ${lineAt(bytes, damage.firstInvalid)}`);
+
   if (options.length === 0) return refuse(`not valid UTF-8 or ${legacy.join(", ")}`);
   const [best, next] = options;
-  const scores = options.map(({ encoding, score }) => ({ encoding, score })); // for an encoding picker
   if (best.score < 0.9)
     return result(best.encoding, best.text, false, `no encoding gives clean text (best guess: ${best.encoding})`, scores);
   if (next && best.score - next.score < 0.3)
@@ -1104,6 +1136,66 @@ ok("dec: damaged UTF-8 is flagged with the line, not re-read as a legacy encodin
   assert.strictEqual(lineAt(hex("41 0d 0a 42 0d 0a 43"), 6), 3); // CRLF
   assert.strictEqual(lineAt(hex("41 0d 42 0d 43"), 4), 3); // CR only (old Mac files)
 });
+ok("dec: damaged UTF-8 still lists the legacy candidates for a picker", () => {
+  const bytes = Uint8Array.from([...new TextEncoder().encode("名前,都市\n山田,東京\n"), ...hex("4361 66e9 2c50 6172 6973 0a"), ...new TextEncoder().encode("佐藤,大阪\n")]);
+  assert.deepStrictEqual(decodeCsv(bytes, ["windows-1252", "shift_jis"]).options.map((o) => o.encoding), ["windows-1252"]); // not valid Shift_JIS
+});
+ok("dec: UTF-8 cut off in the middle of a character at the end", () => {
+  const whole = new TextEncoder().encode("名前,都市\n山田,東京\n佐藤,大阪");
+  for (const drop of [1, 2]) {
+    const r = decodeCsv(whole.subarray(0, whole.length - drop), ["windows-1252", "shift_jis"]);
+    assert.deepStrictEqual([r.encoding, r.sure, r.reason], ["utf-8", false, "UTF-8 cut off in the middle of a character at the end (line 3)"]);
+    assert(r.text.startsWith("名前,都市\n山田,東京\n佐藤,大") && r.text.endsWith("\uFFFD"));
+  }
+  assert.strictEqual(cutCharacterAtEnd(whole), -1);
+  assert.strictEqual(cutCharacterAtEnd(new Uint8Array([])), -1);
+  assert.strictEqual(cutCharacterAtEnd(hex("41 f0 9f 98")), 1);
+  // A Windows-1252 file ending in é (E9) is not mistaken for cut-off UTF-8: the rest is plain ASCII.
+  assert.deepStrictEqual([decodeCsv(hex("43 61 66 e9")).encoding, decodeCsv(hex("43 61 66 e9")).sure], ["windows-1252", true]);
+});
+ok("dec: UTF-16 without a BOM and without ASCII is refused, not misread", () => {
+  const r = decodeCsv(Uint8Array.from(Buffer.from("東京都千代田区\n大阪府大阪市\n", "utf16le")), ["windows-1252", "shift_jis"]);
+  assert.strictEqual(r.reason, "contains zero bytes: a binary file, or UTF-16 without a byte order mark");
+});
+ok("dec: Node's Blob.text() ignores a UTF-16 byte order mark", async () => {
+  assert.strictEqual(await new Blob([new Uint8Array([0xff, 0xfe, 0x48, 0x00, 0x69, 0x00])]).text(), "\uFFFD\uFFFDH\u0000i\u0000");
+});
+ok("dec: scores in the not-sure rows of the table", () => {
+  const rows = [
+    ["kanjiDate:cp932", ["windows-1252", "shift_jis"], [["windows-1252", 1], ["shift_jis", 1]]],
+    ["japanese:cp932", ["windows-1252"], [["windows-1252", 0.23]]],
+    ["japanese:cp932", ["shift_jis", "gb18030"], [["shift_jis", 1], ["gb18030", 1]]],
+    ["cyrillic:cp1251", ["windows-1252", "windows-1251"], [["windows-1252", 1], ["windows-1251", 1]]],
+    ["ellipsis:cp1252", ["windows-1252", "shift_jis"], [["windows-1252", 0], ["shift_jis", 0]]],
+  ];
+  for (const [k, legacy, want] of rows)
+    assert.deepStrictEqual(decodeCsv(hex(DEC_SAMPLES_HEX[k]), legacy).options.map((o) => [o.encoding, Math.round(o.score * 100) / 100]), want, k);
+});
+ok("dec: a real per-mille sign or dagger in Windows-1252 is a false alarm", () => {
+  for (const hexText of ["4e616d652c526174650a4b6f63682c35890a", "4e616d652c4e6f74650a536d6974682c8631393930"]) { // "Koch,5‰", "Smith,†1990"
+    const r = decodeCsv(hex(hexText), ["windows-1252", "shift_jis"]);
+    assert.deepStrictEqual([r.encoding, r.sure], ["windows-1252", false], r.reason);
+  }
+});
+ok("dec: utf8SequenceLength", () => {
+  assert.deepStrictEqual([0x41, 0x80, 0xc1, 0xc2, 0xdf, 0xe0, 0xef, 0xf0, 0xf4, 0xf5, 0xff].map(utf8SequenceLength), [1, 0, 0, 2, 2, 3, 3, 4, 4, 0, 0]);
+});
+ok("dec: decodeAs can switch back to damaged UTF-8", async () => {
+  const bytes = Uint8Array.from([...new TextEncoder().encode("名前,都市\n山田,東京\n"), ...hex("4361 66e9 2c50 6172 6973 0a"), ...new TextEncoder().encode("佐藤,大阪\n")]);
+  const AsyncFunction = (async () => {}).constructor;
+  const got = await new AsyncFunction("file", "decodeCsv", "decodeStrict", "async function readCsvText(file, legacy) {\n  const bytes = new Uint8Array(await file.arrayBuffer());\n  const decoded = decodeCsv(bytes, legacy);\n  // When decoded.sure is false, show a preview and let the user pick another encoding.\n  // decodeAs returns null if the bytes are not valid in the chosen encoding; switching\n  // back to the first result always works, even for damaged UTF-8.\n  const decodeAs = (encoding) => (encoding === decoded.encoding ? decoded.text : decodeStrict(bytes, encoding));\n  return { ...decoded, decodeAs };\n}\n\nconst { encoding, text, sure, reason, options, decodeAs } = await readCsvText(file, [\"windows-1252\", \"shift_jis\"]);" + "\nreturn { encoding, text, back: decodeAs('utf-8'), other: decodeAs('windows-1252') };")(new Blob([bytes]), decodeCsv, decodeStrict);
+  assert.strictEqual(got.encoding, "utf-8");
+  assert.strictEqual(got.back, got.text);
+  assert(got.other.includes("Café,Paris"));
+});
+ok("dec: sample counts quoted in step 3", () => {
+  const valid = (keys, e) => keys.filter((k) => decodeStrict(hex(DEC_SAMPLES_HEX[k]), e) !== null).length;
+  const western = ["latin:cp1252", "latinEnd:cp1252", "quotes:cp1252", "ellipsis:cp1252"];
+  const sjis = ["japanese:cp932", "kanjiOnly:cp932", "halfKana:cp932", "yen:cp932", "kanjiDate:cp932"];
+  assert.strictEqual(valid(western, "shift_jis"), 1); // 3 of 4 Windows-1252 samples are not valid Shift_JIS
+  assert.strictEqual(valid(sjis, "euc-jp"), 1); // 4 of 5 Shift_JIS samples are not valid EUC-JP
+  assert.strictEqual(valid(sjis, "gb18030"), 4); // 4 of 5 Shift_JIS samples are valid GB18030
+});
 const DEC_TABLE = [
   // sample, saved as, candidates, expected encoding, expected sure
   ["latin", "cp1252", ["windows-1252"], "windows-1252", true],
@@ -1167,7 +1259,7 @@ ok("dec: plausibility scores", () => {
   assert.strictEqual(plausibility("\uFFFD".repeat(100001) + "é".repeat(10)), 0); // only the first 100,000 characters count
 });
 ok("dec: readCsvText on a file", async () => {
-  const snippet = "async function readCsvText(file, legacy) {\n  const bytes = new Uint8Array(await file.arrayBuffer());\n  const decoded = decodeCsv(bytes, legacy);\n  // When decoded.sure is false, show a preview and let the user pick another encoding.\n  // decodeAs returns null if the bytes are not valid in the chosen encoding.\n  const decodeAs = (encoding) => decodeStrict(bytes, encoding);\n  return { ...decoded, decodeAs };\n}\n\nconst { encoding, text, sure, reason, options, decodeAs } = await readCsvText(file, [\"windows-1252\", \"shift_jis\"]);";
+  const snippet = "async function readCsvText(file, legacy) {\n  const bytes = new Uint8Array(await file.arrayBuffer());\n  const decoded = decodeCsv(bytes, legacy);\n  // When decoded.sure is false, show a preview and let the user pick another encoding.\n  // decodeAs returns null if the bytes are not valid in the chosen encoding; switching\n  // back to the first result always works, even for damaged UTF-8.\n  const decodeAs = (encoding) => (encoding === decoded.encoding ? decoded.text : decodeStrict(bytes, encoding));\n  return { ...decoded, decodeAs };\n}\n\nconst { encoding, text, sure, reason, options, decodeAs } = await readCsvText(file, [\"windows-1252\", \"shift_jis\"]);";
   const file = new Blob([hex(DEC_SAMPLES_HEX["japanese:cp932"])]);
   const AsyncFunction = (async () => {}).constructor;
   const got = await new AsyncFunction("file", "decodeCsv", "decodeStrict", snippet + "\nreturn { encoding, text, sure, reason, options, other: decodeAs('windows-1252'), invalid: decodeAs('euc-jp') };")(file, decodeCsv, decodeStrict);

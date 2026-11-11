@@ -565,16 +565,28 @@ function decodeStrict(bytes, encoding) {
     return null; // the bytes are not valid in this encoding
   }
 }'''
-DEC_DAMAGE = r'''// Share of non-ASCII bytes that form valid UTF-8 sequences, and where the first bad byte is.
+DEC_DAMAGE = r'''// How many bytes a UTF-8 character starting with this byte has (0: not a valid first byte).
+function utf8SequenceLength(b) {
+  if (b < 0x80) return 1;
+  if (b >= 0xc2 && b <= 0xdf) return 2;
+  if (b >= 0xe0 && b <= 0xef) return 3;
+  if (b >= 0xf0 && b <= 0xf4) return 4;
+  return 0;
+}
+
+// After these first bytes the second byte has a narrower range: no overlong forms,
+// no surrogates (ED A0-BF), nothing above U+10FFFF (F4 90-BF).
+const SECOND_BYTE = { 0xe0: [0xa0, 0xbf], 0xed: [0x80, 0x9f], 0xf0: [0x90, 0xbf], 0xf4: [0x80, 0x8f] };
+
+// Share of non-ASCII bytes that form valid UTF-8 sequences, and where the first bad byte is.
 // Close to 1: a UTF-8 file with a few broken bytes. Close to 0: another encoding.
 function utf8Damage(bytes) {
   let valid = 0, invalid = 0, firstInvalid = -1;
   for (let i = 0; i < bytes.length; ) {
     const b = bytes[i];
     if (b < 0x80) { i++; continue; }
-    const length = b >= 0xc2 && b <= 0xdf ? 2 : b >= 0xe0 && b <= 0xef ? 3 : b >= 0xf0 && b <= 0xf4 ? 4 : 0;
-    // The second byte has a narrower range after E0, ED, F0 and F4 (no overlong forms or surrogates).
-    const [low, high] = b === 0xe0 ? [0xa0, 0xbf] : b === 0xed ? [0x80, 0x9f] : b === 0xf0 ? [0x90, 0xbf] : b === 0xf4 ? [0x80, 0x8f] : [0x80, 0xbf];
+    const length = utf8SequenceLength(b);
+    const [low, high] = SECOND_BYTE[b] ?? [0x80, 0xbf];
     let ok = length > 0 && bytes[i + 1] >= low && bytes[i + 1] <= high;
     for (let k = 2; ok && k < length; k++) ok = (bytes[i + k] & 0xc0) === 0x80; // 10xxxxxx
     if (ok) { valid += length; i += length; continue; }
@@ -583,6 +595,18 @@ function utf8Damage(bytes) {
     i++;
   }
   return { share: valid / (valid + invalid || 1), firstInvalid };
+}
+
+// An upload limit or a broken copy can cut a file in the middle of a character.
+// Returns where that incomplete last character starts, or -1.
+function cutCharacterAtEnd(bytes) {
+  for (let back = 1; back <= 3 && back <= bytes.length; back++) {
+    const b = bytes[bytes.length - back];
+    if ((b & 0xc0) === 0x80) continue; // 10xxxxxx: a continuation byte, keep looking for the first byte
+    const length = utf8SequenceLength(b);
+    return length > back ? bytes.length - back : -1;
+  }
+  return -1;
 }
 
 function lineAt(bytes, offset) { // counts LF, CRLF and CR-only line breaks
@@ -596,7 +620,7 @@ const RARE_SYMBOLS = /[\u0192\u02c6\u02dc\u2020\u2021\u2030\u00a4\u00a6\u00a8\u0
 function charClass(c) {
   if (c === undefined || c < "\u0080") return /[0-9]/.test(c ?? "") ? "digit" : "ascii";
   if (/[\p{Cc}\p{Co}\p{Cn}\uFFFD]/u.test(c) || RARE_SYMBOLS.test(c)) return "junk"; // controls, private use, unassigned
-  if (/[\u3000-\u30ff\uff01-\uff60]/.test(c)) return "kana"; // kana, CJK and full-width punctuation
+  if (/[\u3000-\u30ff\uff01-\uff60]/.test(c)) return "kana"; // kana, plus the CJK and full-width punctuation used with it
   if (/\p{Script=Han}/u.test(c)) return "han";
   if (/[\uff61-\uff9f]/.test(c)) return "halfKana";
   if (/\p{L}/u.test(c)) return "letter";
@@ -604,26 +628,30 @@ function charClass(c) {
   return "symbol";
 }
 
+// Does a non-ASCII character of this class look real next to these neighbours?
+function fitsBetween(cls, sides, hasKana) {
+  const latin = (s) => s === "ascii" || s === "digit" || s === "letter" || s === "quote";
+  switch (cls) {
+    case "kana": return true;
+    case "han": return hasKana || sides.some((s) => s === "han" || s === "kana" || s === "digit"); // 東京, 100円
+    case "halfKana": return sides.includes("halfKana");
+    case "letter": // Müller, l’été
+    case "quote": return sides.every(latin);
+    case "symbol": return sides.every((s) => s === "ascii" || s === "digit"); // 1.234,50 €
+    default: return false; // junk
+  }
+}
+
 // From 0 to 1: the share of non-ASCII characters that sit where real text puts them.
 function plausibility(text) {
   const classes = Array.from(text.slice(0, 100000)).map(charClass); // a sample is enough
   const hasKana = classes.includes("kana");
-  const latin = (s) => s === "ascii" || s === "digit" || s === "letter" || s === "quote";
   let nonAscii = 0, good = 0;
   classes.forEach((cls, i) => {
     if (cls === "ascii" || cls === "digit") return;
     nonAscii++;
     const sides = [classes[i - 1] ?? "ascii", classes[i + 1] ?? "ascii"];
-    const fits = {
-      junk: false,
-      kana: true,
-      han: hasKana || sides.some((s) => s === "han" || s === "kana" || s === "digit"), // 東京, 100円
-      halfKana: sides.includes("halfKana"),
-      letter: sides.every(latin), // Müller, l’été
-      quote: sides.every(latin),
-      symbol: sides.every((s) => s === "ascii" || s === "digit"), // 1.234,50 €
-    }[cls];
-    if (fits) good++;
+    if (fitsBetween(cls, sides, hasKana)) good++;
   });
   return nonAscii === 0 ? 1 : good / nonAscii;
 }'''
@@ -647,20 +675,24 @@ function decodeCsv(bytes, legacy = ["windows-1252"]) {
 
   const utf8 = decodeStrict(bytes, "utf-8");
   if (utf8 !== null) return result("utf-8", utf8, true, "valid UTF-8");
-  const damage = utf8Damage(bytes);
-  if (damage.share >= 0.9) {
-    const line = lineAt(bytes, damage.firstInvalid);
-    return result("utf-8", new TextDecoder().decode(bytes), false, `UTF-8 with invalid bytes, first on line ${line}`);
-  }
 
   const options = legacy
     .map((encoding) => ({ encoding, text: decodeStrict(bytes, encoding) }))
     .filter((option) => option.text !== null)
     .map((option) => ({ ...option, score: plausibility(option.text) }))
     .sort((a, b) => b.score - a.score);
+  const scores = options.map(({ encoding, score }) => ({ encoding, score })); // for an encoding picker
+  const flagUtf8 = (reason) => result("utf-8", new TextDecoder().decode(bytes), false, reason, scores);
+
+  const cut = cutCharacterAtEnd(bytes);
+  const before = cut > 0 ? bytes.subarray(0, cut) : null;
+  if (before && before.some((b) => b >= 0x80) && decodeStrict(before, "utf-8") !== null)
+    return flagUtf8(`UTF-8 cut off in the middle of a character at the end (line ${lineAt(bytes, cut)})`);
+  const damage = utf8Damage(bytes);
+  if (damage.share >= 0.9) return flagUtf8(`UTF-8 with invalid bytes, first on line ${lineAt(bytes, damage.firstInvalid)}`);
+
   if (options.length === 0) return refuse(`not valid UTF-8 or ${legacy.join(", ")}`);
   const [best, next] = options;
-  const scores = options.map(({ encoding, score }) => ({ encoding, score })); // for an encoding picker
   if (best.score < 0.9)
     return result(best.encoding, best.text, false, `no encoding gives clean text (best guess: ${best.encoding})`, scores);
   if (next && best.score - next.score < 0.3)
@@ -671,8 +703,9 @@ DEC_USE = r'''async function readCsvText(file, legacy) {
   const bytes = new Uint8Array(await file.arrayBuffer());
   const decoded = decodeCsv(bytes, legacy);
   // When decoded.sure is false, show a preview and let the user pick another encoding.
-  // decodeAs returns null if the bytes are not valid in the chosen encoding.
-  const decodeAs = (encoding) => decodeStrict(bytes, encoding);
+  // decodeAs returns null if the bytes are not valid in the chosen encoding; switching
+  // back to the first result always works, even for damaged UTF-8.
+  const decodeAs = (encoding) => (encoding === decoded.encoding ? decoded.text : decodeStrict(bytes, encoding));
   return { ...decoded, decodeAs };
 }
 

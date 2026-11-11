@@ -198,7 +198,8 @@ function check(name, ok, detail) {
   enc = await upload("quotes.csv", Buffer.from("4e6f74650a6c92e974e92c204a6f73e9927320636166e90a", "hex"));
   check("encoding: Windows-1252 with curly apostrophes", /l’été/.test(enc.table) && /windows-1252/i.test(enc.summary) && !/Encoding:/.test(enc.summary), enc);
 
-  // 7c. Blob.text() in Chromium (used by the encodings draft in content/drafts)
+  // 7c. Blob.text() in Chromium (quoted in the encodings post, with the version printed here)
+  console.log("Chromium version: " + browser.version());
   const blobText = await page.evaluate(async () => [
     await new Blob([new Uint8Array([0x43, 0x61, 0x66, 0xe9])]).text(),
     await new Blob([new Uint8Array([0xff, 0xfe, 0x48, 0x00, 0x69, 0x00])]).text(),

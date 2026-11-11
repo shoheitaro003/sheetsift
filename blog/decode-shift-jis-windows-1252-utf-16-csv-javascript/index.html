@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Read Shift_JIS, Windows-1252 and UTF-16 CSV files in JavaScript | SheetSift</title>
+<meta name="description" content="Tested JavaScript that reads UTF-8 and UTF-16 CSV files, picks between legacy encodings like Shift_JIS or Windows-1252, and flags guesses.">
+<link rel="canonical" href="https://shoheitaro003.github.io/sheetsift/blog/decode-shift-jis-windows-1252-utf-16-csv-javascript/">
+<meta property="og:title" content="Read Shift_JIS, Windows-1252 and UTF-16 CSV files in JavaScript | SheetSift">
+<meta property="og:description" content="Tested JavaScript that reads UTF-8 and UTF-16 CSV files, picks between legacy encodings like Shift_JIS or Windows-1252, and flags guesses.">
+<meta property="og:url" content="https://shoheitaro003.github.io/sheetsift/blog/decode-shift-jis-windows-1252-utf-16-csv-javascript/">
+<meta property="og:site_name" content="SheetSift">
+<meta name="twitter:card" content="summary">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400&display=swap">
+<link rel="stylesheet" href="../../blog.css">
+<meta property="og:type" content="article">
+<meta property="article:published_time" content="2026-11-11">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "Read Shift_JIS, Windows-1252 and UTF-16 CSV files in JavaScript", "description": "Tested JavaScript that reads UTF-8 and UTF-16 CSV files, picks between legacy encodings like Shift_JIS or Windows-1252, and flags guesses.", "datePublished": "2026-11-11", "dateModified": "2026-11-11", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/decode-shift-jis-windows-1252-utf-16-csv-javascript/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="logo" href="../../"><svg width="24" height="24" viewBox="0 0 26 26" aria-hidden="true"><rect x="1" y="1" width="24" height="24" rx="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M1 9h24M9 9v16" stroke="currentColor" stroke-width="2"/><rect x="11" y="12" width="12" height="4" fill="var(--mark)"/></svg> SheetSift</a>
+  <nav class="nav"><a href="../../blog/">Blog</a><a class="btn" href="../../#try">Try the demo</a></nav>
+</div></header>
+<main><div class="wrap">
+<article>
+<h1>Read Shift_JIS, Windows-1252 and UTF-16 CSV files in JavaScript</h1>
+<p class="meta"><time datetime="2026-11-11">2026-11-11</time></p>
+<p>A customer uploads a CSV and your import screen shows <code>M&#xFFFD;ller</code>, or a column of Japanese names turns into <code>&#x201C;&#xFA;&#x2013;{</code>. Nothing threw an error. The file was not UTF-8, and <code>file.text()</code> read it as UTF-8 anyway.</p>
+<p>By the end of this post you will have <code>decodeCsv(bytes, legacy)</code>, about 150 lines with no dependencies, shown in four parts below: paste them in order into one module and nothing else is needed (the test file has them in one piece). It reads UTF-8, UTF-16 with or without a byte order mark, and the legacy encodings you list (such as Windows-1252 or Shift_JIS). It returns the encoding it used, and <code>sure: false</code> with a reason when the bytes fit several of the encodings you list, or none of them cleanly, so your UI can ask instead of importing garbage. It cannot notice an encoding that is missing from your list; the table in step 4 shows what happens then. Every result quoted below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22, and the browser-only results by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/smoke.cjs">a Chromium test</a>.</p>
+
+<h2>Why it happens</h2>
+<p>A CSV file is only bytes. Nothing in it says which <em>encoding</em>, the table that maps bytes to characters, was used to write it. <code>é</code> is the single byte <code>E9</code> in Windows-1252 and the two bytes <code>C3 A9</code> in UTF-8. <code>file.text()</code> and a plain <code>new TextDecoder()</code> both assume UTF-8 and put the replacement character <code>&#xFFFD;</code> wherever the bytes are not valid UTF-8:</p>
+<pre><code>const cafe = new Uint8Array([0x43, 0x61, 0x66, 0xe9]); // &quot;Café&quot; saved as Windows-1252
+await new Blob([cafe]).text();                 // &quot;Caf\uFFFD&quot;
+new TextDecoder().decode(cafe);                // &quot;Caf\uFFFD&quot;
+new TextDecoder(&quot;windows-1252&quot;).decode(cafe);  // &quot;Café&quot;
+
+const nihon = new Uint8Array([0x93, 0xfa, 0x96, 0x7b]); // &quot;日本&quot; saved as Shift_JIS
+new TextDecoder(&quot;shift_jis&quot;).decode(nihon);    // &quot;日本&quot;
+new TextDecoder(&quot;windows-1252&quot;).decode(nihon); // &quot;“ú–{&quot;</code></pre>
+<p>The last line is the dangerous one. The Shift_JIS bytes for 日本 are also valid Windows-1252, so the wrong decoder returns four ordinary-looking characters and no error. Detection therefore needs two checks: are the bytes valid in an encoding, and does the result look like text a person wrote?</p>
+
+<h2>Four traps in <code>TextDecoder</code></h2>
+<p><code>TextDecoder</code> is the built-in decoder in browsers and Node. Four of its behaviours surprise people. Each line below prints what its comment says:</p>
+<pre><code>// 1. Several labels give the same decoder.
+new TextDecoder(&quot;latin1&quot;).encoding;      // &quot;windows-1252&quot;
+new TextDecoder(&quot;iso-8859-1&quot;).encoding;  // &quot;windows-1252&quot;
+new TextDecoder(&quot;ascii&quot;).encoding;       // &quot;windows-1252&quot;
+new TextDecoder(&quot;sjis&quot;).encoding;        // &quot;shift_jis&quot;
+new TextDecoder(&quot;windows-31j&quot;).encoding; // &quot;shift_jis&quot;
+new TextDecoder(&quot;utf-16&quot;).encoding;      // &quot;utf-16le&quot;
+new TextDecoder(&quot;utf-32&quot;);               // throws RangeError
+
+// 2. A byte order mark only helps if you picked the right decoder already.
+// &quot;Hi&quot; in UTF-16LE, with a BOM:
+const hi = new Uint8Array([0xff, 0xfe, 0x48, 0x00, 0x69, 0x00]);
+new TextDecoder(&quot;utf-16le&quot;).decode(hi);  // &quot;Hi&quot;
+new TextDecoder(&quot;utf-8&quot;).decode(hi);     // &quot;\uFFFD\uFFFDH\u0000i\u0000&quot;
+
+// 3. Windows-1252 accepts every byte, so &quot;no error&quot; proves nothing.
+const strict1252 = new TextDecoder(&quot;windows-1252&quot;, { fatal: true });
+strict1252.decode(new Uint8Array([0x81, 0x8d])); // &quot;\u0081\u008d&quot;
+
+// 4. Chunks decoded separately break characters that cross a chunk boundary.
+const tokyo = new TextEncoder().encode(&quot;東京&quot;); // 6 bytes, 3 per character
+const decoder = new TextDecoder();
+decoder.decode(tokyo.slice(0, 4)) + decoder.decode(tokyo.slice(4)); // &quot;東\uFFFD\uFFFD\uFFFD&quot;
+decoder.decode(tokyo.slice(0, 4), { stream: true }) + decoder.decode(tokyo.slice(4)); // &quot;東京&quot;</code></pre>
+<ol>
+<li><strong>Labels are aliases.</strong> Asking for <code>latin1</code>, <code>iso-8859-1</code> or <code>ascii</code> gives you the Windows-1252 decoder, and <code>sjis</code> or <code>windows-31j</code> gives Shift_JIS. Check <code>decoder.encoding</code> if you log what you used. UTF-32 has no decoder at all.</li>
+<li><strong>A byte order mark does not pick the decoder.</strong> A <em>byte order mark</em> (BOM) is a short signature at the start of a Unicode file: <code>EF BB BF</code> for UTF-8, <code>FF FE</code> for UTF-16LE, <code>FE FF</code> for UTF-16BE. A UTF-16 decoder removes a matching one, but a UTF-8 decoder turns a UTF-16 BOM into replacement characters, so you have to look at the first bytes yourself. <code>Blob.text()</code> is no help either, and it differs between runtimes: in our tests in November 2026 it decoded a UTF-16LE file with a BOM correctly in Chromium (versions 129 and 153) but returned replacement characters in Node 22. Do not rely on it; check the first bytes yourself.</li>
+<li><strong>Windows-1252 never fails.</strong> In <code>TextDecoder</code>, every one of its 256 bytes maps to a character; the five bytes <code>81</code>, <code>8D</code>, <code>8F</code>, <code>90</code> and <code>9D</code> map to invisible control characters. So <code>fatal: true</code>, which makes the decoder throw on invalid bytes, rules nothing out for Windows-1252. It does rule out a lot for multi-byte encodings such as Shift_JIS and UTF-8.</li>
+<li><strong>Chunks need <code>stream: true</code>.</strong> In UTF-8 and Shift_JIS one character can take several bytes. Decode chunks separately and a character split across two chunks becomes replacement characters. Pass <code>{ stream: true }</code> on every call except the last, as the last line shows; the decoder then keeps the incomplete character for the next chunk.</li>
+</ol>
+
+<h2>Step 1: Unicode files first</h2>
+<p>Check for a byte order mark before anything else, because it is the only part of the file that states an encoding. UTF-32 marks come first in the list, since <code>FF FE 00 00</code> also starts with the UTF-16LE mark.</p>
+<pre><code>const BOMS = [ // byte order marks; UTF-32 before UTF-16, because FF FE starts both
+  { bytes: [0xef, 0xbb, 0xbf], encoding: &quot;utf-8&quot; },
+  { bytes: [0xff, 0xfe, 0x00, 0x00], encoding: null }, // UTF-32LE: TextDecoder cannot read it
+  { bytes: [0x00, 0x00, 0xfe, 0xff], encoding: null }, // UTF-32BE
+  { bytes: [0xff, 0xfe], encoding: &quot;utf-16le&quot; },
+  { bytes: [0xfe, 0xff], encoding: &quot;utf-16be&quot; },
+];
+
+function sniffBom(bytes) {
+  return BOMS.find((bom) =&gt; bom.bytes.every((b, i) =&gt; bytes[i] === b)) ?? null;
+}
+
+// UTF-16 without a BOM: commas, digits and line breaks are 2 bytes with one zero,
+// so zeros pile up on one side of each byte pair (&quot;,&quot; is 2C 00 in UTF-16LE).
+function guessUtf16(bytes) {
+  const end = Math.min(bytes.length, 4096) &amp; ~1; // whole 2-byte units only
+  let evenZeros = 0, oddZeros = 0;
+  for (let i = 0; i &lt; end; i += 2) {
+    if (bytes[i] === 0) evenZeros++;
+    if (bytes[i + 1] === 0) oddZeros++;
+  }
+  const units = end / 2;
+  const enough = Math.max(units / 10, 4); // a stray zero byte in a short file is not UTF-16
+  if (oddZeros &gt;= enough &amp;&amp; evenZeros &lt; oddZeros / 4) return &quot;utf-16le&quot;;
+  if (evenZeros &gt;= enough &amp;&amp; oddZeros &lt; evenZeros / 4) return &quot;utf-16be&quot;;
+  return null;
+}
+
+function decodeStrict(bytes, encoding) {
+  try {
+    return new TextDecoder(encoding, { fatal: true }).decode(bytes);
+  } catch {
+    return null; // the bytes are not valid in this encoding
+  }
+}</code></pre>
+<p>UTF-16 files without a BOM have a strong fingerprint: every ASCII character, including the commas, digits and line breaks a CSV is full of, takes two bytes and one of them is zero. <code>guessUtf16</code> counts zeros at even and odd positions in the first 4 KB. One side needs at least 4 zeros and more than a tenth of the pairs, so a stray zero byte in a short file does not count. It also needs four times as many zeros as the other side, because Japanese characters such as 一 (<code>00 4E</code>) put an occasional zero on the other side.</p>
+<p><code>decodeStrict</code> returns <code>null</code> instead of throwing, so the next steps can try one encoding after another.</p>
+
+<h2>Step 2: UTF-8, or damaged UTF-8</h2>
+<p>If strict UTF-8 decoding succeeds, use it. Plain ASCII text (letters, digits, punctuation, tabs and line breaks) reads the same in every legacy encoding listed here, so nothing is lost. A short legacy file can still be valid UTF-8 by chance; none of our samples is, but see the limits at the end.</p>
+<p>If it fails, do not jump straight to a legacy encoding. A file that someone assembled from two exports can be UTF-8 with one pasted line in Windows-1252. Decoding the whole file as Windows-1252 would then break every other line. <code>utf8Damage</code> measures how much of the non-ASCII data is valid UTF-8 and where the first broken byte is. It follows the UTF-8 rules closely enough to reject overlong forms and surrogates, which a quick &ldquo;lead byte plus continuation bytes&rdquo; check would accept:</p>
+<pre><code>// How many bytes a UTF-8 character starting with this byte has (0: not a valid first byte).
+function utf8SequenceLength(b) {
+  if (b &lt; 0x80) return 1;
+  if (b &gt;= 0xc2 &amp;&amp; b &lt;= 0xdf) return 2;
+  if (b &gt;= 0xe0 &amp;&amp; b &lt;= 0xef) return 3;
+  if (b &gt;= 0xf0 &amp;&amp; b &lt;= 0xf4) return 4;
+  return 0;
+}
+
+// After these first bytes the second byte has a narrower range: no overlong forms,
+// no surrogates (ED A0-BF), nothing above U+10FFFF (F4 90-BF).
+const SECOND_BYTE = { 0xe0: [0xa0, 0xbf], 0xed: [0x80, 0x9f], 0xf0: [0x90, 0xbf], 0xf4: [0x80, 0x8f] };
+
+// Share of non-ASCII bytes that form valid UTF-8 sequences, and where the first bad byte is.
+// Close to 1: a UTF-8 file with a few broken bytes. Close to 0: another encoding.
+function utf8Damage(bytes) {
+  let valid = 0, invalid = 0, firstInvalid = -1;
+  for (let i = 0; i &lt; bytes.length; ) {
+    const b = bytes[i];
+    if (b &lt; 0x80) { i++; continue; }
+    const length = utf8SequenceLength(b);
+    const [low, high] = SECOND_BYTE[b] ?? [0x80, 0xbf];
+    let ok = length &gt; 0 &amp;&amp; bytes[i + 1] &gt;= low &amp;&amp; bytes[i + 1] &lt;= high;
+    for (let k = 2; ok &amp;&amp; k &lt; length; k++) ok = (bytes[i + k] &amp; 0xc0) === 0x80; // 10xxxxxx
+    if (ok) { valid += length; i += length; continue; }
+    if (firstInvalid &lt; 0) firstInvalid = i;
+    invalid++;
+    i++;
+  }
+  return { share: valid / (valid + invalid || 1), firstInvalid };
+}
+
+// An upload limit or a broken copy can cut a file in the middle of a character.
+// Returns where that incomplete last character starts, or -1.
+function cutCharacterAtEnd(bytes) {
+  for (let back = 1; back &lt;= 3 &amp;&amp; back &lt;= bytes.length; back++) {
+    const b = bytes[bytes.length - back];
+    if ((b &amp; 0xc0) === 0x80) continue; // 10xxxxxx: a continuation byte, keep looking for the first byte
+    const length = utf8SequenceLength(b);
+    return length &gt; back ? bytes.length - back : -1;
+  }
+  return -1;
+}
+
+function lineAt(bytes, offset) { // counts LF, CRLF and CR-only line breaks
+  let line = 1;
+  for (let i = 0; i &lt; offset; i++) if (bytes[i] === 0x0a || (bytes[i] === 0x0d &amp;&amp; bytes[i + 1] !== 0x0a)) line++;
+  return line;
+}</code></pre>
+<p>When 90% or more is valid, <code>decodeCsv</code> keeps UTF-8 and reports the line of the first bad byte. Your user can fix one line far more easily than a whole column of mojibake (text decoded with the wrong encoding). The line is a physical line, counted by line breaks, not a CSV record: a quoted cell with a line break inside makes the two differ. This needs enough valid UTF-8 around the damage: a file whose only other non-ASCII character is one <code>é</code> falls below 90% and goes on to the legacy step. Our Shift_JIS and EUC-JP samples score between 0 and 0.31 on this measure, and our Windows-1252 samples score 0.</p>
+<p>One more UTF-8 case needs its own check. An upload size limit or a broken copy can cut a file in the middle of a character, so the last one to three bytes are an incomplete sequence. <code>cutCharacterAtEnd</code> finds that sequence; if everything before it is valid UTF-8 and contains non-ASCII text, <code>decodeCsv</code> keeps UTF-8 and says the file was cut off. The non-ASCII condition matters: a Windows-1252 file that is plain ASCII apart from a final <code>é</code> (<code>E9</code>, which also starts a 3-byte UTF-8 sequence) must still go to the legacy step.</p>
+
+<h2>Step 3: legacy encodings, checked twice</h2>
+<p>For the encodings you list, the first check is validity with <code>fatal: true</code>. That alone separates many files: three of our four Windows-1252 samples are not valid Shift_JIS, and four of our five Shift_JIS samples are not valid EUC-JP. But Windows-1252 accepts every byte, so it always survives, and GB18030, a Chinese encoding, accepted four of the five Shift_JIS samples too. The second check scores what the decoded text looks like:</p>
+<pre><code>// Symbols that wrongly decoded Japanese produces often and real Western text almost never uses.
+const RARE_SYMBOLS = /[\u0192\u02c6\u02dc\u2020\u2021\u2030\u00a4\u00a6\u00a8\u00af\u00b8\u2039\u203a]/;
+
+function charClass(c) {
+  if (c === undefined || c &lt; &quot;\u0080&quot;) return /[0-9]/.test(c ?? &quot;&quot;) ? &quot;digit&quot; : &quot;ascii&quot;;
+  if (/[\p{Cc}\p{Co}\p{Cn}\uFFFD]/u.test(c) || RARE_SYMBOLS.test(c)) return &quot;junk&quot;; // controls, private use, unassigned
+  if (/[\u3000-\u30ff\uff01-\uff60]/.test(c)) return &quot;kana&quot;; // kana, plus the CJK and full-width punctuation used with it
+  if (/\p{Script=Han}/u.test(c)) return &quot;han&quot;;
+  if (/[\uff61-\uff9f]/.test(c)) return &quot;halfKana&quot;;
+  if (/\p{L}/u.test(c)) return &quot;letter&quot;;
+  if (/[\p{Pi}\p{Pf}]/u.test(c)) return &quot;quote&quot;; // “ ” ‘ ’ « »
+  return &quot;symbol&quot;;
+}
+
+// Does a non-ASCII character of this class look real next to these neighbours?
+function fitsBetween(cls, sides, hasKana) {
+  const latin = (s) =&gt; s === &quot;ascii&quot; || s === &quot;digit&quot; || s === &quot;letter&quot; || s === &quot;quote&quot;;
+  switch (cls) {
+    case &quot;kana&quot;: return true;
+    case &quot;han&quot;: return hasKana || sides.some((s) =&gt; s === &quot;han&quot; || s === &quot;kana&quot; || s === &quot;digit&quot;); // 東京, 100円
+    case &quot;halfKana&quot;: return sides.includes(&quot;halfKana&quot;);
+    case &quot;letter&quot;: // Müller, l’été
+    case &quot;quote&quot;: return sides.every(latin);
+    case &quot;symbol&quot;: return sides.every((s) =&gt; s === &quot;ascii&quot; || s === &quot;digit&quot;); // 1.234,50 €
+    default: return false; // junk
+  }
+}
+
+// From 0 to 1: the share of non-ASCII characters that sit where real text puts them.
+function plausibility(text) {
+  const classes = Array.from(text.slice(0, 100000)).map(charClass); // a sample is enough
+  const hasKana = classes.includes(&quot;kana&quot;);
+  let nonAscii = 0, good = 0;
+  classes.forEach((cls, i) =&gt; {
+    if (cls === &quot;ascii&quot; || cls === &quot;digit&quot;) return;
+    nonAscii++;
+    const sides = [classes[i - 1] ?? &quot;ascii&quot;, classes[i + 1] ?? &quot;ascii&quot;];
+    if (fitsBetween(cls, sides, hasKana)) good++;
+  });
+  return nonAscii === 0 ? 1 : good / nonAscii;
+}</code></pre>
+<p><code>plausibility</code> looks only at non-ASCII characters and at their neighbours. Real accented letters and curly quotes sit next to ASCII, other letters or quotes (<code>Müller</code>, <code>l’été</code>). Real symbols such as <code>€</code> or <code>–</code> sit next to ASCII (<code>1.234,50 €</code>). A kanji counts as real when the text also contains kana, or when it stands next to another kanji or a digit, so <code>東京都,大阪府</code> and <code>100円</code> score 1.</p>
+<p>Wrongly decoded bytes produce control characters, private-use characters, symbols packed between other non-ASCII characters, and isolated kanji between Latin letters. <code>RARE_SYMBOLS</code> adds the few characters that Japanese text read as Windows-1252 produces all the time and Western text almost never contains, such as <code>‰</code> (the first byte of 円) and <code>†</code>. The cost is that a real <code>‰</code> or <code>†</code> in a Western file makes the result not sure. The main Shift_JIS sample in our tests scores 1.00 as Shift_JIS and 0.23 as Windows-1252.</p>
+
+<h2>Step 4: put it together</h2>
+<pre><code>// legacy: the encodings your users&#x27; older software writes, most likely first.
+function decodeCsv(bytes, legacy = [&quot;windows-1252&quot;]) {
+  const result = (encoding, text, sure, reason, options = []) =&gt; ({ encoding, text, sure, reason, options });
+  const refuse = (reason) =&gt; result(null, null, false, reason);
+
+  const startsWith = (...signature) =&gt; signature.every((b, i) =&gt; bytes[i] === b);
+  if (startsWith(0x50, 0x4b, 0x03, 0x04)) return refuse(&quot;this is a ZIP file, probably an .xlsx renamed to .csv&quot;);
+  if (startsWith(0xd0, 0xcf, 0x11, 0xe0)) return refuse(&quot;this is an old .xls file renamed to .csv&quot;);
+  const bom = sniffBom(bytes);
+  if (bom &amp;&amp; !bom.encoding) return refuse(&quot;UTF-32 file: save it as UTF-8 and try again&quot;);
+  const unicode = bom ? bom.encoding : guessUtf16(bytes);
+  if (unicode) {
+    const text = decodeStrict(bytes, unicode); // also removes the BOM
+    if (text === null) return refuse(`looks like ${unicode} but is not valid ${unicode}`);
+    return result(unicode, text, true, bom ? &quot;byte order mark&quot; : &quot;UTF-16 zero-byte pattern&quot;);
+  }
+  if (bytes.includes(0)) return refuse(&quot;contains zero bytes: a binary file, or UTF-16 without a byte order mark&quot;);
+
+  const utf8 = decodeStrict(bytes, &quot;utf-8&quot;);
+  if (utf8 !== null) return result(&quot;utf-8&quot;, utf8, true, &quot;valid UTF-8&quot;);
+
+  const options = legacy
+    .map((encoding) =&gt; ({ encoding, text: decodeStrict(bytes, encoding) }))
+    .filter((option) =&gt; option.text !== null)
+    .map((option) =&gt; ({ ...option, score: plausibility(option.text) }))
+    .sort((a, b) =&gt; b.score - a.score);
+  const scores = options.map(({ encoding, score }) =&gt; ({ encoding, score })); // for an encoding picker
+  const flagUtf8 = (reason) =&gt; result(&quot;utf-8&quot;, new TextDecoder().decode(bytes), false, reason, scores);
+
+  const cut = cutCharacterAtEnd(bytes);
+  const before = cut &gt; 0 ? bytes.subarray(0, cut) : null;
+  if (before &amp;&amp; before.some((b) =&gt; b &gt;= 0x80) &amp;&amp; decodeStrict(before, &quot;utf-8&quot;) !== null)
+    return flagUtf8(`UTF-8 cut off in the middle of a character at the end (line ${lineAt(bytes, cut)})`);
+  const damage = utf8Damage(bytes);
+  if (damage.share &gt;= 0.9) return flagUtf8(`UTF-8 with invalid bytes, first on line ${lineAt(bytes, damage.firstInvalid)}`);
+
+  if (options.length === 0) return refuse(`not valid UTF-8 or ${legacy.join(&quot;, &quot;)}`);
+  const [best, next] = options;
+  if (best.score &lt; 0.9)
+    return result(best.encoding, best.text, false, `no encoding gives clean text (best guess: ${best.encoding})`, scores);
+  if (next &amp;&amp; best.score - next.score &lt; 0.3)
+    return result(best.encoding, best.text, false, `${best.encoding} and ${next.encoding} both give clean text`, scores);
+  return result(best.encoding, best.text, true, `not UTF-8, clean as ${best.encoding}`, scores);
+}</code></pre>
+<p><strong>The default candidate list, <code>["windows-1252"]</code>, only suits Western European data.</strong> Windows-1252 accepts every byte, so with that default every file decodes as Windows-1252: our Russian sample comes back sure and wrong, and other alphabets can too. Pass your own list.</p>
+<p>The result is <code>{ encoding, text, sure, reason, options }</code>. A file is <code>sure</code> when the best candidate scores at least 0.9 and beats the next valid one by at least 0.3. When <code>sure</code> is false, <code>encoding</code> and <code>text</code> are only the best guess, and <code>options</code> lists every legacy encoding the bytes are valid in, with its score, for an encoding picker. On a tie the candidate listed first wins.</p>
+<p>The thresholds (0.9 and 0.3 here, 90% valid UTF-8 in step 2, the zero-byte ratios in step 1) were chosen against the samples in our tests, not tuned on a large set of real files. Raising them gives more <code>sure: false</code> results and fewer wrong sure ones; lowering them does the opposite. Valid UTF-8 is always reported as sure, which is right for nearly every file but not for the rare short legacy file that happens to be valid UTF-8 (see the limits below).</p>
+<p>The table shows what our tests get. The samples are short CSV files, such as <code>Name,City,Amount</code> followed by rows like <code>Müller GmbH,Köln,"1.234,50 €"</code>, or <code>氏名,住所,金額</code> followed by <code>山田太郎,東京都千代田区一丁目,1200</code>; all of them are in the <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">test file</a>.</p>
+<table>
+<tr><th>File</th><th>Legacy candidates</th><th>Result</th></tr>
+<tr><td>German, French, Spanish names in Windows-1252</td><td><code>windows-1252</code>, <code>shift_jis</code></td><td>windows-1252, sure</td></tr>
+<tr><td>Same file</td><td><code>shift_jis</code> only</td><td>refused: not valid UTF-8 or shift_jis</td></tr>
+<tr><td>Text with curly quotes and apostrophes in Windows-1252: <code>l’été</code>, <code>“Zoë”</code>, <code>„Grüße“</code></td><td><code>windows-1252</code>, <code>shift_jis</code></td><td>windows-1252, sure</td></tr>
+<tr><td>Japanese with kana, kanji only, half-width katakana, or prices like <code>100円</code>, in Shift_JIS</td><td><code>windows-1252</code>, <code>shift_jis</code></td><td>shift_jis, sure</td></tr>
+<tr><td>Only dates like <code>2024年1月5日</code> in Shift_JIS, no kana</td><td><code>windows-1252</code>, <code>shift_jis</code></td><td>windows-1252, <strong>not sure</strong>: both score 1.00, and windows-1252 is listed first</td></tr>
+<tr><td>Japanese in Shift_JIS</td><td><code>windows-1252</code> only</td><td>windows-1252, <strong>not sure</strong>: scores 0.23, no encoding gives clean text</td></tr>
+<tr><td>Japanese in EUC-JP</td><td><code>shift_jis</code>, <code>euc-jp</code></td><td>euc-jp, sure</td></tr>
+<tr><td>Japanese in Shift_JIS</td><td><code>shift_jis</code>, <code>gb18030</code></td><td>shift_jis, <strong>not sure</strong>: both score 1.00</td></tr>
+<tr><td>Russian in Windows-1251</td><td><code>windows-1252</code>, <code>windows-1251</code></td><td>windows-1252, <strong>not sure</strong>: both score 1.00</td></tr>
+<tr><td>Russian in Windows-1251</td><td><code>windows-1252</code> only</td><td>windows-1252, sure, and <strong>wrong</strong></td></tr>
+<tr><td>UTF-8 with one Windows-1252 line</td><td>any</td><td>utf-8, <strong>not sure</strong>: invalid bytes, first on line 3</td></tr>
+<tr><td>UTF-8 cut off inside the last character</td><td>any</td><td>utf-8, <strong>not sure</strong>: cut off at the end, on line 3</td></tr>
+<tr><td>UTF-16LE or BE, with or without BOM</td><td>any</td><td>utf-16le or utf-16be, sure</td></tr>
+<tr><td><code>Café…</code> in Windows-1252 (an accented letter right before <code>…</code>)</td><td><code>windows-1252</code>, <code>shift_jis</code></td><td>windows-1252, <strong>not sure</strong>: both candidates score 0, a false alarm</td></tr>
+<tr><td><code>Müller,Köln</code> in Mac Roman</td><td><code>windows-1252</code>, <code>shift_jis</code></td><td>windows-1252, sure, and <strong>wrong</strong></td></tr>
+<tr><td>An .xlsx or old .xls file renamed to .csv</td><td>any</td><td>refused, with the file type</td></tr>
+</table>
+<p>The not-sure rows show the limits. Shift_JIS bytes can decode cleanly as GB18030 too, as Chinese characters (both score 1.00 for our sample), and a file with only kanji dates reads as plausible Windows-1252 symbols. Windows-1251 and Windows-1252 accept every byte and both produce letters, so with only <code>windows-1252</code> listed a Russian file comes back as Latin letters and <code>sure: true</code>. The list of candidates is therefore your decision: include every encoding your users' files can arrive in, most likely first, and nothing else.</p>
+
+<h2>Using it in an upload form</h2>
+<p>Read the file as bytes, not text, so you can decode it again if the user picks another encoding:</p>
+<pre><code>async function readCsvText(file, legacy) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const decoded = decodeCsv(bytes, legacy);
+  // When decoded.sure is false, show a preview and let the user pick another encoding.
+  // decodeAs returns null if the bytes are not valid in the chosen encoding; switching
+  // back to the first result always works, even for damaged UTF-8.
+  const decodeAs = (encoding) =&gt; (encoding === decoded.encoding ? decoded.text : decodeStrict(bytes, encoding));
+  return { ...decoded, decodeAs };
+}
+
+const { encoding, text, sure, reason, options, decodeAs } = await readCsvText(file, [&quot;windows-1252&quot;, &quot;shift_jis&quot;]);</code></pre>
+<p>When <code>sure</code> is true, continue with <code>text</code>. When it is false and <code>text</code> is set, do not import yet: show the first few lines, the reason, and a picker filled from <code>options</code>. Call <code>decodeAs</code> when the user changes the choice, so they see the names become readable; it returns <code>null</code> when the bytes are not valid in that encoding, so say so instead of showing replacement characters. Choosing the first result again always works, even for damaged UTF-8. When <code>text</code> is <code>null</code>, show the reason and stop.</p>
+<p>For damaged or cut-off UTF-8, show the line number first: fixing that line, or uploading the whole file again, is usually the right answer. <code>options</code> still lists the legacy encodings the bytes are valid in, in case the file is not UTF-8 after all.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Choosing the candidates for you.</strong> The function cannot know where your users are. Single-byte encodings for different alphabets (Windows-1250, 1251, 1252) cannot be told apart reliably by this score, as the table shows.</li>
+<li><strong>Mixed encodings inside one legacy file.</strong> Only damaged UTF-8 is detected; a Shift_JIS file with one Windows-1252 line is refused or flagged as unclear, not repaired.</li>
+<li><strong>Legacy text that happens to be valid UTF-8.</strong> It is read as UTF-8. This is possible with short files.</li>
+<li><strong>Very small files.</strong> With only a few non-ASCII characters, one odd character moves the score a lot, so expect more <code>sure: false</code> results on tiny files.</li>
+<li><strong>UTF-16 without a BOM and with almost no ASCII</strong>, for example a single column of Japanese text with no commas. It is not detected as UTF-16; because its line breaks still contain zero bytes, our sample is refused as &ldquo;a binary file, or UTF-16 without a byte order mark&rdquo; rather than misread.</li>
+<li><strong>Bytes that mean different characters in different variants of Shift_JIS</strong>, and encodings <code>TextDecoder</code> does not support, such as UTF-32 and EBCDIC.</li>
+<li><strong>Browsers other than Chromium</strong>, where we have not run these checks.</li>
+<li><strong>Runtimes without the legacy decoders.</strong> <code>new TextDecoder(label)</code> throws a <code>RangeError</code> for an encoding the runtime does not support, so try each of your candidates once in every runtime you deploy to.</li>
+<li><strong>Other legacy encodings, such as Mac Roman.</strong> Its bytes are valid Windows-1252 and give plausible letters, so a Mac Roman file comes back wrong and sure unless you list <code>"macintosh"</code> as a candidate; with both listed, the result is not sure.</li>
+<li><strong>Streaming and very large files.</strong> <code>decodeCsv</code> needs the whole file: a slice cut in the middle of a character fails the strict checks. It also decodes the whole file once per candidate, so memory use grows with file size times the number of candidates. Parsing very large files in chunks is a separate topic.</li>
+<li><strong>False alarms.</strong> An accented letter right before <code>…</code>, <code>–</code> or a similar symbol counts against the score, so a short file like <code>Café…</code> comes back not sure, and so does a Western file with a real <code>‰</code> or <code>†</code> in it, such as <code>5‰</code>. Loosening that rule would also accept Japanese text read as Windows-1252.</li>
+<li><strong>Delimiters, quotes and header rows</strong>, which come after decoding. See <a href="../csv-importers-real-excel-files/">why CSV importers break on real Excel files</a> and <a href="../detect-header-row-spreadsheet-javascript/">detecting the header row</a>.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer. The demo on our homepage decodes CSV files with the same approach, with Windows-1252 and Shift_JIS as its two legacy candidates. It says which legacy encoding it used and warns when the encoding is a guess, flags damaged UTF-8 with the line number, and refuses an .xlsx file renamed to .csv. It runs in your browser: drop in a file and nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. The functions in this post are simplified versions of the ideas it uses, and you are free to use them in your own code.</p>
+
+</article>
+</div></main>
+<footer><div class="wrap"><span>SheetSift · a drop-in importer for messy Excel and CSV files</span><a href="../../#waitlist">Join the waitlist</a></div>
+<div class="wrap"><small>Visits are counted with <a href="https://www.goatcounter.com/">GoatCounter</a>, which does not track you across sites.</small></div></footer>
+<script>
+// Page view counter (GoatCounter). Only on the public site, so local runs and tests are never counted.
+if (location.hostname === "shoheitaro003.github.io") {
+  var gc = document.createElement("script");
+  gc.async = true; gc.src = "https://gc.zgo.at/count.js";
+  gc.setAttribute("data-goatcounter", "https://sheetsift.goatcounter.com/count");
+  document.body.appendChild(gc);
+}
+</script>
+</body>
+</html>
