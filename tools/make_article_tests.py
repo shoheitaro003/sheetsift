@@ -710,4 +710,197 @@ ok("dec: readCsvText on a file", async () => {{
   assert(got.other.startsWith("\\u017d\\u0081\\u2013\\u00bc")); // the same bytes as Windows-1252
 }});
 '''
+MAP_TESTS = r"""
+// --- blog/map-spreadsheet-columns-to-fields-javascript ---
+{
+%%MAP_NORMALIZE%%
+
+%%MAP_COMPARE%%
+
+%%MAP_FIELDS%%
+
+%%MAP_COLUMNS%%
+
+%%MAP_REMEMBER%%
+
+%%MAP_USE%%
+
+// Short form of a result: field -> header ("?" when not sure), plus unmatched headers, missing fields and sure.
+const summary = (r) => ({
+  mapped: Object.fromEntries(Object.entries(r.byField).filter(([, m]) => m).map(([k, m]) => [k, String(m.header) + (m.sure ? "" : "?")])),
+  unmatched: r.unmatched.map((u) => String(u.header)),
+  missing: r.missing,
+  sure: r.sure,
+});
+const run = (headers, samples) => summary(mapColumns(headers, FIELDS, { samples }));
+
+ok("map: the problem lines print what the comments say", async () => assert.strictEqual(await checkCommentedLines(%%MAP_PROBLEM_JSON%%), 6));
+ok("map: normalizeHeader", () => {
+  const cases = {
+    "E-mail": "e mail", "  E-Mail  ": "e mail", "\uFF25\uFF4D\uFF41\uFF49\uFF4C": "email", "\uFF25\uFF0D\uFF4D\uFF41\uFF49\uFF4C": "e mail",
+    "\uFEFFName": "name", "Email\u200B": "email", "Sign\u00A0up date": "sign up date", "signupDate": "signup date",
+    "sign_up_date": "sign up date", "SIGNUP DATE": "signup date", "MRR ($)": "mrr", "Téléphone": "telephone",
+    "E-Mail-Adresse": "e mail adresse", "Order #": "order", "\uFF92\uFF70\uFF99\uFF71\uFF84\uFF9E\uFF9A\uFF7D": "メールアドレス",
+    "\uFF71\uFF84\uFF9E\uFF9A\uFF7D": "アドレス", "電話番号": "電話番号", "\uFF25メール": "eメール",
+  };
+  for (const [input, want] of Object.entries(cases)) assert.strictEqual(normalizeHeader(input), want, JSON.stringify(input));
+  assert.strictEqual(normalizeHeader(null), "");
+  assert.strictEqual(normalizeHeader(undefined), "");
+  assert.strictEqual(normalizeHeader(2024), "2024");
+  assert.strictEqual(normalizeHeader(" - "), "");
+  assert.deepStrictEqual(words("Plans"), ["plan"]);
+  assert.deepStrictEqual(words("Email Addresses"), ["email", "address"]);
+  assert.deepStrictEqual(words("Address"), ["address"]);
+  assert.deepStrictEqual(words("Bus"), ["bus"]);
+  assert.deepStrictEqual(words("Boxes Sales"), ["box", "sale"]);
+  assert.strictEqual("\uFEFF Email\u00A0".trim(), "Email"); // trim() already removes these at the ends
+  assert.strictEqual(headerKey("Customer_Names"), "customer name");
+});
+ok("map: oneEditApart", () => {
+  for (const [a, b] of [["emial", "email"], ["compnay", "company"], ["emails", "email"], ["phne", "phone"], ["email", "emaik"], ["xemail", "email"]])
+    assert(oneEditApart(a, b) && oneEditApart(b, a), a + "/" + b);
+  for (const [a, b] of [["email", "email"], ["email", "mail ad"], ["email", "eamil x"], ["phone", "phoen1"], ["mrr", "a"], ["", "ab"], ["abcd", "badc"]])
+    assert(!oneEditApart(a, b) && !oneEditApart(b, a), a + "/" + b);
+  assert(oneEditApart("", "a"));
+});
+ok("map: compareNames scores", () => {
+  const score = (h, n) => compareNames(h, n)?.score ?? null;
+  assert.strictEqual(score("E-mail", "email"), 1);
+  assert.strictEqual(score("E-Mail-Adresse", "email adresse"), 1);
+  assert.strictEqual(score("Address email", "email address"), 0.95);
+  assert.strictEqual(score("Primary email", "email"), 0.7);
+  assert.strictEqual(Math.round(score("Signup date (UTC)", "signup date") * 1000), 767);
+  assert.strictEqual(Math.round(score("Email opt-in", "email") * 1000), 633);
+  assert.strictEqual(score("Emial", "email"), 0.6);
+  assert.strictEqual(score("ARR", "mrr"), null);       // too short for the spelling rule
+  assert.strictEqual(score("Mail", "main"), null);
+  assert.strictEqual(score("Mailing address", "mail"), null);
+  assert.strictEqual(score("Mailing address", "email address"), null);
+  assert.strictEqual(score("", "email"), null);
+  assert.strictEqual(score("顧客メールアドレス", "メールアドレス"), null); // no spaces between Japanese words
+  assert.strictEqual(compareNames("Mail", "mail").why, 'same as "mail"');
+});
+ok("map: decision table", () => {
+  const table = %%MAP_TABLE_JSON%%;
+  for (const [headers, samples, want] of table) assert.deepStrictEqual(run(headers, samples ?? undefined), want, JSON.stringify(headers));
+});
+ok("map: reasons for unused columns", () => {
+  const why = (headers, samples) => mapColumns(headers, FIELDS, { samples }).unmatched.map((u) => u.why);
+  assert.deepStrictEqual(why(["Name", "Email", "E-mail"]), ["also matches Email, which column B already fills"]);
+  assert.deepStrictEqual(why(["Name", "Email opt-in"], [[], ["yes", "no"]]), ["matched by name, but only 0 of 2 values look like Email"]);
+  assert.deepStrictEqual(why(["Name", "Contact", "Backup contact"], [[], ["a@b.co"], ["c@d.co"]]),
+    ["values look like Email, but so do other columns", "values look like Email, but so do other columns"]);
+  assert.deepStrictEqual(why(["Name", "Email", "", "ARR"]), ["empty header", "no field has this name"]);
+  assert.deepStrictEqual(mapColumns(["Name", "Email", "E-mail"], FIELDS).byField.email.doubts, ["column C matches too"]);
+  assert.deepStrictEqual(mapColumns(["First name", "Last name", "Email"], FIELDS).byField.name.doubts, ["weak name match", "column B matches too"]);
+  assert.deepStrictEqual(mapColumns(["Emial"], FIELDS).byField.email.doubts, ["weak name match"]);
+  assert.deepStrictEqual(mapColumns(["Contact"], FIELDS, { samples: [["a@b.co"]] }).byField.email.doubts, ["matched by its values, not its name"]);
+});
+ok("map: value thresholds (9 in 10 passes, 5 in 10 is used but flagged, fewer is rejected)", () => {
+  const emails = (good) => Array.from({ length: 10 }, (_, i) => (i < good ? `u${i}@example.com` : "n/a"));
+  const email = (good) => mapColumns(["Name", "Email"], FIELDS, { samples: [[], emails(good)] }).byField.email;
+  assert.strictEqual(email(10).sure, true);
+  assert.strictEqual(email(9).sure, true);
+  assert.deepStrictEqual(email(8).doubts, ["only 8 of 10 values look like Email"]);
+  assert.deepStrictEqual(email(5).doubts, ["only 5 of 10 values look like Email"]);
+  assert.strictEqual(email(4), null);
+  // Blank cells do not count; a column with only blanks is not checked at all.
+  assert.strictEqual(mapColumns(["Name", "Email"], FIELDS, { samples: [[], ["", null, undefined, "  "]] }).byField.email.sure, true);
+  // Matching by values alone needs 9 in 10 too.
+  assert.strictEqual(mapColumns(["Contact"], FIELDS, { samples: [emails(9)] }).byField.email.header, "Contact");
+  assert.strictEqual(mapColumns(["Contact"], FIELDS, { samples: [emails(8)] }).byField.email, null);
+  // Numbers typed in Excel count as numbers.
+  assert.strictEqual(mapColumns(["MRR"], FIELDS, { samples: [[49, "1,234.50", "€ 99", "(12)"]] }).byField.mrr.sure, true);
+});
+ok("map: remembered choices", () => {
+  const headers = ["Kunde", "Kontakt"];
+  const first = mapColumns(headers, FIELDS);
+  assert.deepStrictEqual(summary(first), { mapped: {}, unmatched: ["Kunde", "Kontakt"], missing: ["name", "email"], sure: false });
+  // The user picks the fields on the mapping screen; your code builds the same shape as byField.
+  const confirmed = { name: { column: 0 }, email: { column: 1 }, company: null };
+  const remembered = rememberMapping({}, headers, confirmed);
+  assert.deepStrictEqual(remembered, { kunde: "name", kontakt: "email" });
+  assert.deepStrictEqual(summary(mapColumns([" KUNDE ", "Kontakt", "Firma"], FIELDS, { remembered })),
+    { mapped: { name: " KUNDE ", email: "Kontakt" }, unmatched: ["Firma"], missing: [], sure: true });
+  // A remembered choice is still rejected when the values contradict it.
+  assert.strictEqual(mapColumns(["Kontakt", "Name"], FIELDS, { remembered, samples: [["030 1234"], []] }).byField.email, null);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(remembered)), remembered); // plain JSON, safe for localStorage
+});
+ok("map: blank headers are never remembered", () => {
+  const remembered = rememberMapping({}, ["Name", "", " - "], { name: { column: 0 }, email: { column: 1 }, phone: { column: 2 } });
+  assert.deepStrictEqual(remembered, { name: "name" });
+  const r = mapColumns(["Name", ""], FIELDS, { remembered: { "": "email" } });
+  assert.strictEqual(r.byField.email, null);
+});
+ok("map: no two names of different fields collide after normalizing", () => {
+  const owner = new Map();
+  for (const f of FIELDS) for (const n of [f.key, f.label, ...f.aliases]) {
+    const k = headerKey(n);
+    assert(!owner.has(k) || owner.get(k) === f.key, n);
+    owner.set(k, f.key);
+  }
+});
+ok("map: a one-word alias like name also matches longer headers", () => {
+  const withoutCompany = FIELDS.filter((f) => f.key !== "company");
+  const m = mapColumns(["Company name", "Email"], withoutCompany).byField.name;
+  assert.deepStrictEqual([m.header, m.sure, m.why, m.doubts], ["Company name", false, 'contains "name"', ["weak name match"]]);
+  // Values can confirm a partial name.
+  assert.strictEqual(mapColumns(["Emial"], FIELDS, { samples: [["a@b.co"]] }).byField.email.sure, true);
+});
+ok("map: suggestMapping and applyMapping", () => {
+  const rows = [
+    ["Customer export"], [],
+    ["\uFEFFCustomer name", "E-Mail", "Plan", "Monthly revenue"],
+    ["Yui Tanaka", "yui@example.jp", "Pro", "49"],
+    ["Ken Mori", "ken@example.com"],
+    undefined,
+  ];
+  const result = suggestMapping(rows, 2);
+  assert.deepStrictEqual(summary(result), { mapped: { name: "\uFEFFCustomer name", email: "E-Mail", mrr: "Monthly revenue" }, unmatched: ["Plan"], missing: [], sure: true });
+  assert.deepStrictEqual(applyMapping(rows, 2, result.byField), [
+    { name: "Yui Tanaka", email: "yui@example.jp", mrr: "49" },
+    { name: "Ken Mori", email: "ken@example.com", mrr: "" },
+  ]);
+  assert.deepStrictEqual(applyMapping([["Email", "Plan"], [" ", "Pro"], [], undefined], 0, { email: { column: 0 } }), []);
+  assert.deepStrictEqual(summary(suggestMapping([], 0)), { mapped: {}, unmatched: [], missing: ["name", "email"], sure: false });
+  // Only the first 50 data rows are checked.
+  const many = [["Name", "Email"], ...Array.from({ length: 50 }, () => ["a", "a@b.co"]), ...Array.from({ length: 100 }, () => ["b", "x"])];
+  assert.strictEqual(suggestMapping(many, 0).byField.email.sure, true);
+});
+ok("map: no invisible characters in the snippets", () => {
+  for (const s of %%MAP_ALL_JSON%%) assert(!/[\u00A0\u200B-\u200F\u2028\u2029\uFEFF]/.test(s));
+});
+}
+"""
+MAP_TABLE = [
+  [["Name", "E-mail", "Company", "MRR"], None, {"mapped": {"name": "Name", "email": "E-mail", "company": "Company", "mrr": "MRR"}, "unmatched": [], "missing": [], "sure": True}],
+  [["Customer name", "Email address", "Organisation", "Monthly revenue"], None, {"mapped": {"name": "Customer name", "email": "Email address", "company": "Organisation", "mrr": "Monthly revenue"}, "unmatched": [], "missing": [], "sure": True}],
+  [["\uFF2E\uFF41\uFF4D\uFF45", "\uFEFFE-Mail-Adresse", "Téléphone"], None, {"mapped": {"name": "\uFF2E\uFF41\uFF4D\uFF45", "email": "\uFEFFE-Mail-Adresse", "phone": "Téléphone"}, "unmatched": [], "missing": [], "sure": True}],
+  [["名前", "\uFF92\uFF70\uFF99\uFF71\uFF84\uFF9E\uFF9A\uFF7D", "電話番号"], None, {"mapped": {"name": "名前", "email": "\uFF92\uFF70\uFF99\uFF71\uFF84\uFF9E\uFF9A\uFF7D", "phone": "電話番号"}, "unmatched": [], "missing": [], "sure": True}],
+  [["Name", "Primary email", "Phone number (mobile)"], None, {"mapped": {"name": "Name", "email": "Primary email?", "phone": "Phone number (mobile)?"}, "unmatched": [], "missing": [], "sure": False}],
+  [["Name", "Primary email"], [["Yui"], ["yui@example.jp"]], {"mapped": {"name": "Name", "email": "Primary email"}, "unmatched": [], "missing": [], "sure": True}],
+  [["File name", "Email verified"], None, {"mapped": {"name": "File name?", "email": "Email verified?"}, "unmatched": [], "missing": [], "sure": False}],
+  [["Name", "Name", "Email"], None, {"mapped": {"name": "Name?", "email": "Email"}, "unmatched": ["Name"], "missing": [], "sure": False}],
+  [["Name", "Email", "Work email"], None, {"mapped": {"name": "Name", "email": "Email"}, "unmatched": ["Work email"], "missing": [], "sure": False}],
+  [["Name", "Email", "E-mail"], None, {"mapped": {"name": "Name", "email": "Email?"}, "unmatched": ["E-mail"], "missing": [], "sure": False}],
+  [["First name", "Last name", "Email"], None, {"mapped": {"name": "First name?", "email": "Email"}, "unmatched": ["Last name"], "missing": [], "sure": False}],
+  [["Company name", "Email"], None, {"mapped": {"email": "Email", "company": "Company name"}, "unmatched": [], "missing": ["name"], "sure": False}],
+  [["Name", "Emial", "ARR"], None, {"mapped": {"name": "Name", "email": "Emial?"}, "unmatched": ["ARR"], "missing": [], "sure": False}],
+  [["Name", "Mailing address"], None, {"mapped": {"name": "Name"}, "unmatched": ["Mailing address"], "missing": ["email"], "sure": False}],
+  [["Name", "Email opt-in"], None, {"mapped": {"name": "Name", "email": "Email opt-in?"}, "unmatched": [], "missing": [], "sure": False}],
+  [["Name", "Email opt-in"], [["Yui"], ["yes"]], {"mapped": {"name": "Name"}, "unmatched": ["Email opt-in"], "missing": ["email"], "sure": False}],
+  [["Name", "Email", "Email opt-in"], [["Yui"], ["yui@example.jp"], ["yes"]], {"mapped": {"name": "Name", "email": "Email"}, "unmatched": ["Email opt-in"], "missing": [], "sure": True}],
+  [["Name", "Contact"], [["Yui"], ["yui@example.jp"]], {"mapped": {"name": "Name", "email": "Contact?"}, "unmatched": [], "missing": [], "sure": False}],
+  [["Name", "Contact", "Backup contact"], [["Yui"], ["yui@example.jp"], ["ken@example.com"]], {"mapped": {"name": "Name"}, "unmatched": ["Contact", "Backup contact"], "missing": ["email"], "sure": False}],
+  [["Name", "Email", "MRR"], [["Yui"], ["yui@example.jp"], ["n/a", "free"]], {"mapped": {"name": "Name", "email": "Email"}, "unmatched": ["MRR"], "missing": [], "sure": False}],
+  [["Name", "顧客メールアドレス"], None, {"mapped": {"name": "Name"}, "unmatched": ["顧客メールアドレス"], "missing": ["email"], "sure": False}],
+  [[2024, None, "Email"], None, {"mapped": {"email": "Email"}, "unmatched": ["2024", "null"], "missing": ["name"], "sure": False}],
+]
+_map_names = ["MAP_NORMALIZE", "MAP_COMPARE", "MAP_FIELDS", "MAP_COLUMNS", "MAP_REMEMBER", "MAP_USE"]
+for _k in _map_names:
+    MAP_TESTS = MAP_TESTS.replace("%%" + _k + "%%", globals()[_k])
+MAP_TESTS = MAP_TESTS.replace("%%MAP_PROBLEM_JSON%%", _json.dumps(MAP_PROBLEM))
+MAP_TESTS = MAP_TESTS.replace("%%MAP_TABLE_JSON%%", _json.dumps(MAP_TABLE, ensure_ascii=False))
+MAP_TESTS = MAP_TESTS.replace("%%MAP_ALL_JSON%%", _json.dumps([globals()[k] for k in _map_names + ["MAP_PROBLEM"]]))
+out += MAP_TESTS
 open(sys.argv[1] if len(sys.argv) > 1 else "/dev/stdout", "w").write(out)

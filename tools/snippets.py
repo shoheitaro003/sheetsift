@@ -711,3 +711,240 @@ DEC_USE = r'''async function readCsvText(file, legacy) {
 
 const { encoding, text, sure, reason, options, decodeAs } = await readCsvText(file, ["windows-1252", "shift_jis"]);'''
 
+
+
+# --- blog/map-spreadsheet-columns-to-fields-javascript ---
+MAP_PROBLEM = r'''const EMAIL_NAMES = ["email", "e-mail", "email address", "mail"];
+const exactMatch = (header) => EMAIL_NAMES.includes(header.trim().toLowerCase());
+exactMatch("E-mail");             // true
+exactMatch("E-Mail-Adresse");     // false
+exactMatch("Email\u00A0address");  // false
+exactMatch("Ｅｍａｉｌ");         // false
+
+const looseMatch = (header) => header.toLowerCase().includes("mail");
+looseMatch("Mailing address");    // true
+looseMatch("Email opt-in");       // true'''
+MAP_NORMALIZE = r'''function normalizeHeader(text) {
+  return String(text ?? "")
+    // Ｅｍａｉｌ -> Email, ﾒｰﾙ -> メール, no-break space -> space
+    .normalize("NFKC")
+    // zero-width spaces and byte order marks
+    .replace(/\p{Cf}/gu, "")
+    // signupDate -> signup Date
+    .replace(/(\p{Ll})(\p{Lu})/gu, "$1 $2")
+    .toLowerCase()
+    // é -> e, but the mark in Japanese ド stays
+    .normalize("NFD")
+    .replace(/(\p{Script=Latin})\p{M}+/gu, "$1")
+    .normalize("NFC")
+    // punctuation, underscores and runs of spaces -> one space
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+// Plurals count as the same word. "address" is left alone.
+function stem(word) {
+  if (/(ss|x|ch|sh)es$/.test(word)) return word.slice(0, -2); // addresses
+  if (word.length > 3 && /[^s]s$/.test(word)) return word.slice(0, -1); // plans
+  return word;
+}
+const words = (text) => normalizeHeader(text).split(" ").filter(Boolean).map(stem);
+const headerKey = (text) => words(text).join(" ");'''
+MAP_COMPARE = r'''// True when b is a with one letter changed, added or removed,
+// or with two neighbouring letters swapped.
+function oneEditApart(a, b) {
+  if (a === b || Math.abs(a.length - b.length) > 1) return false;
+  let i = 0;
+  while (a[i] === b[i]) i++; // length of the common start
+  if (a.length === b.length) {
+    return a.slice(i + 1) === b.slice(i + 1) ||
+      (a[i] === b[i + 1] && a[i + 1] === b[i] && a.slice(i + 2) === b.slice(i + 2));
+  }
+  const [longer, shorter] = a.length > b.length ? [a, b] : [b, a];
+  return longer.slice(i + 1) === shorter.slice(i);
+}
+
+function compareNames(header, name) {
+  const h = words(header), n = words(name);
+  if (!h.length || !n.length) return null;
+  const hJoined = h.join(""), nJoined = n.join("");
+  if (hJoined === nJoined) return { score: 1, why: `same as "${name}"` };
+  const contained = n.every((w) => h.includes(w));
+  if (contained && h.length === n.length) {
+    return { score: 0.95, why: `same words as "${name}"` };
+  }
+  if (contained) {
+    return { score: 0.5 + 0.4 * (n.length / h.length), why: `contains "${name}"` };
+  }
+  const longEnough = Math.min(hJoined.length, nJoined.length) >= 5;
+  if (longEnough && oneEditApart(hJoined, nJoined)) {
+    return { score: 0.6, why: `spelled like "${name}"` };
+  }
+  return null;
+}'''
+MAP_FIELDS = r'''const looksLikeEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v).trim());
+const looksLikeNumber = (v) =>
+  typeof v === "number" || /^[-+(]?[$€£¥]?\s?\d[\d.,\s']*\)?$/.test(String(v).trim());
+
+const FIELDS = [
+  { key: "name", label: "Full name", required: true,
+    aliases: ["name", "customer name", "contact name", "氏名", "名前"] },
+  { key: "email", label: "Email", required: true,
+    looksLike: looksLikeEmail, findByValues: true,
+    aliases: ["email address", "mail", "e-mail address", "email adresse",
+              "メールアドレス", "メール"] },
+  { key: "company", label: "Company",
+    aliases: ["company name", "organization", "organisation", "会社名"] },
+  { key: "phone", label: "Phone",
+    aliases: ["phone number", "telephone", "tel", "mobile", "電話番号"] },
+  { key: "mrr", label: "MRR", looksLike: looksLikeNumber,
+    aliases: ["monthly revenue", "monthly recurring revenue"] },
+];'''
+MAP_COLUMNS = r'''const MIN_SCORE = 0.6;   // weaker name matches are ignored
+const SURE_SCORE = 0.95; // weaker name matches need values to confirm them
+const CLOSE = 0.1;       // a rival this close makes the choice a guess
+
+// 0 -> "A", 27 -> "AB"
+function columnLetter(i) {
+  const prefix = i >= 26 ? columnLetter(Math.floor(i / 26) - 1) : "";
+  return prefix + String.fromCharCode(65 + (i % 26));
+}
+
+// How many sample values pass the field's check (null: nothing to check).
+function valueShare(field, values = []) {
+  const filled = values.filter((v) => v != null && String(v).trim() !== "");
+  if (!field.looksLike || !filled.length) return null;
+  const pass = filled.filter(field.looksLike).length;
+  const text = `${pass} of ${filled.length} values look like ${field.label}`;
+  return { pass, of: filled.length, text };
+}
+
+function bestNameMatch(header, field, remembered) {
+  const key = headerKey(header);
+  if (key && remembered[key] === field.key) {
+    return { score: 1, why: "chosen by a user before" };
+  }
+  let best = null;
+  for (const name of [field.key, field.label, ...(field.aliases ?? [])]) {
+    const m = compareNames(header, name);
+    if (m && (!best || m.score > best.score)) best = m;
+  }
+  return best;
+}
+
+function mapColumns(headers, fields, { samples = [], remembered = {} } = {}) {
+  // Columns that matched a field but were not used: column -> { key, why, second }.
+  // second: a better column already fills that field.
+  const notUsed = new Map();
+  const note = (column, key, why, second = false) => {
+    if (!notUsed.has(column)) notUsed.set(column, { key, why, second });
+  };
+
+  // 1. Pairs whose names match and whose values do not contradict them.
+  const pairs = [];
+  fields.forEach((field, f) => headers.forEach((header, column) => {
+    const best = bestNameMatch(header, field, remembered);
+    if (!best || best.score < MIN_SCORE) return;
+    const share = valueShare(field, samples[column]);
+    if (share && share.pass / share.of < 0.5) {
+      return note(column, field.key, `matched by name, but only ${share.text}`);
+    }
+    const confirmed = share && share.pass / share.of >= 0.9;
+    const doubt = share && !confirmed && `only ${share.text}`;
+    pairs.push({ f, column, ...best, confirmed, doubt });
+  }));
+
+  // 2. Best pairs first; each field and each column is used once.
+  pairs.sort((a, b) => b.score - a.score || a.column - b.column || a.f - b.f);
+  const byField = Object.fromEntries(fields.map((field) => [field.key, null]));
+  const usedBy = new Map(); // column -> field key
+  for (const p of pairs) {
+    const field = fields[p.f], taken = byField[field.key];
+    if (usedBy.has(p.column)) continue;
+    if (taken) {
+      const where = columnLetter(taken.column);
+      const why = `also matches ${field.label}, which column ${where} already fills`;
+      note(p.column, field.key, why, true);
+      continue;
+    }
+    // A rival scores almost as well and could still be used: another free column
+    // for this field, or another empty field for this column.
+    const rival = pairs.find((q) => q !== p && q.score >= p.score - CLOSE && (
+      (q.f === p.f && !usedBy.has(q.column)) ||
+      (q.column === p.column && !byField[fields[q.f].key])));
+    const doubts = [];
+    if (p.score < SURE_SCORE && !p.confirmed) doubts.push("weak name match");
+    const rivalColumn = rival && columnLetter(rival.column);
+    if (rival?.f === p.f) doubts.push(`column ${rivalColumn} matches too`);
+    else if (rival) doubts.push(`could also be ${fields[rival.f].label}`);
+    if (p.doubt) doubts.push(p.doubt);
+    const header = headers[p.column], sure = !doubts.length;
+    byField[field.key] = { column: p.column, header, why: p.why, sure, doubts };
+    usedBy.set(p.column, field.key);
+  }
+
+  // 3. Fields still empty: the one unused column whose values look right (9 in 10).
+  for (const field of fields) {
+    if (byField[field.key] || !field.findByValues) continue;
+    const fits = headers.map((_, column) => column).filter((column) => {
+      const share = !usedBy.has(column) && valueShare(field, samples[column]);
+      return share && share.pass / share.of >= 0.9;
+    });
+    if (fits.length !== 1) {
+      const why = `values look like ${field.label}, but so do other columns`;
+      fits.forEach((column) => note(column, field.key, why));
+      continue;
+    }
+    const [column] = fits, header = headers[column];
+    const why = `values look like ${field.label}`;
+    const doubts = ["matched by its values, not its name"];
+    byField[field.key] = { column, header, why, sure: false, doubts };
+    usedBy.set(column, field.key);
+  }
+
+  const unmatched = headers
+    .map((header, column) => ({ column, header }))
+    .filter(({ column }) => !usedBy.has(column))
+    .map((c) => ({ ...c, why: notUsed.get(c.column)?.why ??
+      (normalizeHeader(c.header) ? "no field has this name" : "empty header") }));
+  const missing = fields.filter((f) => f.required && !byField[f.key])
+    .map((f) => f.key);
+  // A person should look when a field stayed empty although a column's name
+  // matched it, or when a second column matches a filled field (Email, Email 2).
+  const needsLook = unmatched.some(({ column }) => {
+    const n = notUsed.get(column);
+    return n && (n.second || !byField[n.key]);
+  });
+  const allSure = Object.values(byField).every((m) => !m || m.sure);
+  const sure = !missing.length && !needsLook && allSure;
+  return { byField, unmatched, missing, sure };
+}'''
+MAP_REMEMBER = r'''// After the user confirms the mapping screen, store their choices
+// (in your database or in localStorage).
+function rememberMapping(remembered, headers, byField) {
+  for (const [key, match] of Object.entries(byField)) {
+    const header = match && headerKey(headers[match.column]);
+    if (header) remembered[header] = key; // blank headers are not remembered
+  }
+  return remembered;
+}'''
+MAP_USE = r'''// rows: arrays of cells from your CSV or Excel parser.
+// headerRow: the index of the header row.
+function suggestMapping(rows, headerRow, remembered = {}) {
+  const headers = rows[headerRow] ?? [];
+  // 50 data rows are enough to check the values.
+  const firstRows = rows.slice(headerRow + 1, headerRow + 51);
+  const samples = headers.map((_, column) => firstRows.map((row) => row?.[column]));
+  return mapColumns(headers, FIELDS, { samples, remembered });
+}
+
+// Rows whose mapped cells are all blank are skipped.
+function applyMapping(rows, headerRow, byField) {
+  const used = Object.entries(byField).filter(([, match]) => match);
+  const cell = (row, match) => row?.[match.column] ?? "";
+  const toRecord = (row) =>
+    Object.fromEntries(used.map(([key, match]) => [key, cell(row, match)]));
+  return rows.slice(headerRow + 1)
+    .filter((row) => used.some(([, match]) => String(cell(row, match)).trim() !== ""))
+    .map(toRecord);
+}'''

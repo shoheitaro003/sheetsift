@@ -1,0 +1,107 @@
+title: Map CSV and Excel columns to your fields in JavaScript
+description: Match headers like E-mail, Email address and メール to one field without AI. Tested JavaScript that checks the values too and flags uncertain matches.
+date: 2026-11-12
+---
+<p>Your importer expects a column called <code>email</code>. The customer's file says <code>E-mail</code>, the next one <code>Email address</code>, and a German one <code>E-Mail-Adresse</code>. A list of exact names misses most of them; a substring check maps <code>Email opt-in</code>, a column of yes/no values, to your email field.</p>
+<p>By the end of this post you will have <code>mapColumns(headers, fields)</code>, about 220 lines with no dependencies, shown in five parts: paste them in order into one module. It matches headers to your fields by name, uses a few sample values to reject wrong matches, and returns <code>sure: false</code> with a reason for every guess, so your mapping screen only asks the user when it has to. Every function, and every result quoted below, is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22.</p>
+
+<h2>Why a list of names and a substring check both fail</h2>
+<p>This first block only shows the problem; it is not part of the solution. (<code>\u00A0</code> is written as an escape so you can see it; in a real file it is an invisible character.)</p>
+{{code:MAP_PROBLEM}}
+<p>The exact list fails on spelling it did not foresee, on a no-break space (U+00A0) between the words, and on full-width letters. <code>trim()</code> only helps at the ends: it does remove a byte order mark and no-break spaces there. The substring check finds too much: <code>Mailing address</code> is a postal address.</p>
+<p>The fix has three parts: clean both names the same way before comparing, compare whole words instead of substrings, and look at the values before trusting a name.</p>
+
+<h2>Step 1: normalize the header</h2>
+<p>Normalizing means turning every spelling of a name into one standard form. This function runs on the header and on every name you compare it with:</p>
+{{code:MAP_NORMALIZE}}
+<p>Each line handles one kind of difference:</p>
+<ul>
+<li><code>normalize("NFKC")</code> is the Unicode compatibility form. It turns full-width <code>Ｅｍａｉｌ</code> into <code>Email</code>, half-width katakana <code>ﾒｰﾙｱﾄﾞﾚｽ</code> into <code>メールアドレス</code>, and a no-break space into a normal space.</li>
+<li><code>\p{Cf}</code> matches format characters: zero-width spaces and byte order marks. They are invisible and survive NFKC, so they are removed. (A byte order mark is U+FEFF at the very start of a file; if your parser keeps it, it becomes part of the first header.)</li>
+<li>The camelCase split runs before lowercasing, so <code>signupDate</code>, <code>sign_up_date</code> and <code>SIGNUP DATE</code> end up as words.</li>
+<li>Accents are removed only from Latin letters, so <code>Téléphone</code> becomes <code>telephone</code>. Removing every combining mark would also strip the voicing mark from Japanese <code>ド</code>.</li>
+<li>Everything that is not a letter or a digit becomes a space: <code>MRR ($)</code> becomes <code>mrr</code>, and <code>E-mail</code> becomes <code>e mail</code>.</li>
+</ul>
+<p><code>words()</code> also removes a plural ending, so <code>Plans</code> matches <code>plan</code> and <code>Addresses</code> matches <code>address</code>. The rule is crude (<code>status</code> becomes <code>statu</code>), but these keys are only compared, never shown, and both sides get the same treatment. What to watch is two names of different fields that become one, such as <code>new</code> and <code>news</code>. Our tests check the names in step 3; when you add aliases, check that <code>headerKey</code> gives no duplicates across fields.</p>
+
+<h2>Step 2: compare a header with one name</h2>
+<p><code>compareNames</code> returns a score from 0.6 to 1, or <code>null</code> when the names do not match:</p>
+{{code:MAP_COMPARE}}
+<table>
+<tr><th>Rule</th><th>Example (header vs name)</th><th>Score</th></tr>
+<tr><td>Same letters once spaces are removed</td><td><code>E-mail</code> vs <code>email</code></td><td>1</td></tr>
+<tr><td>Same words in another order</td><td><code>Address email</code> vs <code>email address</code></td><td>0.95</td></tr>
+<tr><td>Header contains every word of the name</td><td><code>Primary email</code> vs <code>email</code></td><td>0.7</td></tr>
+<tr><td>Same rule, longer header</td><td><code>Email opt-in</code> vs <code>email</code></td><td>0.63</td></tr>
+<tr><td>One typo, both at least 5 letters</td><td><code>Emial</code> vs <code>email</code></td><td>0.6</td></tr>
+<tr><td>No match</td><td><code>ARR</code> vs <code>mrr</code>, <code>Mailing address</code> vs <code>mail</code></td><td>null</td></tr>
+</table>
+<p>Comparing without spaces is what makes <code>E-mail</code>, <code>eMail</code> and <code>Email</code> equal. The "contains" score falls as the header gets longer than the name, because every extra word is a chance that the column means something else. The typo rule needs five letters because short names are one letter apart by accident: <code>ARR</code> and <code>MRR</code> are different numbers, <code>Mail</code> and <code>Main</code> different columns.</p>
+
+<h2>Step 3: describe your fields</h2>
+<p>Each field has a key, a label, and the other names users give it. Two optional settings use the values: <code>looksLike</code> tests one cell, and <code>findByValues</code> lets a column with no matching name be picked by its values alone.</p>
+{{code:MAP_FIELDS}}
+<p>Set <code>findByValues</code> only where values are distinctive. Almost every cell that passes the email test is an email address. A column of numbers could be revenue, a count or an ID, so <code>mrr</code> uses its test only to reject a match: a column called <code>MRR</code> that contains <code>n/a</code> and <code>free</code> is not used.</p>
+<p>The alias list is where you put your users' vocabulary. Start with the names in this post, then add the headers your users map by hand (step 5 shows how to keep them). One-word aliases such as <code>name</code> match many headers: <code>File name</code> and <code>Company name</code> both contain it. That is why a match below 0.95 is flagged unless the values confirm it (step 4); here <code>Company name</code> goes to the company field because its exact alias scores 1.</p>
+
+<h2>Step 4: assign each column to at most one field</h2>
+<p><code>mapColumns</code> takes the header row, your fields, and optionally sample values for each column and the choices users made before. It returns the match for each field, the columns it did not use with a reason, the required fields it could not fill, and an overall <code>sure</code>.</p>
+{{code:MAP_COLUMNS}}
+<p>It works in three passes:</p>
+<ol>
+<li><strong>Collect pairs.</strong> For each field and column, keep the best name score of 0.6 or more. If fewer than half of the sample values pass <code>looksLike</code>, drop the pair; if fewer than 9 in 10 pass, keep it with a doubt; if 9 in 10 or more pass, the values confirm it. Blank cells are not counted.</li>
+<li><strong>Assign the best pairs first.</strong> Sorting by score means <code>Email</code> (1) wins over <code>Email opt-in</code> (0.63), whichever comes first in the file. A match is not sure when its name score is below 0.95 and no values confirm it, or when another free column or field scores within 0.1 of it. So <code>Primary email</code> is a guess until its values look like email addresses. That catches two email columns, and <code>First name</code> next to <code>Last name</code> when you only have a full-name field. So <code>Email</code> next to <code>E-mail</code> (both 1) is a guess. A second match more than 0.1 weaker, such as <code>Work email</code> (0.7) next to <code>Email</code>, is left unused, and it still makes the overall result unsure, so its data is not dropped without the user seeing it.</li>
+<li><strong>Use values for fields still empty.</strong> For fields with <code>findByValues</code>, a column is picked only if it is the single unused column where 9 in 10 values pass. Two such columns (<code>Contact</code> and <code>Backup contact</code>) leave the field empty: there is no way to tell which one the user means.</li>
+</ol>
+<p>The overall result is sure only when every required field is filled, every match is sure, no field was left empty after a column's name matched it, and no unused column matches a filled field. With the fields from step 3, our tests give these results (<code>?</code> marks a match with <code>sure: false</code>):</p>
+<table>
+<tr><th>Headers (values checked)</th><th>Result</th><th>result.sure</th></tr>
+<tr><td><code>Customer name</code>, <code>Email address</code>, <code>Organisation</code>, <code>Monthly revenue</code></td><td>all four mapped</td><td>true</td></tr>
+<tr><td><code>Ｎａｍｅ</code>, <code>E-Mail-Adresse</code> with a byte order mark, <code>Téléphone</code></td><td>all three mapped</td><td>true</td></tr>
+<tr><td><code>名前</code>, <code>ﾒｰﾙｱﾄﾞﾚｽ</code>, <code>電話番号</code></td><td>all three mapped</td><td>true</td></tr>
+<tr><td><code>Name</code>, <code>Primary email</code>, <code>Phone number (mobile)</code></td><td>email → <code>Primary email</code>?; phone → <code>Phone number (mobile)</code>?</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Primary email</code> (emails)</td><td>both mapped</td><td>true</td></tr>
+<tr><td><code>File name</code>, <code>Email verified</code></td><td>name → <code>File name</code>?; email → <code>Email verified</code>?</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Name</code>, <code>Email</code></td><td>name → first <code>Name</code>?; second unused</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Email</code>, <code>Work email</code></td><td>email → <code>Email</code>; <code>Work email</code> unused</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Email</code>, <code>E-mail</code></td><td>email → <code>Email</code>?; <code>E-mail</code> unused</td><td>false</td></tr>
+<tr><td><code>First name</code>, <code>Last name</code>, <code>Email</code></td><td>name → <code>First name</code>?</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Emial</code>, <code>ARR</code></td><td>email → <code>Emial</code>?; <code>ARR</code> unused</td><td>false</td></tr>
+<tr><td><code>Company name</code>, <code>Email</code></td><td>company mapped; name missing</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Mailing address</code></td><td>email missing</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Email opt-in</code> (no values)</td><td>email → <code>Email opt-in</code>?</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Email opt-in</code> (yes)</td><td>email missing: values do not look like email</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Email</code>, <code>Email opt-in</code> (yes)</td><td>email → <code>Email</code></td><td>true</td></tr>
+<tr><td><code>Name</code>, <code>Contact</code> (emails)</td><td>email → <code>Contact</code>?, by its values</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Contact</code>, <code>Backup contact</code> (emails in both)</td><td>email missing</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Email</code>, <code>MRR</code> (n/a, free)</td><td><code>MRR</code> unused</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>顧客メールアドレス</code></td><td>email missing</td><td>false</td></tr>
+</table>
+<p>The last row is a limit, not a choice: Japanese has no spaces between words, so "contains" cannot see <code>メールアドレス</code> inside <code>顧客メールアドレス</code>. Add such headers as aliases.</p>
+
+<h2>Step 5: show the mapping screen, then remember the answer</h2>
+<p>Your parser gives you rows; the header row comes from your own detection (see <a href="../detect-header-row-spreadsheet-javascript/">detecting the header row</a>). The value checks use the first 50 data rows: a default we chose so that a few odd cells do not decide, while large files stay fast. <code>applyMapping</code> then turns rows into records keyed by your field names, skipping rows whose mapped cells are all blank:</p>
+{{code:MAP_USE}}
+<p>When <code>result.sure</code> is true, import without asking. Otherwise show one line per field with the chosen column preselected, and put the <code>doubts</code> and the <code>unmatched</code> reasons next to it, for example <code>column C matches too</code> or <code>matched by name, but only 0 of 2 values look like Email</code>. List <code>missing</code> required fields first. Show <code>unmatched</code> even when the result is sure: a column whose name matches no field (<code>Status</code>, say) does not make the result unsure, and it is not imported.</p>
+<p>After the user confirms, store their choices so the same export maps by itself next time:</p>
+{{code:MAP_REMEMBER}}
+<p>Pass the stored object back as <code>remembered</code>. It is keyed by the normalized header (blank headers are skipped), so <code>Kontakt</code> chosen once also matches <code> KONTAKT </code> later, and it is plain JSON. A remembered choice is still rejected when the values contradict it.</p>
+<p>Keep one object per customer in your database: it stores every confirmed column, and two customers can use <code>Contact</code> for different fields. <code>localStorage</code> works for a single browser.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Meaning without shared words.</strong> <code>Revenue per month</code> does not match <code>monthly revenue</code>, and <code>Kunde</code> does not match <code>customer</code>. Aliases or remembered choices handle these; matching by meaning needs a synonym list or a language model.</li>
+<li><strong>One field from several columns, or several fields from one.</strong> Joining <code>First name</code> and <code>Last name</code>, or splitting <code>Yui Tanaka &lt;yui@example.jp&gt;</code>, is a transform after mapping.</li>
+<li><strong>Headers over two rows</strong>, such as <code>Billing</code> above <code>Email</code>. Join the two rows into one header first.</li>
+<li><strong>Japanese or Chinese headers with extra words</strong>, as in the table above.</li>
+<li><strong>Thorough value checks.</strong> <code>looksLikeNumber</code> rejects <code>12.3%</code>, and there is no check for phone numbers, so <code>Phone</code> and <code>Mobile</code> columns are told apart by name only. Write checks for the formats your fields accept.</li>
+<li><strong>Parsing the values.</strong> The checks here only decide whether a column fits. Reading the numbers and dates is covered in our posts on <a href="../parse-european-number-formats-javascript/">European number formats</a> and <a href="../read-excel-dates-javascript-sheetjs/">Excel dates</a>.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer, and mapping columns to your fields is planned for it. The demo on our homepage does the steps before mapping: it finds the header row and reads each column's type, such as email, date or number, from its name and values. It runs in your browser: drop in a file and nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. Column mapping is not in SheetSift yet; you are free to use the functions in this post in your own code.</p>

@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Map CSV and Excel columns to your fields in JavaScript | SheetSift</title>
+<meta name="description" content="Match headers like E-mail, Email address and メール to one field without AI. Tested JavaScript that checks the values too and flags uncertain matches.">
+<link rel="canonical" href="https://shoheitaro003.github.io/sheetsift/blog/map-spreadsheet-columns-to-fields-javascript/">
+<meta property="og:title" content="Map CSV and Excel columns to your fields in JavaScript | SheetSift">
+<meta property="og:description" content="Match headers like E-mail, Email address and メール to one field without AI. Tested JavaScript that checks the values too and flags uncertain matches.">
+<meta property="og:url" content="https://shoheitaro003.github.io/sheetsift/blog/map-spreadsheet-columns-to-fields-javascript/">
+<meta property="og:site_name" content="SheetSift">
+<meta name="twitter:card" content="summary">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400&display=swap">
+<link rel="stylesheet" href="../../blog.css">
+<meta property="og:type" content="article">
+<meta property="article:published_time" content="2026-11-12">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "Map CSV and Excel columns to your fields in JavaScript", "description": "Match headers like E-mail, Email address and \u30e1\u30fc\u30eb to one field without AI. Tested JavaScript that checks the values too and flags uncertain matches.", "datePublished": "2026-11-12", "dateModified": "2026-11-12", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/map-spreadsheet-columns-to-fields-javascript/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="logo" href="../../"><svg width="24" height="24" viewBox="0 0 26 26" aria-hidden="true"><rect x="1" y="1" width="24" height="24" rx="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M1 9h24M9 9v16" stroke="currentColor" stroke-width="2"/><rect x="11" y="12" width="12" height="4" fill="var(--mark)"/></svg> SheetSift</a>
+  <nav class="nav"><a href="../../blog/">Blog</a><a class="btn" href="../../#try">Try the demo</a></nav>
+</div></header>
+<main><div class="wrap">
+<article>
+<h1>Map CSV and Excel columns to your fields in JavaScript</h1>
+<p class="meta"><time datetime="2026-11-12">2026-11-12</time></p>
+<p>Your importer expects a column called <code>email</code>. The customer's file says <code>E-mail</code>, the next one <code>Email address</code>, and a German one <code>E-Mail-Adresse</code>. A list of exact names misses most of them; a substring check maps <code>Email opt-in</code>, a column of yes/no values, to your email field.</p>
+<p>By the end of this post you will have <code>mapColumns(headers, fields)</code>, about 220 lines with no dependencies, shown in five parts: paste them in order into one module. It matches headers to your fields by name, uses a few sample values to reject wrong matches, and returns <code>sure: false</code> with a reason for every guess, so your mapping screen only asks the user when it has to. Every function, and every result quoted below, is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22.</p>
+
+<h2>Why a list of names and a substring check both fail</h2>
+<p>This first block only shows the problem; it is not part of the solution. (<code>\u00A0</code> is written as an escape so you can see it; in a real file it is an invisible character.)</p>
+<pre><code>const EMAIL_NAMES = [&quot;email&quot;, &quot;e-mail&quot;, &quot;email address&quot;, &quot;mail&quot;];
+const exactMatch = (header) =&gt; EMAIL_NAMES.includes(header.trim().toLowerCase());
+exactMatch(&quot;E-mail&quot;);             // true
+exactMatch(&quot;E-Mail-Adresse&quot;);     // false
+exactMatch(&quot;Email\u00A0address&quot;);  // false
+exactMatch(&quot;Ｅｍａｉｌ&quot;);         // false
+
+const looseMatch = (header) =&gt; header.toLowerCase().includes(&quot;mail&quot;);
+looseMatch(&quot;Mailing address&quot;);    // true
+looseMatch(&quot;Email opt-in&quot;);       // true</code></pre>
+<p>The exact list fails on spelling it did not foresee, on a no-break space (U+00A0) between the words, and on full-width letters. <code>trim()</code> only helps at the ends: it does remove a byte order mark and no-break spaces there. The substring check finds too much: <code>Mailing address</code> is a postal address.</p>
+<p>The fix has three parts: clean both names the same way before comparing, compare whole words instead of substrings, and look at the values before trusting a name.</p>
+
+<h2>Step 1: normalize the header</h2>
+<p>Normalizing means turning every spelling of a name into one standard form. This function runs on the header and on every name you compare it with:</p>
+<pre><code>function normalizeHeader(text) {
+  return String(text ?? &quot;&quot;)
+    // Ｅｍａｉｌ -&gt; Email, ﾒｰﾙ -&gt; メール, no-break space -&gt; space
+    .normalize(&quot;NFKC&quot;)
+    // zero-width spaces and byte order marks
+    .replace(/\p{Cf}/gu, &quot;&quot;)
+    // signupDate -&gt; signup Date
+    .replace(/(\p{Ll})(\p{Lu})/gu, &quot;$1 $2&quot;)
+    .toLowerCase()
+    // é -&gt; e, but the mark in Japanese ド stays
+    .normalize(&quot;NFD&quot;)
+    .replace(/(\p{Script=Latin})\p{M}+/gu, &quot;$1&quot;)
+    .normalize(&quot;NFC&quot;)
+    // punctuation, underscores and runs of spaces -&gt; one space
+    .replace(/[^\p{L}\p{N}]+/gu, &quot; &quot;)
+    .trim();
+}
+
+// Plurals count as the same word. &quot;address&quot; is left alone.
+function stem(word) {
+  if (/(ss|x|ch|sh)es$/.test(word)) return word.slice(0, -2); // addresses
+  if (word.length &gt; 3 &amp;&amp; /[^s]s$/.test(word)) return word.slice(0, -1); // plans
+  return word;
+}
+const words = (text) =&gt; normalizeHeader(text).split(&quot; &quot;).filter(Boolean).map(stem);
+const headerKey = (text) =&gt; words(text).join(&quot; &quot;);</code></pre>
+<p>Each line handles one kind of difference:</p>
+<ul>
+<li><code>normalize("NFKC")</code> is the Unicode compatibility form. It turns full-width <code>Ｅｍａｉｌ</code> into <code>Email</code>, half-width katakana <code>ﾒｰﾙｱﾄﾞﾚｽ</code> into <code>メールアドレス</code>, and a no-break space into a normal space.</li>
+<li><code>\p{Cf}</code> matches format characters: zero-width spaces and byte order marks. They are invisible and survive NFKC, so they are removed. (A byte order mark is U+FEFF at the very start of a file; if your parser keeps it, it becomes part of the first header.)</li>
+<li>The camelCase split runs before lowercasing, so <code>signupDate</code>, <code>sign_up_date</code> and <code>SIGNUP DATE</code> end up as words.</li>
+<li>Accents are removed only from Latin letters, so <code>Téléphone</code> becomes <code>telephone</code>. Removing every combining mark would also strip the voicing mark from Japanese <code>ド</code>.</li>
+<li>Everything that is not a letter or a digit becomes a space: <code>MRR ($)</code> becomes <code>mrr</code>, and <code>E-mail</code> becomes <code>e mail</code>.</li>
+</ul>
+<p><code>words()</code> also removes a plural ending, so <code>Plans</code> matches <code>plan</code> and <code>Addresses</code> matches <code>address</code>. The rule is crude (<code>status</code> becomes <code>statu</code>), but these keys are only compared, never shown, and both sides get the same treatment. What to watch is two names of different fields that become one, such as <code>new</code> and <code>news</code>. Our tests check the names in step 3; when you add aliases, check that <code>headerKey</code> gives no duplicates across fields.</p>
+
+<h2>Step 2: compare a header with one name</h2>
+<p><code>compareNames</code> returns a score from 0.6 to 1, or <code>null</code> when the names do not match:</p>
+<pre><code>// True when b is a with one letter changed, added or removed,
+// or with two neighbouring letters swapped.
+function oneEditApart(a, b) {
+  if (a === b || Math.abs(a.length - b.length) &gt; 1) return false;
+  let i = 0;
+  while (a[i] === b[i]) i++; // length of the common start
+  if (a.length === b.length) {
+    return a.slice(i + 1) === b.slice(i + 1) ||
+      (a[i] === b[i + 1] &amp;&amp; a[i + 1] === b[i] &amp;&amp; a.slice(i + 2) === b.slice(i + 2));
+  }
+  const [longer, shorter] = a.length &gt; b.length ? [a, b] : [b, a];
+  return longer.slice(i + 1) === shorter.slice(i);
+}
+
+function compareNames(header, name) {
+  const h = words(header), n = words(name);
+  if (!h.length || !n.length) return null;
+  const hJoined = h.join(&quot;&quot;), nJoined = n.join(&quot;&quot;);
+  if (hJoined === nJoined) return { score: 1, why: `same as &quot;${name}&quot;` };
+  const contained = n.every((w) =&gt; h.includes(w));
+  if (contained &amp;&amp; h.length === n.length) {
+    return { score: 0.95, why: `same words as &quot;${name}&quot;` };
+  }
+  if (contained) {
+    return { score: 0.5 + 0.4 * (n.length / h.length), why: `contains &quot;${name}&quot;` };
+  }
+  const longEnough = Math.min(hJoined.length, nJoined.length) &gt;= 5;
+  if (longEnough &amp;&amp; oneEditApart(hJoined, nJoined)) {
+    return { score: 0.6, why: `spelled like &quot;${name}&quot;` };
+  }
+  return null;
+}</code></pre>
+<table>
+<tr><th>Rule</th><th>Example (header vs name)</th><th>Score</th></tr>
+<tr><td>Same letters once spaces are removed</td><td><code>E-mail</code> vs <code>email</code></td><td>1</td></tr>
+<tr><td>Same words in another order</td><td><code>Address email</code> vs <code>email address</code></td><td>0.95</td></tr>
+<tr><td>Header contains every word of the name</td><td><code>Primary email</code> vs <code>email</code></td><td>0.7</td></tr>
+<tr><td>Same rule, longer header</td><td><code>Email opt-in</code> vs <code>email</code></td><td>0.63</td></tr>
+<tr><td>One typo, both at least 5 letters</td><td><code>Emial</code> vs <code>email</code></td><td>0.6</td></tr>
+<tr><td>No match</td><td><code>ARR</code> vs <code>mrr</code>, <code>Mailing address</code> vs <code>mail</code></td><td>null</td></tr>
+</table>
+<p>Comparing without spaces is what makes <code>E-mail</code>, <code>eMail</code> and <code>Email</code> equal. The "contains" score falls as the header gets longer than the name, because every extra word is a chance that the column means something else. The typo rule needs five letters because short names are one letter apart by accident: <code>ARR</code> and <code>MRR</code> are different numbers, <code>Mail</code> and <code>Main</code> different columns.</p>
+
+<h2>Step 3: describe your fields</h2>
+<p>Each field has a key, a label, and the other names users give it. Two optional settings use the values: <code>looksLike</code> tests one cell, and <code>findByValues</code> lets a column with no matching name be picked by its values alone.</p>
+<pre><code>const looksLikeEmail = (v) =&gt; /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v).trim());
+const looksLikeNumber = (v) =&gt;
+  typeof v === &quot;number&quot; || /^[-+(]?[$€£¥]?\s?\d[\d.,\s&#x27;]*\)?$/.test(String(v).trim());
+
+const FIELDS = [
+  { key: &quot;name&quot;, label: &quot;Full name&quot;, required: true,
+    aliases: [&quot;name&quot;, &quot;customer name&quot;, &quot;contact name&quot;, &quot;氏名&quot;, &quot;名前&quot;] },
+  { key: &quot;email&quot;, label: &quot;Email&quot;, required: true,
+    looksLike: looksLikeEmail, findByValues: true,
+    aliases: [&quot;email address&quot;, &quot;mail&quot;, &quot;e-mail address&quot;, &quot;email adresse&quot;,
+              &quot;メールアドレス&quot;, &quot;メール&quot;] },
+  { key: &quot;company&quot;, label: &quot;Company&quot;,
+    aliases: [&quot;company name&quot;, &quot;organization&quot;, &quot;organisation&quot;, &quot;会社名&quot;] },
+  { key: &quot;phone&quot;, label: &quot;Phone&quot;,
+    aliases: [&quot;phone number&quot;, &quot;telephone&quot;, &quot;tel&quot;, &quot;mobile&quot;, &quot;電話番号&quot;] },
+  { key: &quot;mrr&quot;, label: &quot;MRR&quot;, looksLike: looksLikeNumber,
+    aliases: [&quot;monthly revenue&quot;, &quot;monthly recurring revenue&quot;] },
+];</code></pre>
+<p>Set <code>findByValues</code> only where values are distinctive. Almost every cell that passes the email test is an email address. A column of numbers could be revenue, a count or an ID, so <code>mrr</code> uses its test only to reject a match: a column called <code>MRR</code> that contains <code>n/a</code> and <code>free</code> is not used.</p>
+<p>The alias list is where you put your users' vocabulary. Start with the names in this post, then add the headers your users map by hand (step 5 shows how to keep them). One-word aliases such as <code>name</code> match many headers: <code>File name</code> and <code>Company name</code> both contain it. That is why a match below 0.95 is flagged unless the values confirm it (step 4); here <code>Company name</code> goes to the company field because its exact alias scores 1.</p>
+
+<h2>Step 4: assign each column to at most one field</h2>
+<p><code>mapColumns</code> takes the header row, your fields, and optionally sample values for each column and the choices users made before. It returns the match for each field, the columns it did not use with a reason, the required fields it could not fill, and an overall <code>sure</code>.</p>
+<pre><code>const MIN_SCORE = 0.6;   // weaker name matches are ignored
+const SURE_SCORE = 0.95; // weaker name matches need values to confirm them
+const CLOSE = 0.1;       // a rival this close makes the choice a guess
+
+// 0 -&gt; &quot;A&quot;, 27 -&gt; &quot;AB&quot;
+function columnLetter(i) {
+  const prefix = i &gt;= 26 ? columnLetter(Math.floor(i / 26) - 1) : &quot;&quot;;
+  return prefix + String.fromCharCode(65 + (i % 26));
+}
+
+// How many sample values pass the field&#x27;s check (null: nothing to check).
+function valueShare(field, values = []) {
+  const filled = values.filter((v) =&gt; v != null &amp;&amp; String(v).trim() !== &quot;&quot;);
+  if (!field.looksLike || !filled.length) return null;
+  const pass = filled.filter(field.looksLike).length;
+  const text = `${pass} of ${filled.length} values look like ${field.label}`;
+  return { pass, of: filled.length, text };
+}
+
+function bestNameMatch(header, field, remembered) {
+  const key = headerKey(header);
+  if (key &amp;&amp; remembered[key] === field.key) {
+    return { score: 1, why: &quot;chosen by a user before&quot; };
+  }
+  let best = null;
+  for (const name of [field.key, field.label, ...(field.aliases ?? [])]) {
+    const m = compareNames(header, name);
+    if (m &amp;&amp; (!best || m.score &gt; best.score)) best = m;
+  }
+  return best;
+}
+
+function mapColumns(headers, fields, { samples = [], remembered = {} } = {}) {
+  // Columns that matched a field but were not used: column -&gt; { key, why, second }.
+  // second: a better column already fills that field.
+  const notUsed = new Map();
+  const note = (column, key, why, second = false) =&gt; {
+    if (!notUsed.has(column)) notUsed.set(column, { key, why, second });
+  };
+
+  // 1. Pairs whose names match and whose values do not contradict them.
+  const pairs = [];
+  fields.forEach((field, f) =&gt; headers.forEach((header, column) =&gt; {
+    const best = bestNameMatch(header, field, remembered);
+    if (!best || best.score &lt; MIN_SCORE) return;
+    const share = valueShare(field, samples[column]);
+    if (share &amp;&amp; share.pass / share.of &lt; 0.5) {
+      return note(column, field.key, `matched by name, but only ${share.text}`);
+    }
+    const confirmed = share &amp;&amp; share.pass / share.of &gt;= 0.9;
+    const doubt = share &amp;&amp; !confirmed &amp;&amp; `only ${share.text}`;
+    pairs.push({ f, column, ...best, confirmed, doubt });
+  }));
+
+  // 2. Best pairs first; each field and each column is used once.
+  pairs.sort((a, b) =&gt; b.score - a.score || a.column - b.column || a.f - b.f);
+  const byField = Object.fromEntries(fields.map((field) =&gt; [field.key, null]));
+  const usedBy = new Map(); // column -&gt; field key
+  for (const p of pairs) {
+    const field = fields[p.f], taken = byField[field.key];
+    if (usedBy.has(p.column)) continue;
+    if (taken) {
+      const where = columnLetter(taken.column);
+      const why = `also matches ${field.label}, which column ${where} already fills`;
+      note(p.column, field.key, why, true);
+      continue;
+    }
+    // A rival scores almost as well and could still be used: another free column
+    // for this field, or another empty field for this column.
+    const rival = pairs.find((q) =&gt; q !== p &amp;&amp; q.score &gt;= p.score - CLOSE &amp;&amp; (
+      (q.f === p.f &amp;&amp; !usedBy.has(q.column)) ||
+      (q.column === p.column &amp;&amp; !byField[fields[q.f].key])));
+    const doubts = [];
+    if (p.score &lt; SURE_SCORE &amp;&amp; !p.confirmed) doubts.push(&quot;weak name match&quot;);
+    const rivalColumn = rival &amp;&amp; columnLetter(rival.column);
+    if (rival?.f === p.f) doubts.push(`column ${rivalColumn} matches too`);
+    else if (rival) doubts.push(`could also be ${fields[rival.f].label}`);
+    if (p.doubt) doubts.push(p.doubt);
+    const header = headers[p.column], sure = !doubts.length;
+    byField[field.key] = { column: p.column, header, why: p.why, sure, doubts };
+    usedBy.set(p.column, field.key);
+  }
+
+  // 3. Fields still empty: the one unused column whose values look right (9 in 10).
+  for (const field of fields) {
+    if (byField[field.key] || !field.findByValues) continue;
+    const fits = headers.map((_, column) =&gt; column).filter((column) =&gt; {
+      const share = !usedBy.has(column) &amp;&amp; valueShare(field, samples[column]);
+      return share &amp;&amp; share.pass / share.of &gt;= 0.9;
+    });
+    if (fits.length !== 1) {
+      const why = `values look like ${field.label}, but so do other columns`;
+      fits.forEach((column) =&gt; note(column, field.key, why));
+      continue;
+    }
+    const [column] = fits, header = headers[column];
+    const why = `values look like ${field.label}`;
+    const doubts = [&quot;matched by its values, not its name&quot;];
+    byField[field.key] = { column, header, why, sure: false, doubts };
+    usedBy.set(column, field.key);
+  }
+
+  const unmatched = headers
+    .map((header, column) =&gt; ({ column, header }))
+    .filter(({ column }) =&gt; !usedBy.has(column))
+    .map((c) =&gt; ({ ...c, why: notUsed.get(c.column)?.why ??
+      (normalizeHeader(c.header) ? &quot;no field has this name&quot; : &quot;empty header&quot;) }));
+  const missing = fields.filter((f) =&gt; f.required &amp;&amp; !byField[f.key])
+    .map((f) =&gt; f.key);
+  // A person should look when a field stayed empty although a column&#x27;s name
+  // matched it, or when a second column matches a filled field (Email, Email 2).
+  const needsLook = unmatched.some(({ column }) =&gt; {
+    const n = notUsed.get(column);
+    return n &amp;&amp; (n.second || !byField[n.key]);
+  });
+  const allSure = Object.values(byField).every((m) =&gt; !m || m.sure);
+  const sure = !missing.length &amp;&amp; !needsLook &amp;&amp; allSure;
+  return { byField, unmatched, missing, sure };
+}</code></pre>
+<p>It works in three passes:</p>
+<ol>
+<li><strong>Collect pairs.</strong> For each field and column, keep the best name score of 0.6 or more. If fewer than half of the sample values pass <code>looksLike</code>, drop the pair; if fewer than 9 in 10 pass, keep it with a doubt; if 9 in 10 or more pass, the values confirm it. Blank cells are not counted.</li>
+<li><strong>Assign the best pairs first.</strong> Sorting by score means <code>Email</code> (1) wins over <code>Email opt-in</code> (0.63), whichever comes first in the file. A match is not sure when its name score is below 0.95 and no values confirm it, or when another free column or field scores within 0.1 of it. So <code>Primary email</code> is a guess until its values look like email addresses. That catches two email columns, and <code>First name</code> next to <code>Last name</code> when you only have a full-name field. So <code>Email</code> next to <code>E-mail</code> (both 1) is a guess. A second match more than 0.1 weaker, such as <code>Work email</code> (0.7) next to <code>Email</code>, is left unused, and it still makes the overall result unsure, so its data is not dropped without the user seeing it.</li>
+<li><strong>Use values for fields still empty.</strong> For fields with <code>findByValues</code>, a column is picked only if it is the single unused column where 9 in 10 values pass. Two such columns (<code>Contact</code> and <code>Backup contact</code>) leave the field empty: there is no way to tell which one the user means.</li>
+</ol>
+<p>The overall result is sure only when every required field is filled, every match is sure, no field was left empty after a column's name matched it, and no unused column matches a filled field. With the fields from step 3, our tests give these results (<code>?</code> marks a match with <code>sure: false</code>):</p>
+<table>
+<tr><th>Headers (values checked)</th><th>Result</th><th>result.sure</th></tr>
+<tr><td><code>Customer name</code>, <code>Email address</code>, <code>Organisation</code>, <code>Monthly revenue</code></td><td>all four mapped</td><td>true</td></tr>
+<tr><td><code>Ｎａｍｅ</code>, <code>E-Mail-Adresse</code> with a byte order mark, <code>Téléphone</code></td><td>all three mapped</td><td>true</td></tr>
+<tr><td><code>名前</code>, <code>ﾒｰﾙｱﾄﾞﾚｽ</code>, <code>電話番号</code></td><td>all three mapped</td><td>true</td></tr>
+<tr><td><code>Name</code>, <code>Primary email</code>, <code>Phone number (mobile)</code></td><td>email → <code>Primary email</code>?; phone → <code>Phone number (mobile)</code>?</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Primary email</code> (emails)</td><td>both mapped</td><td>true</td></tr>
+<tr><td><code>File name</code>, <code>Email verified</code></td><td>name → <code>File name</code>?; email → <code>Email verified</code>?</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Name</code>, <code>Email</code></td><td>name → first <code>Name</code>?; second unused</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Email</code>, <code>Work email</code></td><td>email → <code>Email</code>; <code>Work email</code> unused</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Email</code>, <code>E-mail</code></td><td>email → <code>Email</code>?; <code>E-mail</code> unused</td><td>false</td></tr>
+<tr><td><code>First name</code>, <code>Last name</code>, <code>Email</code></td><td>name → <code>First name</code>?</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Emial</code>, <code>ARR</code></td><td>email → <code>Emial</code>?; <code>ARR</code> unused</td><td>false</td></tr>
+<tr><td><code>Company name</code>, <code>Email</code></td><td>company mapped; name missing</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Mailing address</code></td><td>email missing</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Email opt-in</code> (no values)</td><td>email → <code>Email opt-in</code>?</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Email opt-in</code> (yes)</td><td>email missing: values do not look like email</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Email</code>, <code>Email opt-in</code> (yes)</td><td>email → <code>Email</code></td><td>true</td></tr>
+<tr><td><code>Name</code>, <code>Contact</code> (emails)</td><td>email → <code>Contact</code>?, by its values</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Contact</code>, <code>Backup contact</code> (emails in both)</td><td>email missing</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>Email</code>, <code>MRR</code> (n/a, free)</td><td><code>MRR</code> unused</td><td>false</td></tr>
+<tr><td><code>Name</code>, <code>顧客メールアドレス</code></td><td>email missing</td><td>false</td></tr>
+</table>
+<p>The last row is a limit, not a choice: Japanese has no spaces between words, so "contains" cannot see <code>メールアドレス</code> inside <code>顧客メールアドレス</code>. Add such headers as aliases.</p>
+
+<h2>Step 5: show the mapping screen, then remember the answer</h2>
+<p>Your parser gives you rows; the header row comes from your own detection (see <a href="../detect-header-row-spreadsheet-javascript/">detecting the header row</a>). The value checks use the first 50 data rows: a default we chose so that a few odd cells do not decide, while large files stay fast. <code>applyMapping</code> then turns rows into records keyed by your field names, skipping rows whose mapped cells are all blank:</p>
+<pre><code>// rows: arrays of cells from your CSV or Excel parser.
+// headerRow: the index of the header row.
+function suggestMapping(rows, headerRow, remembered = {}) {
+  const headers = rows[headerRow] ?? [];
+  // 50 data rows are enough to check the values.
+  const firstRows = rows.slice(headerRow + 1, headerRow + 51);
+  const samples = headers.map((_, column) =&gt; firstRows.map((row) =&gt; row?.[column]));
+  return mapColumns(headers, FIELDS, { samples, remembered });
+}
+
+// Rows whose mapped cells are all blank are skipped.
+function applyMapping(rows, headerRow, byField) {
+  const used = Object.entries(byField).filter(([, match]) =&gt; match);
+  const cell = (row, match) =&gt; row?.[match.column] ?? &quot;&quot;;
+  const toRecord = (row) =&gt;
+    Object.fromEntries(used.map(([key, match]) =&gt; [key, cell(row, match)]));
+  return rows.slice(headerRow + 1)
+    .filter((row) =&gt; used.some(([, match]) =&gt; String(cell(row, match)).trim() !== &quot;&quot;))
+    .map(toRecord);
+}</code></pre>
+<p>When <code>result.sure</code> is true, import without asking. Otherwise show one line per field with the chosen column preselected, and put the <code>doubts</code> and the <code>unmatched</code> reasons next to it, for example <code>column C matches too</code> or <code>matched by name, but only 0 of 2 values look like Email</code>. List <code>missing</code> required fields first. Show <code>unmatched</code> even when the result is sure: a column whose name matches no field (<code>Status</code>, say) does not make the result unsure, and it is not imported.</p>
+<p>After the user confirms, store their choices so the same export maps by itself next time:</p>
+<pre><code>// After the user confirms the mapping screen, store their choices
+// (in your database or in localStorage).
+function rememberMapping(remembered, headers, byField) {
+  for (const [key, match] of Object.entries(byField)) {
+    const header = match &amp;&amp; headerKey(headers[match.column]);
+    if (header) remembered[header] = key; // blank headers are not remembered
+  }
+  return remembered;
+}</code></pre>
+<p>Pass the stored object back as <code>remembered</code>. It is keyed by the normalized header (blank headers are skipped), so <code>Kontakt</code> chosen once also matches <code> KONTAKT </code> later, and it is plain JSON. A remembered choice is still rejected when the values contradict it.</p>
+<p>Keep one object per customer in your database: it stores every confirmed column, and two customers can use <code>Contact</code> for different fields. <code>localStorage</code> works for a single browser.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Meaning without shared words.</strong> <code>Revenue per month</code> does not match <code>monthly revenue</code>, and <code>Kunde</code> does not match <code>customer</code>. Aliases or remembered choices handle these; matching by meaning needs a synonym list or a language model.</li>
+<li><strong>One field from several columns, or several fields from one.</strong> Joining <code>First name</code> and <code>Last name</code>, or splitting <code>Yui Tanaka &lt;yui@example.jp&gt;</code>, is a transform after mapping.</li>
+<li><strong>Headers over two rows</strong>, such as <code>Billing</code> above <code>Email</code>. Join the two rows into one header first.</li>
+<li><strong>Japanese or Chinese headers with extra words</strong>, as in the table above.</li>
+<li><strong>Thorough value checks.</strong> <code>looksLikeNumber</code> rejects <code>12.3%</code>, and there is no check for phone numbers, so <code>Phone</code> and <code>Mobile</code> columns are told apart by name only. Write checks for the formats your fields accept.</li>
+<li><strong>Parsing the values.</strong> The checks here only decide whether a column fits. Reading the numbers and dates is covered in our posts on <a href="../parse-european-number-formats-javascript/">European number formats</a> and <a href="../read-excel-dates-javascript-sheetjs/">Excel dates</a>.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer, and mapping columns to your fields is planned for it. The demo on our homepage does the steps before mapping: it finds the header row and reads each column's type, such as email, date or number, from its name and values. It runs in your browser: drop in a file and nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. Column mapping is not in SheetSift yet; you are free to use the functions in this post in your own code.</p>
+
+</article>
+</div></main>
+<footer><div class="wrap"><span>SheetSift · a drop-in importer for messy Excel and CSV files</span><a href="../../#waitlist">Join the waitlist</a></div>
+<div class="wrap"><small>Visits are counted with <a href="https://www.goatcounter.com/">GoatCounter</a>, which does not track you across sites.</small></div></footer>
+<script>
+// Page view counter (GoatCounter). Only on the public site, so local runs and tests are never counted.
+if (location.hostname === "shoheitaro003.github.io") {
+  var gc = document.createElement("script");
+  gc.async = true; gc.src = "https://gc.zgo.at/count.js";
+  gc.setAttribute("data-goatcounter", "https://sheetsift.goatcounter.com/count");
+  document.body.appendChild(gc);
+}
+</script>
+</body>
+</html>

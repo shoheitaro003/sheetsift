@@ -1268,3 +1268,382 @@ ok("dec: readCsvText on a file", async () => {
   assert.deepStrictEqual(got.options.map((o) => o.encoding), ["shift_jis", "windows-1252"]);
   assert(got.other.startsWith("\u017d\u0081\u2013\u00bc")); // the same bytes as Windows-1252
 });
+
+// --- blog/map-spreadsheet-columns-to-fields-javascript ---
+{
+function normalizeHeader(text) {
+  return String(text ?? "")
+    // Ｅｍａｉｌ -> Email, ﾒｰﾙ -> メール, no-break space -> space
+    .normalize("NFKC")
+    // zero-width spaces and byte order marks
+    .replace(/\p{Cf}/gu, "")
+    // signupDate -> signup Date
+    .replace(/(\p{Ll})(\p{Lu})/gu, "$1 $2")
+    .toLowerCase()
+    // é -> e, but the mark in Japanese ド stays
+    .normalize("NFD")
+    .replace(/(\p{Script=Latin})\p{M}+/gu, "$1")
+    .normalize("NFC")
+    // punctuation, underscores and runs of spaces -> one space
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+// Plurals count as the same word. "address" is left alone.
+function stem(word) {
+  if (/(ss|x|ch|sh)es$/.test(word)) return word.slice(0, -2); // addresses
+  if (word.length > 3 && /[^s]s$/.test(word)) return word.slice(0, -1); // plans
+  return word;
+}
+const words = (text) => normalizeHeader(text).split(" ").filter(Boolean).map(stem);
+const headerKey = (text) => words(text).join(" ");
+
+// True when b is a with one letter changed, added or removed,
+// or with two neighbouring letters swapped.
+function oneEditApart(a, b) {
+  if (a === b || Math.abs(a.length - b.length) > 1) return false;
+  let i = 0;
+  while (a[i] === b[i]) i++; // length of the common start
+  if (a.length === b.length) {
+    return a.slice(i + 1) === b.slice(i + 1) ||
+      (a[i] === b[i + 1] && a[i + 1] === b[i] && a.slice(i + 2) === b.slice(i + 2));
+  }
+  const [longer, shorter] = a.length > b.length ? [a, b] : [b, a];
+  return longer.slice(i + 1) === shorter.slice(i);
+}
+
+function compareNames(header, name) {
+  const h = words(header), n = words(name);
+  if (!h.length || !n.length) return null;
+  const hJoined = h.join(""), nJoined = n.join("");
+  if (hJoined === nJoined) return { score: 1, why: `same as "${name}"` };
+  const contained = n.every((w) => h.includes(w));
+  if (contained && h.length === n.length) {
+    return { score: 0.95, why: `same words as "${name}"` };
+  }
+  if (contained) {
+    return { score: 0.5 + 0.4 * (n.length / h.length), why: `contains "${name}"` };
+  }
+  const longEnough = Math.min(hJoined.length, nJoined.length) >= 5;
+  if (longEnough && oneEditApart(hJoined, nJoined)) {
+    return { score: 0.6, why: `spelled like "${name}"` };
+  }
+  return null;
+}
+
+const looksLikeEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v).trim());
+const looksLikeNumber = (v) =>
+  typeof v === "number" || /^[-+(]?[$€£¥]?\s?\d[\d.,\s']*\)?$/.test(String(v).trim());
+
+const FIELDS = [
+  { key: "name", label: "Full name", required: true,
+    aliases: ["name", "customer name", "contact name", "氏名", "名前"] },
+  { key: "email", label: "Email", required: true,
+    looksLike: looksLikeEmail, findByValues: true,
+    aliases: ["email address", "mail", "e-mail address", "email adresse",
+              "メールアドレス", "メール"] },
+  { key: "company", label: "Company",
+    aliases: ["company name", "organization", "organisation", "会社名"] },
+  { key: "phone", label: "Phone",
+    aliases: ["phone number", "telephone", "tel", "mobile", "電話番号"] },
+  { key: "mrr", label: "MRR", looksLike: looksLikeNumber,
+    aliases: ["monthly revenue", "monthly recurring revenue"] },
+];
+
+const MIN_SCORE = 0.6;   // weaker name matches are ignored
+const SURE_SCORE = 0.95; // weaker name matches need values to confirm them
+const CLOSE = 0.1;       // a rival this close makes the choice a guess
+
+// 0 -> "A", 27 -> "AB"
+function columnLetter(i) {
+  const prefix = i >= 26 ? columnLetter(Math.floor(i / 26) - 1) : "";
+  return prefix + String.fromCharCode(65 + (i % 26));
+}
+
+// How many sample values pass the field's check (null: nothing to check).
+function valueShare(field, values = []) {
+  const filled = values.filter((v) => v != null && String(v).trim() !== "");
+  if (!field.looksLike || !filled.length) return null;
+  const pass = filled.filter(field.looksLike).length;
+  const text = `${pass} of ${filled.length} values look like ${field.label}`;
+  return { pass, of: filled.length, text };
+}
+
+function bestNameMatch(header, field, remembered) {
+  const key = headerKey(header);
+  if (key && remembered[key] === field.key) {
+    return { score: 1, why: "chosen by a user before" };
+  }
+  let best = null;
+  for (const name of [field.key, field.label, ...(field.aliases ?? [])]) {
+    const m = compareNames(header, name);
+    if (m && (!best || m.score > best.score)) best = m;
+  }
+  return best;
+}
+
+function mapColumns(headers, fields, { samples = [], remembered = {} } = {}) {
+  // Columns that matched a field but were not used: column -> { key, why, second }.
+  // second: a better column already fills that field.
+  const notUsed = new Map();
+  const note = (column, key, why, second = false) => {
+    if (!notUsed.has(column)) notUsed.set(column, { key, why, second });
+  };
+
+  // 1. Pairs whose names match and whose values do not contradict them.
+  const pairs = [];
+  fields.forEach((field, f) => headers.forEach((header, column) => {
+    const best = bestNameMatch(header, field, remembered);
+    if (!best || best.score < MIN_SCORE) return;
+    const share = valueShare(field, samples[column]);
+    if (share && share.pass / share.of < 0.5) {
+      return note(column, field.key, `matched by name, but only ${share.text}`);
+    }
+    const confirmed = share && share.pass / share.of >= 0.9;
+    const doubt = share && !confirmed && `only ${share.text}`;
+    pairs.push({ f, column, ...best, confirmed, doubt });
+  }));
+
+  // 2. Best pairs first; each field and each column is used once.
+  pairs.sort((a, b) => b.score - a.score || a.column - b.column || a.f - b.f);
+  const byField = Object.fromEntries(fields.map((field) => [field.key, null]));
+  const usedBy = new Map(); // column -> field key
+  for (const p of pairs) {
+    const field = fields[p.f], taken = byField[field.key];
+    if (usedBy.has(p.column)) continue;
+    if (taken) {
+      const where = columnLetter(taken.column);
+      const why = `also matches ${field.label}, which column ${where} already fills`;
+      note(p.column, field.key, why, true);
+      continue;
+    }
+    // A rival scores almost as well and could still be used: another free column
+    // for this field, or another empty field for this column.
+    const rival = pairs.find((q) => q !== p && q.score >= p.score - CLOSE && (
+      (q.f === p.f && !usedBy.has(q.column)) ||
+      (q.column === p.column && !byField[fields[q.f].key])));
+    const doubts = [];
+    if (p.score < SURE_SCORE && !p.confirmed) doubts.push("weak name match");
+    const rivalColumn = rival && columnLetter(rival.column);
+    if (rival?.f === p.f) doubts.push(`column ${rivalColumn} matches too`);
+    else if (rival) doubts.push(`could also be ${fields[rival.f].label}`);
+    if (p.doubt) doubts.push(p.doubt);
+    const header = headers[p.column], sure = !doubts.length;
+    byField[field.key] = { column: p.column, header, why: p.why, sure, doubts };
+    usedBy.set(p.column, field.key);
+  }
+
+  // 3. Fields still empty: the one unused column whose values look right (9 in 10).
+  for (const field of fields) {
+    if (byField[field.key] || !field.findByValues) continue;
+    const fits = headers.map((_, column) => column).filter((column) => {
+      const share = !usedBy.has(column) && valueShare(field, samples[column]);
+      return share && share.pass / share.of >= 0.9;
+    });
+    if (fits.length !== 1) {
+      const why = `values look like ${field.label}, but so do other columns`;
+      fits.forEach((column) => note(column, field.key, why));
+      continue;
+    }
+    const [column] = fits, header = headers[column];
+    const why = `values look like ${field.label}`;
+    const doubts = ["matched by its values, not its name"];
+    byField[field.key] = { column, header, why, sure: false, doubts };
+    usedBy.set(column, field.key);
+  }
+
+  const unmatched = headers
+    .map((header, column) => ({ column, header }))
+    .filter(({ column }) => !usedBy.has(column))
+    .map((c) => ({ ...c, why: notUsed.get(c.column)?.why ??
+      (normalizeHeader(c.header) ? "no field has this name" : "empty header") }));
+  const missing = fields.filter((f) => f.required && !byField[f.key])
+    .map((f) => f.key);
+  // A person should look when a field stayed empty although a column's name
+  // matched it, or when a second column matches a filled field (Email, Email 2).
+  const needsLook = unmatched.some(({ column }) => {
+    const n = notUsed.get(column);
+    return n && (n.second || !byField[n.key]);
+  });
+  const allSure = Object.values(byField).every((m) => !m || m.sure);
+  const sure = !missing.length && !needsLook && allSure;
+  return { byField, unmatched, missing, sure };
+}
+
+// After the user confirms the mapping screen, store their choices
+// (in your database or in localStorage).
+function rememberMapping(remembered, headers, byField) {
+  for (const [key, match] of Object.entries(byField)) {
+    const header = match && headerKey(headers[match.column]);
+    if (header) remembered[header] = key; // blank headers are not remembered
+  }
+  return remembered;
+}
+
+// rows: arrays of cells from your CSV or Excel parser.
+// headerRow: the index of the header row.
+function suggestMapping(rows, headerRow, remembered = {}) {
+  const headers = rows[headerRow] ?? [];
+  // 50 data rows are enough to check the values.
+  const firstRows = rows.slice(headerRow + 1, headerRow + 51);
+  const samples = headers.map((_, column) => firstRows.map((row) => row?.[column]));
+  return mapColumns(headers, FIELDS, { samples, remembered });
+}
+
+// Rows whose mapped cells are all blank are skipped.
+function applyMapping(rows, headerRow, byField) {
+  const used = Object.entries(byField).filter(([, match]) => match);
+  const cell = (row, match) => row?.[match.column] ?? "";
+  const toRecord = (row) =>
+    Object.fromEntries(used.map(([key, match]) => [key, cell(row, match)]));
+  return rows.slice(headerRow + 1)
+    .filter((row) => used.some(([, match]) => String(cell(row, match)).trim() !== ""))
+    .map(toRecord);
+}
+
+// Short form of a result: field -> header ("?" when not sure), plus unmatched headers, missing fields and sure.
+const summary = (r) => ({
+  mapped: Object.fromEntries(Object.entries(r.byField).filter(([, m]) => m).map(([k, m]) => [k, String(m.header) + (m.sure ? "" : "?")])),
+  unmatched: r.unmatched.map((u) => String(u.header)),
+  missing: r.missing,
+  sure: r.sure,
+});
+const run = (headers, samples) => summary(mapColumns(headers, FIELDS, { samples }));
+
+ok("map: the problem lines print what the comments say", async () => assert.strictEqual(await checkCommentedLines("const EMAIL_NAMES = [\"email\", \"e-mail\", \"email address\", \"mail\"];\nconst exactMatch = (header) => EMAIL_NAMES.includes(header.trim().toLowerCase());\nexactMatch(\"E-mail\");             // true\nexactMatch(\"E-Mail-Adresse\");     // false\nexactMatch(\"Email\\u00A0address\");  // false\nexactMatch(\"\uff25\uff4d\uff41\uff49\uff4c\");         // false\n\nconst looseMatch = (header) => header.toLowerCase().includes(\"mail\");\nlooseMatch(\"Mailing address\");    // true\nlooseMatch(\"Email opt-in\");       // true"), 6));
+ok("map: normalizeHeader", () => {
+  const cases = {
+    "E-mail": "e mail", "  E-Mail  ": "e mail", "\uFF25\uFF4D\uFF41\uFF49\uFF4C": "email", "\uFF25\uFF0D\uFF4D\uFF41\uFF49\uFF4C": "e mail",
+    "\uFEFFName": "name", "Email\u200B": "email", "Sign\u00A0up date": "sign up date", "signupDate": "signup date",
+    "sign_up_date": "sign up date", "SIGNUP DATE": "signup date", "MRR ($)": "mrr", "Téléphone": "telephone",
+    "E-Mail-Adresse": "e mail adresse", "Order #": "order", "\uFF92\uFF70\uFF99\uFF71\uFF84\uFF9E\uFF9A\uFF7D": "メールアドレス",
+    "\uFF71\uFF84\uFF9E\uFF9A\uFF7D": "アドレス", "電話番号": "電話番号", "\uFF25メール": "eメール",
+  };
+  for (const [input, want] of Object.entries(cases)) assert.strictEqual(normalizeHeader(input), want, JSON.stringify(input));
+  assert.strictEqual(normalizeHeader(null), "");
+  assert.strictEqual(normalizeHeader(undefined), "");
+  assert.strictEqual(normalizeHeader(2024), "2024");
+  assert.strictEqual(normalizeHeader(" - "), "");
+  assert.deepStrictEqual(words("Plans"), ["plan"]);
+  assert.deepStrictEqual(words("Email Addresses"), ["email", "address"]);
+  assert.deepStrictEqual(words("Address"), ["address"]);
+  assert.deepStrictEqual(words("Bus"), ["bus"]);
+  assert.deepStrictEqual(words("Boxes Sales"), ["box", "sale"]);
+  assert.strictEqual("\uFEFF Email\u00A0".trim(), "Email"); // trim() already removes these at the ends
+  assert.strictEqual(headerKey("Customer_Names"), "customer name");
+});
+ok("map: oneEditApart", () => {
+  for (const [a, b] of [["emial", "email"], ["compnay", "company"], ["emails", "email"], ["phne", "phone"], ["email", "emaik"], ["xemail", "email"]])
+    assert(oneEditApart(a, b) && oneEditApart(b, a), a + "/" + b);
+  for (const [a, b] of [["email", "email"], ["email", "mail ad"], ["email", "eamil x"], ["phone", "phoen1"], ["mrr", "a"], ["", "ab"], ["abcd", "badc"]])
+    assert(!oneEditApart(a, b) && !oneEditApart(b, a), a + "/" + b);
+  assert(oneEditApart("", "a"));
+});
+ok("map: compareNames scores", () => {
+  const score = (h, n) => compareNames(h, n)?.score ?? null;
+  assert.strictEqual(score("E-mail", "email"), 1);
+  assert.strictEqual(score("E-Mail-Adresse", "email adresse"), 1);
+  assert.strictEqual(score("Address email", "email address"), 0.95);
+  assert.strictEqual(score("Primary email", "email"), 0.7);
+  assert.strictEqual(Math.round(score("Signup date (UTC)", "signup date") * 1000), 767);
+  assert.strictEqual(Math.round(score("Email opt-in", "email") * 1000), 633);
+  assert.strictEqual(score("Emial", "email"), 0.6);
+  assert.strictEqual(score("ARR", "mrr"), null);       // too short for the spelling rule
+  assert.strictEqual(score("Mail", "main"), null);
+  assert.strictEqual(score("Mailing address", "mail"), null);
+  assert.strictEqual(score("Mailing address", "email address"), null);
+  assert.strictEqual(score("", "email"), null);
+  assert.strictEqual(score("顧客メールアドレス", "メールアドレス"), null); // no spaces between Japanese words
+  assert.strictEqual(compareNames("Mail", "mail").why, 'same as "mail"');
+});
+ok("map: decision table", () => {
+  const table = [[["Name", "E-mail", "Company", "MRR"], null, {"mapped": {"name": "Name", "email": "E-mail", "company": "Company", "mrr": "MRR"}, "unmatched": [], "missing": [], "sure": true}], [["Customer name", "Email address", "Organisation", "Monthly revenue"], null, {"mapped": {"name": "Customer name", "email": "Email address", "company": "Organisation", "mrr": "Monthly revenue"}, "unmatched": [], "missing": [], "sure": true}], [["Ｎａｍｅ", "﻿E-Mail-Adresse", "Téléphone"], null, {"mapped": {"name": "Ｎａｍｅ", "email": "﻿E-Mail-Adresse", "phone": "Téléphone"}, "unmatched": [], "missing": [], "sure": true}], [["名前", "ﾒｰﾙｱﾄﾞﾚｽ", "電話番号"], null, {"mapped": {"name": "名前", "email": "ﾒｰﾙｱﾄﾞﾚｽ", "phone": "電話番号"}, "unmatched": [], "missing": [], "sure": true}], [["Name", "Primary email", "Phone number (mobile)"], null, {"mapped": {"name": "Name", "email": "Primary email?", "phone": "Phone number (mobile)?"}, "unmatched": [], "missing": [], "sure": false}], [["Name", "Primary email"], [["Yui"], ["yui@example.jp"]], {"mapped": {"name": "Name", "email": "Primary email"}, "unmatched": [], "missing": [], "sure": true}], [["File name", "Email verified"], null, {"mapped": {"name": "File name?", "email": "Email verified?"}, "unmatched": [], "missing": [], "sure": false}], [["Name", "Name", "Email"], null, {"mapped": {"name": "Name?", "email": "Email"}, "unmatched": ["Name"], "missing": [], "sure": false}], [["Name", "Email", "Work email"], null, {"mapped": {"name": "Name", "email": "Email"}, "unmatched": ["Work email"], "missing": [], "sure": false}], [["Name", "Email", "E-mail"], null, {"mapped": {"name": "Name", "email": "Email?"}, "unmatched": ["E-mail"], "missing": [], "sure": false}], [["First name", "Last name", "Email"], null, {"mapped": {"name": "First name?", "email": "Email"}, "unmatched": ["Last name"], "missing": [], "sure": false}], [["Company name", "Email"], null, {"mapped": {"email": "Email", "company": "Company name"}, "unmatched": [], "missing": ["name"], "sure": false}], [["Name", "Emial", "ARR"], null, {"mapped": {"name": "Name", "email": "Emial?"}, "unmatched": ["ARR"], "missing": [], "sure": false}], [["Name", "Mailing address"], null, {"mapped": {"name": "Name"}, "unmatched": ["Mailing address"], "missing": ["email"], "sure": false}], [["Name", "Email opt-in"], null, {"mapped": {"name": "Name", "email": "Email opt-in?"}, "unmatched": [], "missing": [], "sure": false}], [["Name", "Email opt-in"], [["Yui"], ["yes"]], {"mapped": {"name": "Name"}, "unmatched": ["Email opt-in"], "missing": ["email"], "sure": false}], [["Name", "Email", "Email opt-in"], [["Yui"], ["yui@example.jp"], ["yes"]], {"mapped": {"name": "Name", "email": "Email"}, "unmatched": ["Email opt-in"], "missing": [], "sure": true}], [["Name", "Contact"], [["Yui"], ["yui@example.jp"]], {"mapped": {"name": "Name", "email": "Contact?"}, "unmatched": [], "missing": [], "sure": false}], [["Name", "Contact", "Backup contact"], [["Yui"], ["yui@example.jp"], ["ken@example.com"]], {"mapped": {"name": "Name"}, "unmatched": ["Contact", "Backup contact"], "missing": ["email"], "sure": false}], [["Name", "Email", "MRR"], [["Yui"], ["yui@example.jp"], ["n/a", "free"]], {"mapped": {"name": "Name", "email": "Email"}, "unmatched": ["MRR"], "missing": [], "sure": false}], [["Name", "顧客メールアドレス"], null, {"mapped": {"name": "Name"}, "unmatched": ["顧客メールアドレス"], "missing": ["email"], "sure": false}], [[2024, null, "Email"], null, {"mapped": {"email": "Email"}, "unmatched": ["2024", "null"], "missing": ["name"], "sure": false}]];
+  for (const [headers, samples, want] of table) assert.deepStrictEqual(run(headers, samples ?? undefined), want, JSON.stringify(headers));
+});
+ok("map: reasons for unused columns", () => {
+  const why = (headers, samples) => mapColumns(headers, FIELDS, { samples }).unmatched.map((u) => u.why);
+  assert.deepStrictEqual(why(["Name", "Email", "E-mail"]), ["also matches Email, which column B already fills"]);
+  assert.deepStrictEqual(why(["Name", "Email opt-in"], [[], ["yes", "no"]]), ["matched by name, but only 0 of 2 values look like Email"]);
+  assert.deepStrictEqual(why(["Name", "Contact", "Backup contact"], [[], ["a@b.co"], ["c@d.co"]]),
+    ["values look like Email, but so do other columns", "values look like Email, but so do other columns"]);
+  assert.deepStrictEqual(why(["Name", "Email", "", "ARR"]), ["empty header", "no field has this name"]);
+  assert.deepStrictEqual(mapColumns(["Name", "Email", "E-mail"], FIELDS).byField.email.doubts, ["column C matches too"]);
+  assert.deepStrictEqual(mapColumns(["First name", "Last name", "Email"], FIELDS).byField.name.doubts, ["weak name match", "column B matches too"]);
+  assert.deepStrictEqual(mapColumns(["Emial"], FIELDS).byField.email.doubts, ["weak name match"]);
+  assert.deepStrictEqual(mapColumns(["Contact"], FIELDS, { samples: [["a@b.co"]] }).byField.email.doubts, ["matched by its values, not its name"]);
+});
+ok("map: value thresholds (9 in 10 passes, 5 in 10 is used but flagged, fewer is rejected)", () => {
+  const emails = (good) => Array.from({ length: 10 }, (_, i) => (i < good ? `u${i}@example.com` : "n/a"));
+  const email = (good) => mapColumns(["Name", "Email"], FIELDS, { samples: [[], emails(good)] }).byField.email;
+  assert.strictEqual(email(10).sure, true);
+  assert.strictEqual(email(9).sure, true);
+  assert.deepStrictEqual(email(8).doubts, ["only 8 of 10 values look like Email"]);
+  assert.deepStrictEqual(email(5).doubts, ["only 5 of 10 values look like Email"]);
+  assert.strictEqual(email(4), null);
+  // Blank cells do not count; a column with only blanks is not checked at all.
+  assert.strictEqual(mapColumns(["Name", "Email"], FIELDS, { samples: [[], ["", null, undefined, "  "]] }).byField.email.sure, true);
+  // Matching by values alone needs 9 in 10 too.
+  assert.strictEqual(mapColumns(["Contact"], FIELDS, { samples: [emails(9)] }).byField.email.header, "Contact");
+  assert.strictEqual(mapColumns(["Contact"], FIELDS, { samples: [emails(8)] }).byField.email, null);
+  // Numbers typed in Excel count as numbers.
+  assert.strictEqual(mapColumns(["MRR"], FIELDS, { samples: [[49, "1,234.50", "€ 99", "(12)"]] }).byField.mrr.sure, true);
+});
+ok("map: remembered choices", () => {
+  const headers = ["Kunde", "Kontakt"];
+  const first = mapColumns(headers, FIELDS);
+  assert.deepStrictEqual(summary(first), { mapped: {}, unmatched: ["Kunde", "Kontakt"], missing: ["name", "email"], sure: false });
+  // The user picks the fields on the mapping screen; your code builds the same shape as byField.
+  const confirmed = { name: { column: 0 }, email: { column: 1 }, company: null };
+  const remembered = rememberMapping({}, headers, confirmed);
+  assert.deepStrictEqual(remembered, { kunde: "name", kontakt: "email" });
+  assert.deepStrictEqual(summary(mapColumns([" KUNDE ", "Kontakt", "Firma"], FIELDS, { remembered })),
+    { mapped: { name: " KUNDE ", email: "Kontakt" }, unmatched: ["Firma"], missing: [], sure: true });
+  // A remembered choice is still rejected when the values contradict it.
+  assert.strictEqual(mapColumns(["Kontakt", "Name"], FIELDS, { remembered, samples: [["030 1234"], []] }).byField.email, null);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(remembered)), remembered); // plain JSON, safe for localStorage
+});
+ok("map: blank headers are never remembered", () => {
+  const remembered = rememberMapping({}, ["Name", "", " - "], { name: { column: 0 }, email: { column: 1 }, phone: { column: 2 } });
+  assert.deepStrictEqual(remembered, { name: "name" });
+  const r = mapColumns(["Name", ""], FIELDS, { remembered: { "": "email" } });
+  assert.strictEqual(r.byField.email, null);
+});
+ok("map: no two names of different fields collide after normalizing", () => {
+  const owner = new Map();
+  for (const f of FIELDS) for (const n of [f.key, f.label, ...f.aliases]) {
+    const k = headerKey(n);
+    assert(!owner.has(k) || owner.get(k) === f.key, n);
+    owner.set(k, f.key);
+  }
+});
+ok("map: a one-word alias like name also matches longer headers", () => {
+  const withoutCompany = FIELDS.filter((f) => f.key !== "company");
+  const m = mapColumns(["Company name", "Email"], withoutCompany).byField.name;
+  assert.deepStrictEqual([m.header, m.sure, m.why, m.doubts], ["Company name", false, 'contains "name"', ["weak name match"]]);
+  // Values can confirm a partial name.
+  assert.strictEqual(mapColumns(["Emial"], FIELDS, { samples: [["a@b.co"]] }).byField.email.sure, true);
+});
+ok("map: suggestMapping and applyMapping", () => {
+  const rows = [
+    ["Customer export"], [],
+    ["\uFEFFCustomer name", "E-Mail", "Plan", "Monthly revenue"],
+    ["Yui Tanaka", "yui@example.jp", "Pro", "49"],
+    ["Ken Mori", "ken@example.com"],
+    undefined,
+  ];
+  const result = suggestMapping(rows, 2);
+  assert.deepStrictEqual(summary(result), { mapped: { name: "\uFEFFCustomer name", email: "E-Mail", mrr: "Monthly revenue" }, unmatched: ["Plan"], missing: [], sure: true });
+  assert.deepStrictEqual(applyMapping(rows, 2, result.byField), [
+    { name: "Yui Tanaka", email: "yui@example.jp", mrr: "49" },
+    { name: "Ken Mori", email: "ken@example.com", mrr: "" },
+  ]);
+  assert.deepStrictEqual(applyMapping([["Email", "Plan"], [" ", "Pro"], [], undefined], 0, { email: { column: 0 } }), []);
+  assert.deepStrictEqual(summary(suggestMapping([], 0)), { mapped: {}, unmatched: [], missing: ["name", "email"], sure: false });
+  // Only the first 50 data rows are checked.
+  const many = [["Name", "Email"], ...Array.from({ length: 50 }, () => ["a", "a@b.co"]), ...Array.from({ length: 100 }, () => ["b", "x"])];
+  assert.strictEqual(suggestMapping(many, 0).byField.email.sure, true);
+});
+ok("map: no invisible characters in the snippets", () => {
+  for (const s of ["function normalizeHeader(text) {\n  return String(text ?? \"\")\n    // \uff25\uff4d\uff41\uff49\uff4c -> Email, \uff92\uff70\uff99 -> \u30e1\u30fc\u30eb, no-break space -> space\n    .normalize(\"NFKC\")\n    // zero-width spaces and byte order marks\n    .replace(/\\p{Cf}/gu, \"\")\n    // signupDate -> signup Date\n    .replace(/(\\p{Ll})(\\p{Lu})/gu, \"$1 $2\")\n    .toLowerCase()\n    // \u00e9 -> e, but the mark in Japanese \u30c9 stays\n    .normalize(\"NFD\")\n    .replace(/(\\p{Script=Latin})\\p{M}+/gu, \"$1\")\n    .normalize(\"NFC\")\n    // punctuation, underscores and runs of spaces -> one space\n    .replace(/[^\\p{L}\\p{N}]+/gu, \" \")\n    .trim();\n}\n\n// Plurals count as the same word. \"address\" is left alone.\nfunction stem(word) {\n  if (/(ss|x|ch|sh)es$/.test(word)) return word.slice(0, -2); // addresses\n  if (word.length > 3 && /[^s]s$/.test(word)) return word.slice(0, -1); // plans\n  return word;\n}\nconst words = (text) => normalizeHeader(text).split(\" \").filter(Boolean).map(stem);\nconst headerKey = (text) => words(text).join(\" \");", "// True when b is a with one letter changed, added or removed,\n// or with two neighbouring letters swapped.\nfunction oneEditApart(a, b) {\n  if (a === b || Math.abs(a.length - b.length) > 1) return false;\n  let i = 0;\n  while (a[i] === b[i]) i++; // length of the common start\n  if (a.length === b.length) {\n    return a.slice(i + 1) === b.slice(i + 1) ||\n      (a[i] === b[i + 1] && a[i + 1] === b[i] && a.slice(i + 2) === b.slice(i + 2));\n  }\n  const [longer, shorter] = a.length > b.length ? [a, b] : [b, a];\n  return longer.slice(i + 1) === shorter.slice(i);\n}\n\nfunction compareNames(header, name) {\n  const h = words(header), n = words(name);\n  if (!h.length || !n.length) return null;\n  const hJoined = h.join(\"\"), nJoined = n.join(\"\");\n  if (hJoined === nJoined) return { score: 1, why: `same as \"${name}\"` };\n  const contained = n.every((w) => h.includes(w));\n  if (contained && h.length === n.length) {\n    return { score: 0.95, why: `same words as \"${name}\"` };\n  }\n  if (contained) {\n    return { score: 0.5 + 0.4 * (n.length / h.length), why: `contains \"${name}\"` };\n  }\n  const longEnough = Math.min(hJoined.length, nJoined.length) >= 5;\n  if (longEnough && oneEditApart(hJoined, nJoined)) {\n    return { score: 0.6, why: `spelled like \"${name}\"` };\n  }\n  return null;\n}", "const looksLikeEmail = (v) => /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(String(v).trim());\nconst looksLikeNumber = (v) =>\n  typeof v === \"number\" || /^[-+(]?[$\u20ac\u00a3\u00a5]?\\s?\\d[\\d.,\\s']*\\)?$/.test(String(v).trim());\n\nconst FIELDS = [\n  { key: \"name\", label: \"Full name\", required: true,\n    aliases: [\"name\", \"customer name\", \"contact name\", \"\u6c0f\u540d\", \"\u540d\u524d\"] },\n  { key: \"email\", label: \"Email\", required: true,\n    looksLike: looksLikeEmail, findByValues: true,\n    aliases: [\"email address\", \"mail\", \"e-mail address\", \"email adresse\",\n              \"\u30e1\u30fc\u30eb\u30a2\u30c9\u30ec\u30b9\", \"\u30e1\u30fc\u30eb\"] },\n  { key: \"company\", label: \"Company\",\n    aliases: [\"company name\", \"organization\", \"organisation\", \"\u4f1a\u793e\u540d\"] },\n  { key: \"phone\", label: \"Phone\",\n    aliases: [\"phone number\", \"telephone\", \"tel\", \"mobile\", \"\u96fb\u8a71\u756a\u53f7\"] },\n  { key: \"mrr\", label: \"MRR\", looksLike: looksLikeNumber,\n    aliases: [\"monthly revenue\", \"monthly recurring revenue\"] },\n];", "const MIN_SCORE = 0.6;   // weaker name matches are ignored\nconst SURE_SCORE = 0.95; // weaker name matches need values to confirm them\nconst CLOSE = 0.1;       // a rival this close makes the choice a guess\n\n// 0 -> \"A\", 27 -> \"AB\"\nfunction columnLetter(i) {\n  const prefix = i >= 26 ? columnLetter(Math.floor(i / 26) - 1) : \"\";\n  return prefix + String.fromCharCode(65 + (i % 26));\n}\n\n// How many sample values pass the field's check (null: nothing to check).\nfunction valueShare(field, values = []) {\n  const filled = values.filter((v) => v != null && String(v).trim() !== \"\");\n  if (!field.looksLike || !filled.length) return null;\n  const pass = filled.filter(field.looksLike).length;\n  const text = `${pass} of ${filled.length} values look like ${field.label}`;\n  return { pass, of: filled.length, text };\n}\n\nfunction bestNameMatch(header, field, remembered) {\n  const key = headerKey(header);\n  if (key && remembered[key] === field.key) {\n    return { score: 1, why: \"chosen by a user before\" };\n  }\n  let best = null;\n  for (const name of [field.key, field.label, ...(field.aliases ?? [])]) {\n    const m = compareNames(header, name);\n    if (m && (!best || m.score > best.score)) best = m;\n  }\n  return best;\n}\n\nfunction mapColumns(headers, fields, { samples = [], remembered = {} } = {}) {\n  // Columns that matched a field but were not used: column -> { key, why, second }.\n  // second: a better column already fills that field.\n  const notUsed = new Map();\n  const note = (column, key, why, second = false) => {\n    if (!notUsed.has(column)) notUsed.set(column, { key, why, second });\n  };\n\n  // 1. Pairs whose names match and whose values do not contradict them.\n  const pairs = [];\n  fields.forEach((field, f) => headers.forEach((header, column) => {\n    const best = bestNameMatch(header, field, remembered);\n    if (!best || best.score < MIN_SCORE) return;\n    const share = valueShare(field, samples[column]);\n    if (share && share.pass / share.of < 0.5) {\n      return note(column, field.key, `matched by name, but only ${share.text}`);\n    }\n    const confirmed = share && share.pass / share.of >= 0.9;\n    const doubt = share && !confirmed && `only ${share.text}`;\n    pairs.push({ f, column, ...best, confirmed, doubt });\n  }));\n\n  // 2. Best pairs first; each field and each column is used once.\n  pairs.sort((a, b) => b.score - a.score || a.column - b.column || a.f - b.f);\n  const byField = Object.fromEntries(fields.map((field) => [field.key, null]));\n  const usedBy = new Map(); // column -> field key\n  for (const p of pairs) {\n    const field = fields[p.f], taken = byField[field.key];\n    if (usedBy.has(p.column)) continue;\n    if (taken) {\n      const where = columnLetter(taken.column);\n      const why = `also matches ${field.label}, which column ${where} already fills`;\n      note(p.column, field.key, why, true);\n      continue;\n    }\n    // A rival scores almost as well and could still be used: another free column\n    // for this field, or another empty field for this column.\n    const rival = pairs.find((q) => q !== p && q.score >= p.score - CLOSE && (\n      (q.f === p.f && !usedBy.has(q.column)) ||\n      (q.column === p.column && !byField[fields[q.f].key])));\n    const doubts = [];\n    if (p.score < SURE_SCORE && !p.confirmed) doubts.push(\"weak name match\");\n    const rivalColumn = rival && columnLetter(rival.column);\n    if (rival?.f === p.f) doubts.push(`column ${rivalColumn} matches too`);\n    else if (rival) doubts.push(`could also be ${fields[rival.f].label}`);\n    if (p.doubt) doubts.push(p.doubt);\n    const header = headers[p.column], sure = !doubts.length;\n    byField[field.key] = { column: p.column, header, why: p.why, sure, doubts };\n    usedBy.set(p.column, field.key);\n  }\n\n  // 3. Fields still empty: the one unused column whose values look right (9 in 10).\n  for (const field of fields) {\n    if (byField[field.key] || !field.findByValues) continue;\n    const fits = headers.map((_, column) => column).filter((column) => {\n      const share = !usedBy.has(column) && valueShare(field, samples[column]);\n      return share && share.pass / share.of >= 0.9;\n    });\n    if (fits.length !== 1) {\n      const why = `values look like ${field.label}, but so do other columns`;\n      fits.forEach((column) => note(column, field.key, why));\n      continue;\n    }\n    const [column] = fits, header = headers[column];\n    const why = `values look like ${field.label}`;\n    const doubts = [\"matched by its values, not its name\"];\n    byField[field.key] = { column, header, why, sure: false, doubts };\n    usedBy.set(column, field.key);\n  }\n\n  const unmatched = headers\n    .map((header, column) => ({ column, header }))\n    .filter(({ column }) => !usedBy.has(column))\n    .map((c) => ({ ...c, why: notUsed.get(c.column)?.why ??\n      (normalizeHeader(c.header) ? \"no field has this name\" : \"empty header\") }));\n  const missing = fields.filter((f) => f.required && !byField[f.key])\n    .map((f) => f.key);\n  // A person should look when a field stayed empty although a column's name\n  // matched it, or when a second column matches a filled field (Email, Email 2).\n  const needsLook = unmatched.some(({ column }) => {\n    const n = notUsed.get(column);\n    return n && (n.second || !byField[n.key]);\n  });\n  const allSure = Object.values(byField).every((m) => !m || m.sure);\n  const sure = !missing.length && !needsLook && allSure;\n  return { byField, unmatched, missing, sure };\n}", "// After the user confirms the mapping screen, store their choices\n// (in your database or in localStorage).\nfunction rememberMapping(remembered, headers, byField) {\n  for (const [key, match] of Object.entries(byField)) {\n    const header = match && headerKey(headers[match.column]);\n    if (header) remembered[header] = key; // blank headers are not remembered\n  }\n  return remembered;\n}", "// rows: arrays of cells from your CSV or Excel parser.\n// headerRow: the index of the header row.\nfunction suggestMapping(rows, headerRow, remembered = {}) {\n  const headers = rows[headerRow] ?? [];\n  // 50 data rows are enough to check the values.\n  const firstRows = rows.slice(headerRow + 1, headerRow + 51);\n  const samples = headers.map((_, column) => firstRows.map((row) => row?.[column]));\n  return mapColumns(headers, FIELDS, { samples, remembered });\n}\n\n// Rows whose mapped cells are all blank are skipped.\nfunction applyMapping(rows, headerRow, byField) {\n  const used = Object.entries(byField).filter(([, match]) => match);\n  const cell = (row, match) => row?.[match.column] ?? \"\";\n  const toRecord = (row) =>\n    Object.fromEntries(used.map(([key, match]) => [key, cell(row, match)]));\n  return rows.slice(headerRow + 1)\n    .filter((row) => used.some(([, match]) => String(cell(row, match)).trim() !== \"\"))\n    .map(toRecord);\n}", "const EMAIL_NAMES = [\"email\", \"e-mail\", \"email address\", \"mail\"];\nconst exactMatch = (header) => EMAIL_NAMES.includes(header.trim().toLowerCase());\nexactMatch(\"E-mail\");             // true\nexactMatch(\"E-Mail-Adresse\");     // false\nexactMatch(\"Email\\u00A0address\");  // false\nexactMatch(\"\uff25\uff4d\uff41\uff49\uff4c\");         // false\n\nconst looseMatch = (header) => header.toLowerCase().includes(\"mail\");\nlooseMatch(\"Mailing address\");    // true\nlooseMatch(\"Email opt-in\");       // true"]) assert(!/[\u00A0\u200B-\u200F\u2028\u2029\uFEFF]/.test(s));
+});
+}

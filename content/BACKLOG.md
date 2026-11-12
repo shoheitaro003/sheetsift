@@ -8,7 +8,7 @@ Take the top unchecked item. Add new ideas from questions people send.
 - [x] Detecting the header row in a spreadsheet: a heuristic that works on real exports (published 2026-11-08)
 - [x] Reading Excel dates correctly with SheetJS (published 2026-11-09)
 - [x] Shift_JIS, Windows-1252 and UTF-16: decoding CSV files from legacy systems in the browser (published 2026-11-11)
-- [ ] Column mapping without AI: matching "E-mail", "Email address" and "mail" to one field
+- [x] Column mapping without AI: matching "E-mail", "Email address" and "mail" to one field (published 2026-11-12)
 - [ ] Why your importer should never silently guess (ambiguous dates, unquoted commas, duplicate headers)
 - [ ] Parsing a 100,000-row CSV in the browser without freezing the page (Web Workers, streaming)
 - [ ] Security checklist for spreadsheet uploads (prototype pollution, formula injection, HTML in cells)
