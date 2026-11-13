@@ -64,6 +64,13 @@ function check(name, ok, detail) {
   r = await safe("ledger", "Konto;Saldo\nKasse;1.234,56-\nBank;2.000,00\nDebitoren;\u2212150,00\n");
   if (r) check("ledger: negative formats become numbers", r.cols[1] === "number" && r.rows.map((x) => x[1]).join() === "-1234.56|fixed,2000.00|fixed,-150.00|fixed", r);
 
+  // 2c. A row with more values than columns (unquoted comma) is flagged, not silently cut
+  r = await safe("extra values", "Name,Company,Amount\nYui,Acme,49\nKen,Acme, Inc,120\nLi,Orbit,7\n");
+  if (r) {
+    check("extra values: row is flagged", r.rows[1][2].endsWith("|warn") && r.counts.warn >= 1, r.rows);
+    check("extra values: other rows untouched", !r.rows[0].some((c) => c.endsWith("|warn")) && !r.rows[2].some((c) => c.endsWith("|warn")), r.rows);
+  }
+
   // 3. Japanese headers, yen, Japanese dates
   r = await safe("japanese", "顧客一覧,,,\n氏名,メール,登録日,金額\n田中,tanaka@example.jp,2026年4月3日,\"¥1,200\"\n佐藤,sato@example.jp,2026/04/05,800円\n鈴木,suzuki@example.jp,2026-04-06,1500\n合計,,,3500\n");
   if (r) {

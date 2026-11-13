@@ -25,6 +25,7 @@
 <h1>The SheetSift blog</h1>
 <p class="meta">Practical notes on importing the spreadsheets real customers send.</p>
 <ul class="posts">
+<li><a href="find-csv-rows-broken-by-unquoted-commas-javascript/">Find CSV rows broken by unquoted commas in JavaScript</a><p>A value like Acme, Inc without quotes shifts every column after it. Tested JavaScript that finds these rows by line number and suggests a fix to confirm.</p></li>
 <li><a href="map-spreadsheet-columns-to-fields-javascript/">Map CSV and Excel columns to your fields in JavaScript</a><p>Match headers like E-mail, Email address and メール to one field without AI. Tested JavaScript that checks the values too and flags uncertain matches.</p></li>
 <li><a href="decode-shift-jis-windows-1252-utf-16-csv-javascript/">Read Shift_JIS, Windows-1252 and UTF-16 CSV files in JavaScript</a><p>Tested JavaScript that reads UTF-8 and UTF-16 CSV files, picks between legacy encodings like Shift_JIS or Windows-1252, and flags guesses.</p></li>
 <li><a href="read-excel-dates-javascript-sheetjs/">Read Excel dates in JavaScript without off-by-one-day bugs</a><p>Excel stores dates as serial numbers. Tested SheetJS code that turns them into ISO dates with no time zone shift and no 1900 or 1904 date system errors.</p></li>

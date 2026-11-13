@@ -2,6 +2,7 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>https://shoheitaro003.github.io/sheetsift/</loc></url>
   <url><loc>https://shoheitaro003.github.io/sheetsift/blog/</loc></url>
+  <url><loc>https://shoheitaro003.github.io/sheetsift/blog/find-csv-rows-broken-by-unquoted-commas-javascript/</loc></url>
   <url><loc>https://shoheitaro003.github.io/sheetsift/blog/map-spreadsheet-columns-to-fields-javascript/</loc></url>
   <url><loc>https://shoheitaro003.github.io/sheetsift/blog/decode-shift-jis-windows-1252-utf-16-csv-javascript/</loc></url>
   <url><loc>https://shoheitaro003.github.io/sheetsift/blog/read-excel-dates-javascript-sheetjs/</loc></url>

@@ -903,4 +903,194 @@ MAP_TESTS = MAP_TESTS.replace("%%MAP_PROBLEM_JSON%%", _json.dumps(MAP_PROBLEM))
 MAP_TESTS = MAP_TESTS.replace("%%MAP_TABLE_JSON%%", _json.dumps(MAP_TABLE, ensure_ascii=False))
 MAP_TESTS = MAP_TESTS.replace("%%MAP_ALL_JSON%%", _json.dumps([globals()[k] for k in _map_names + ["MAP_PROBLEM"]]))
 out += MAP_TESTS
+CSVF_TESTS = r"""
+// --- blog/find-csv-rows-broken-by-unquoted-commas ---
+{
+%%CSVF_PARSE%%
+
+%%CSVF_DELIM%%
+
+%%CSVF_KINDS%%
+
+%%CSVF_JOINS%%
+
+%%CSVF_CHECK%%
+
+%%CSVF_USE%%
+
+ok("csvf: the problem is real", () => {
+  const out = (() => {
+%%CSVF_PROBLEM_BODY%%
+  })();
+  assert.deepStrictEqual(out, { Name: "Ken Mori", Company: "Acme", Amount: " Inc" });
+});
+const CSVF_BASE = "Name,Company,City,Amount\nYui Tanaka,Acme,Tokyo,49\nLi Wei,Orbit,Lyon,7\nKim Park,\"Park, Ltd\",Seoul,9\n";
+const csvfOne = (line) => {
+  const r = checkCsv(CSVF_BASE + line + "\n");
+  if (r.issues.length === 0) return { kind: "imported", fields: r.rows[3].fields };
+  assert.strictEqual(r.issues.length, 1);
+  assert.strictEqual(r.rows.length, 3);
+  return { kind: r.issues[0].kind, suggestion: r.issues[0].suggestion };
+};
+ok("csvf: decision table", () => {
+  for (const [line, want] of %%CSVF_TABLE_JSON%%) assert.deepStrictEqual(csvfOne(line), want, line);
+});
+ok("csvf: messages name the line and the cause", () => {
+  const r = checkCsv(CSVF_BASE + "Ken Mori,Acme, Inc,Osaka,120\nSam Fox,Fox Ltd,120\nBo Chen,Chen Ltd,Lyon,12,5\nAna Lima,Lima & Co,Porto,1,234,\n");
+  assert.deepStrictEqual(r.issues.map((i) => i.message), [
+    'Line 5: 5 values, the header has 4. "Acme, Inc" as one value fits the other rows.',
+    "Line 6: 3 values, the header has 4.",
+    "Line 7: 5 values, the header has 4. No single join fits the other rows.",
+    "Line 8: 6 values, the header has 4. No single join fits the other rows.",
+  ]);
+});
+ok("csvf: ambiguous joins are not suggested", () => {
+  const r = checkCsv(CSVF_BASE + "Ken Mori,Acme, Inc, Osaka,120\n");
+  assert.strictEqual(r.issues[0].suggestion, null);
+  assert.strictEqual(r.issues[0].message, "Line 5: 5 values, the header has 4. 2 different joins would fit, so none is suggested.");
+});
+ok("csvf: a file that writes a, b, c gets no prose joins", () => {
+  const text = "Name, Company, Amount\nYui, Acme, 49\nLi, Orbit, 7\nKen, Acme, Inc, 120\n";
+  const r = checkCsv(text);
+  assert.strictEqual(r.rows.length, 2);
+  assert.deepStrictEqual([r.issues[0].kind, r.issues[0].suggestion], ["too-many", null]);
+});
+ok("csvf: spaced files with quotes, and long prose joins", () => {
+  const r = checkCsv('Name, Company, Amount\n"Yui", "Acme, Inc", 49\n"Li", "Orbit", 7\n');
+  assert.deepStrictEqual([r.rows.map((x) => x.fields), r.issues], [[["Yui", "Acme, Inc", " 49"], ["Li", "Orbit", " 7"]], []]);
+  const s = checkCsv("Name,Note,Amount\nYui,ok,49\nLi,fine,7\nKen,hello, world, again,5\n");
+  assert.deepStrictEqual(s.issues[0].suggestion, ["Ken", "hello, world, again", "5"]);
+});
+ok("csvf: trailing delimiters only when the rest fits", () => {
+  const r = checkCsv("Name,Company,City,Amount\nYui,Acme,Tokyo,49\nLi,Orbit,Lyon,7\nBo Chen,Lyon,15,,\nAl,Ace,Rome,3,\n");
+  assert.deepStrictEqual(r.issues.map((i) => [i.message, i.suggestion]), [
+    ["Line 4: 5 values, the header has 4. No single join fits the other rows.", null],
+    ["Line 5: 1 value after the last column, all empty.", ["Al", "Ace", "Rome", "3"]],
+  ]);
+});
+ok("csvf: the joined value in the message is a JSON string", () => {
+  const u = checkCsv("Name,Note,Amount\nYui,ok,49\nLi,fine,7\nKen,a\\b, c,5\n");
+  assert.deepStrictEqual(u.issues[0].suggestion, ["Ken", "a\\b, c", "5"]);
+  assert(u.issues[0].message.endsWith(JSON.stringify("a\\b, c") + " as one value fits the other rows."));
+});
+ok("csvf: tab files never join", () => {
+  const r = checkCsv("Name\tAmount\nYui\t49\nLi\t7\nKen\t 1\t200\n", { delimiter: "\t" });
+  assert.deepStrictEqual([r.issues[0].kind, r.issues[0].suggestion], ["too-many", null]);
+  const s = checkCsv("Name;Amount\nYui;49\nLi;7\nKen;1;234\n", { delimiter: ";" });
+  assert.strictEqual(s.issues[0].suggestion, null); // grouped numbers only with commas
+  const t = checkCsv("Name;Note\nYui;ok\nLi;fine\nKen;late; again\n", { delimiter: ";" });
+  assert.deepStrictEqual(t.issues[0].suggestion, ["Ken", "late; again"]);
+});
+ok("csvf: too few values, and a line break inside a value", () => {
+  const r = checkCsv("Name,Note,Amount\nYui,ok,49\nLi,fine,7\nKen,first part\nsecond part,120\n");
+  assert.deepStrictEqual(r.issues.map((i) => [i.line, i.kind]), [[4, "too-few"], [5, "too-few"]]);
+  assert(r.issues[0].message.endsWith("With the next line it would fit: a line break inside a value?"));
+  assert.strictEqual(r.issues[1].message, "Line 5: 2 values, the header has 3.");
+  assert.strictEqual(checkCsv("Name,Amount\nYui\n").issues[0].message, "Line 2: 1 value, the header has 2.");
+  assert.strictEqual(r.issues[0].suggestion, null);
+});
+ok("csvf: an unclosed quote stops the import there", () => {
+  const r = checkCsv("Name,Company,Amount\nYui,Acme,49\nKen,\"Mori Ltd,120\nLi,Orbit,7\nBo,Chen,9\n");
+  assert.strictEqual(r.rows.length, 1);
+  assert.deepStrictEqual(r.issues.map((i) => i.message), ["Line 3: a quote opens on line 3 and never closes, so lines 3 to 5 became one value."]);
+  assert.strictEqual(r.issues[0].suggestion, null);
+  const noNewline = checkCsv("Name,Note\nYui,\"open");
+  assert(noNewline.issues[0].message.includes("lines 2 to 2"));
+});
+ok("csvf: parseRecords keeps physical line numbers", () => {
+  const recs = parseRecords('Name,Note\r\n"Yui","two\r\nlines"\r\nKen,"a ""quoted"" word"\rLi,""\n\nBo,x');
+  assert.deepStrictEqual(recs.map((r) => [r.line, r.fields]), [
+    [1, ["Name", "Note"]], [2, ["Yui", "two\r\nlines"]], [4, ["Ken", 'a "quoted" word']],
+    [5, ["Li", ""]], [6, [""]], [7, ["Bo", "x"]],
+  ]);
+  assert(recs.every((r) => r.problems.length === 0));
+  assert.deepStrictEqual(parseRecords('a,"x\ry"\rb,z').map((r) => r.line), [1, 3]);
+  assert.deepStrictEqual(parseRecords('a,""').map((r) => r.fields), [["a", ""]]);
+  assert.deepStrictEqual(parseRecords("a,b\n").length, 1);
+  assert.deepStrictEqual(parseRecords("").length, 0);
+  assert.deepStrictEqual(parseRecords("a\nb\nc\n", ",", 2).map((r) => r.fields[0]), ["a", "b"]);
+  assert.deepStrictEqual(parseRecords('x,y"')[0].problems, ["stray-quote"]);
+  // Spaces around quoted values, as in files written "a", "b, c", 1
+  const spaced = parseRecords('"Yui", "Acme, Inc" , 49\n"Zed",  "Zeta"  Corp ,8');
+  assert.deepStrictEqual(spaced.map((r) => [r.fields, r.problems]), [
+    [["Yui", "Acme, Inc", " 49"], []],
+    [["Zed", "Zeta  Corp", "8"], ["text-after-quote"]],
+  ]);
+});
+ok("csvf: guessDelimiter", () => {
+  const cases = [
+    ["Name,Amount\nYui,49\nLi,7\n", ",", true],
+    ["Kunde;Betrag\nA GmbH;1.234,50\nB AG;99,90\n", ";", true],
+    ["Name\tNote\nYui\tok, fine\nLi\tx\n", "\t", true],
+    ["a|b|c\n1|2|3\n", "|", true],
+    ["\uFEFFName;Amount\nYui;49\n", ";", true],
+    ["a;b,c\n1;2,3\n", ",", false],
+    ["a;b,c\n1;2,3\n4;5\n", ";", true],
+    ["one\ntwo\n", ",", false],
+    ["Name,Amount\n", ",", false],
+    ["", ",", false],
+  ];
+  for (const [text, delimiter, sure] of cases) assert.deepStrictEqual(guessDelimiter(text), { delimiter, sure }, JSON.stringify(text));
+  // Rows broken by an unquoted comma lower the score, but the delimiter is still found.
+  assert.deepStrictEqual(guessDelimiter("Name,Company,City,Amount\nYui,Acme,Tokyo,49\nLi,Orbit,Lyon,7\nKim,\"Park, Ltd\",Seoul,9\nKen,Acme, Inc,Osaka,120\n"), { delimiter: ",", sure: true });
+  assert.deepStrictEqual(guessDelimiter("Name,Company\nYui,Acme, Inc\nLi,Orbit, Ltd\n"), { delimiter: ",", sure: false });
+  assert.deepStrictEqual(guessDelimiter("Name,Company,Amount\nYui,Acme,49\nKen,Acme, Inc,120\nLi,Orbit,7\nBo,Chen,9\nAna,Lima,3\n"), { delimiter: ",", sure: true });
+});
+ok("csvf: empty files and BOM", () => {
+  assert.deepStrictEqual(checkCsv(""), { header: [], rows: [], issues: [] });
+  assert.deepStrictEqual(checkCsv("\uFEFFName,Amount\n"), { header: ["Name", "Amount"], rows: [], issues: [] });
+  assert.deepStrictEqual(checkCsv("x\nName,Amount\nYui,49\n", { headerIndex: 1 }).rows.map((r) => r.fields), [["Yui", "49"]]);
+  assert.deepStrictEqual(checkCsv("sep=;\nA;B\n1;2\n", { delimiter: ";" }).header, ["sep=", ""]);
+  assert.deepStrictEqual(checkCsv("\n\nx\n\nName,Amount\nYui,49\n", { headerIndex: 1 }).header, ["Name", "Amount"]);
+});
+ok("csvf: kinds need two values; fits ignores blanks", () => {
+  assert.deepStrictEqual(columnKinds([{ fields: ["a", "1", "x"] }, { fields: ["b", "2,000", "3"] }], 3), ["text", "number", "any"]);
+  assert.deepStrictEqual(columnKinds([{ fields: ["a", "1"] }], 2), ["any", "any"]);
+  assert(fits(["", " 12 "], ["text", "number"]));
+  assert(!fits(["12", "x"], ["text", "number"]));
+  for (const v of ["49", "-1,234.50", "+7", "1,234,567"]) assert(NUMBER.test(v), v);
+  assert(Number.isNaN(Number("1,234"))); // why a repaired value still needs parsing
+  for (const v of ["12,5", "1,2345", "$49", "1.234,50", ",123", "1,23"]) assert(!NUMBER.test(v), v);
+});
+ok("csvf: importCsv keeps file order and leaves the rest open", () => {
+  const text = "Name,Company,Amount\nYui,Acme,49\nKen,Acme, Inc,120\nLi,Orbit,7\nBo,Chen,,\nSam,Fox\n";
+  const yes = importCsv(text, () => true);
+  assert.deepStrictEqual(yes.rows.map((r) => r.fields), [["Yui", "Acme", "49"], ["Ken", "Acme, Inc", "120"], ["Li", "Orbit", "7"], ["Bo", "Chen", ""]]);
+  assert.deepStrictEqual(yes.open.map((i) => i.kind), ["too-few"]);
+  assert.deepStrictEqual([yes.delimiter, yes.delimiterSure], [",", false]);
+  const no = importCsv(text, () => false);
+  assert.deepStrictEqual(no.rows.map((r) => r.line), [2, 4]);
+  assert.deepStrictEqual(no.open.map((i) => i.kind), ["too-many", "trailing-delimiter", "too-few"]);
+});
+ok("csvf: no invisible characters in the snippets", () => {
+  for (const s of %%CSVF_ALL_JSON%%) assert(!/[\u00A0\u200B-\u200F\u2028\u2029\uFEFF]/.test(s));
+});
+}
+"""
+CSVF_TABLE = [
+  ["Ken Mori,Acme, Inc,Osaka,120", {"kind": "too-many", "suggestion": ["Ken Mori", "Acme, Inc", "Osaka", "120"]}],
+  ["Mori, Ken,Acme,Osaka,120", {"kind": "too-many", "suggestion": ["Mori, Ken", "Acme", "Osaka", "120"]}],
+  ["Ana Lima,Lima & Co,Porto,1,234", {"kind": "too-many", "suggestion": ["Ana Lima", "Lima & Co", "Porto", "1,234"]}],
+  ["Ana Lima,Lima & Co,Porto,1,234.50", {"kind": "too-many", "suggestion": ["Ana Lima", "Lima & Co", "Porto", "1,234.50"]}],
+  ["Ken Mori,Acme, Inc, Osaka,120", {"kind": "too-many", "suggestion": None}],
+  ["Eve Ito,Acme,Inc,Nara,30", {"kind": "too-many", "suggestion": None}],
+  ["Bo Chen,Chen Ltd,Lyon,12,5", {"kind": "too-many", "suggestion": None}],
+  ["Ana Lima,Lima, Co,Porto,1,234", {"kind": "too-many", "suggestion": None}],
+  ["Bo Chen,Chen Ltd,Lyon,15,,", {"kind": "trailing-delimiter", "suggestion": ["Bo Chen", "Chen Ltd", "Lyon", "15"]}],
+  ["Bo Chen,Lyon,15,,", {"kind": "too-many", "suggestion": None}],
+  ["Ken Mori,Acme, Inc,Osaka,", {"kind": "too-many", "suggestion": ["Ken Mori", "Acme, Inc", "Osaka", ""]}],
+  ["Sam Fox,Fox Ltd,120", {"kind": "too-few", "suggestion": None}],
+  ["Sam Fox,Fox 5\" Ltd,Leeds,5", {"kind": "stray-quote", "suggestion": ["Sam Fox", "Fox 5\" Ltd", "Leeds", "5"]}],
+  ["Zed Roe,\"Zeta\" Corp,Oslo,8", {"kind": "text-after-quote", "suggestion": ["Zed Roe", "Zeta Corp", "Oslo", "8"]}],
+  ["Kim Park,\"Park, Ltd\",Seoul,9", {"kind": "imported", "fields": ["Kim Park", "Park, Ltd", "Seoul", "9"]}],
+  ["Mia Ross,\"Ross \"\"M\"\" Ltd\",Leeds,7", {"kind": "imported", "fields": ["Mia Ross", "Ross \"M\" Ltd", "Leeds", "7"]}],
+]
+_csvf_names = ["CSVF_PARSE", "CSVF_DELIM", "CSVF_KINDS", "CSVF_JOINS", "CSVF_CHECK", "CSVF_USE"]
+for _k in _csvf_names:
+    CSVF_TESTS = CSVF_TESTS.replace("%%" + _k + "%%", globals()[_k])
+_csvf_problem_body = CSVF_PROBLEM.replace("Object.fromEntries", "return Object.fromEntries")
+CSVF_TESTS = CSVF_TESTS.replace("%%CSVF_PROBLEM_BODY%%", _csvf_problem_body)
+CSVF_TESTS = CSVF_TESTS.replace("%%CSVF_TABLE_JSON%%", _json.dumps(CSVF_TABLE, ensure_ascii=False))
+CSVF_TESTS = CSVF_TESTS.replace("%%CSVF_ALL_JSON%%", _json.dumps([globals()[k] for k in _csvf_names + ["CSVF_PROBLEM"]]))
+out += CSVF_TESTS
 open(sys.argv[1] if len(sys.argv) > 1 else "/dev/stdout", "w").write(out)

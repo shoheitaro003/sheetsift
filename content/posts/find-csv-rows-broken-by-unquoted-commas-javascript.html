@@ -1,0 +1,108 @@
+title: Find CSV rows broken by unquoted commas in JavaScript
+description: A value like Acme, Inc without quotes shifts every column after it. Tested JavaScript that finds these rows by line number and suggests a fix to confirm.
+date: 2026-11-13
+---
+<p>A customer uploads a CSV with the header <code>Name,Company,Amount</code>. One row reads <code>Ken Mori,Acme, Inc,120</code>. Whoever wrote the file did not put quotes around <code>Acme, Inc</code>, so the row has four values for three columns: <code>Inc</code> lands in Amount and <code>120</code> is dropped, or your import fails with "wrong number of fields" and no hint why.</p>
+<p>By the end of this post you will have <code>checkCsv(text)</code>, a small module with no dependencies. It returns the rows that are safe to import and, for every other row, an issue with its line number, the cause, and a repaired row when exactly one repair is explained by the data. Nothing is fixed without a person saying yes. Every function and every result below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22.</p>
+
+<h2>Why the parser cannot fix this on its own</h2>
+{{code:CSVF_PROBLEM}}
+<p>A better parser does not help. In the CSV this post handles (and step 1 parses), a value that contains the delimiter is wrapped in double quotes, and a quote inside such a value is written twice (<code>"Ross ""M"" Ltd"</code>). Without the quotes, <code>Acme, Inc</code> <em>is</em> two values as far as a parser can tell. The rest of the file can tell more: if every other row has a number in Amount and no row starts a value with a space, then <code>Acme</code> + <code>, Inc</code> is far more likely than a fourth column. The code below turns that reasoning into rules you can test; its parts go into one module, in order.</p>
+
+<h2>Step 1: parse, and keep line numbers and quote problems</h2>
+<p>To tell the user where a problem is, you need the line it is on in their file. A record (one row of values) can span several lines when a quoted value contains a line break, so counting records is not enough. <code>parseRecords</code> keeps the <em>physical line</em> each record starts on, the way a text editor numbers lines:</p>
+{{code:CSVF_PARSE}}
+<p>It reads one character at a time, because quotes change the meaning of everything after them. It also handles four quote cases; the first two and the last are noted, because a careful importer should not accept them silently:</p>
+<ul>
+<li><strong>A stray quote</strong>, as in <code>Fox 5" Ltd</code>: a quote inside a value that did not start with one. The value is kept as written, which is usually right, and flagged.</li>
+<li><strong>Text after a closing quote</strong>, as in <code>"Zeta" Corp</code>. The parts are joined to <code>Zeta Corp</code> and flagged.</li>
+<li><strong>Spaces around a quoted value</strong>, as in <code>"Yui", "Acme, Inc", 49</code>. Some files are written this way, so spaces before an opening quote and after a closing quote are dropped without a note.</li>
+<li><strong>A quote that never closes.</strong> Everything from there to the end of the file becomes one value. The record remembers where the quote opened, so the message can point at it.</li>
+</ul>
+<p>A short trace of <code>Zed Roe,"Zeta" Corp,8</code>: the quote after the first comma opens a quoted value, <code>Zeta</code> is read inside it, and the next quote closes it. The space after it is held back in <code>spaces</code>; if a delimiter came next it would be dropped, but <code>C</code> comes, so the space and <code>Corp</code> are added and the record gets the note <code>text-after-quote</code>.</p>
+<p>Line breaks can be <code>\r\n</code> (Windows), <code>\n</code>, or a lone <code>\r</code> (old Mac exports); all three count as one line, inside and outside quotes. <code>limit</code> stops after that many records, which step 2 uses.</p>
+
+<h2>Step 2: guess the delimiter, and say when you are not sure</h2>
+<p>A semicolon file read with commas also gives the "wrong" number of values on many rows, so settle the delimiter first. For each candidate, <code>guessDelimiter</code> parses the first 30 records and scores the share of rows with as many values as the first row:</p>
+{{code:CSVF_DELIM}}
+<p>It is sure when more than half of the rows agree and no other candidate scores more than half as well. One broken row in a small file does not make it unsure; a file where most rows are broken does. Our tests give:</p>
+<table>
+<tr><th>File</th><th>Result</th></tr>
+<tr><td><code>Name,Amount</code> / <code>Yui,49</code> / <code>Li,7</code></td><td><code>,</code> sure</td></tr>
+<tr><td><code>Kunde;Betrag</code> / <code>A GmbH;1.234,50</code> / <code>B AG;99,90</code></td><td><code>;</code> sure</td></tr>
+<tr><td>Tab-separated, with <code>ok, fine</code> in a value</td><td>tab, sure</td></tr>
+<tr><td>The file from step 5 with the <code>Acme, Inc</code> row (1 of 4 rows broken)</td><td><code>,</code> sure</td></tr>
+<tr><td><code>Name,Company</code> / <code>Yui,Acme, Inc</code> / <code>Li,Orbit, Ltd</code> (every row broken)</td><td><code>,</code> not sure</td></tr>
+<tr><td><code>a;b,c</code> / <code>1;2,3</code> (both delimiters fit)</td><td><code>,</code> not sure</td></tr>
+<tr><td>One column, or only a header row</td><td><code>,</code> not sure</td></tr>
+</table>
+<p>When it is not sure, show the first rows split both ways and let the user pick.</p>
+
+<h2>Step 3: learn what each column looks like</h2>
+<p>To judge a repair you need to know what a column normally holds. <code>columnKinds</code> looks only at rows that parsed cleanly with the right number of values:</p>
+{{code:CSVF_KINDS}}
+<p>Three kinds are enough for the rules in step 4. A column is <code>"number"</code> when every value is a plain number, and <code>"text"</code> when no value is, so a number landing in a Company column counts as wrong. Mixed columns, and columns with fewer than two values, accept anything. Blank cells always fit.</p>
+
+<h2>Step 4: find a join that the data explains</h2>
+<p>A row with <em>k</em> extra values was split at <em>k</em> commas too many. If they are next to each other, joining <em>k</em> + 1 neighbouring values back together repairs the row. <code>findJoins</code> tries every position:</p>
+{{code:CSVF_JOINS}}
+<p>Fitting the column kinds is not enough. In <code>Ken Mori,Acme, Inc,Osaka,120</code>, joining <code>Ken Mori,Acme</code> also leaves a row whose kinds fit, because every text column accepts <code>Inc</code>. So a join must also be explained by one of two patterns:</p>
+<ul>
+<li><strong>A comma inside a sentence.</strong> When people type a comma in a name or a note, a space usually follows it, as in <code>Acme, Inc</code>. The rule assumes the file's own delimiters are not followed by a space, and checks that on the clean rows first: if any value after the first column starts with a space (a file written as <code>a, b, c</code>), the rule is switched off. It is also off for tab files.</li>
+<li><strong>A thousands separator</strong> in a number column: <code>1</code> + <code>234</code> joined is <code>1,234</code>, a valid grouped number. <code>12,5</code> is not (it would be a decimal comma), so it is not joined. A grouped join can still be wrong, since <code>Porto,1,234</code> may also be a row shifted by one column, which is why it is only a suggestion.</li>
+</ul>
+<p>Several commas next to each other are one run: <code>Ken,hello, world, again,5</code> under <code>Name,Note,Amount</code> gives the note <code>hello, world, again</code>. The space rule wants exactly one space followed by text, so <code>Acme,  Inc</code> (two spaces) is not explained, and a single clean row with a value starting with a space turns the rule off for the whole file. Commas in different places would need two joins, which this code does not try. Only a single explained join becomes a suggestion. Two candidates mean the data cannot decide, and choosing one would be a guess.</p>
+
+<h2>Step 5: sort every row into imported or "needs a look"</h2>
+<p><code>checkCsv</code> puts it together. It skips blank lines and removes a byte order mark at the start of the text.</p>
+<p><code>headerIndex</code> counts records after blank lines are removed, not physical lines. If your header detection (see <a href="../detect-header-row-spreadsheet-javascript/">detecting the header row</a>) returns a line number, convert it first.</p>
+<p>A row with empty values at the end is treated as "trailing delimiters" only when the rest of it fits; otherwise it goes through the join search like any other row with too many values:</p>
+{{code:CSVF_CHECK}}
+<p>With the header <code>Name,Company,City,Amount</code> and three clean rows (<code>Yui Tanaka,Acme,Tokyo,49</code>, <code>Li Wei,Orbit,Lyon,7</code> and <code>Kim Park,"Park, Ltd",Seoul,9</code>), our tests give these results for one more line. "Two fit" means two joins are explained; "no space" means <code>Acme,Inc</code> could just as well be a shifted column.</p>
+<table>
+<tr><th>Line</th><th>Issue</th><th>Suggestion</th></tr>
+<tr><td><code>Ken Mori,<wbr>Acme,<wbr> Inc,<wbr>Osaka,<wbr>120</code></td><td>too-many</td><td><code>Acme, Inc</code></td></tr>
+<tr><td><code>Mori,<wbr> Ken,<wbr>Acme,<wbr>Osaka,<wbr>120</code></td><td>too-many</td><td><code>Mori, Ken</code></td></tr>
+<tr><td><code>Ana Lima,<wbr>Lima &amp; Co,<wbr>Porto,<wbr>1,<wbr>234</code></td><td>too-many</td><td><code>1,234</code></td></tr>
+<tr><td><code>Ana Lima,<wbr>Lima &amp; Co,<wbr>Porto,<wbr>1,<wbr>234.50</code></td><td>too-many</td><td><code>1,234.50</code></td></tr>
+<tr><td><code>Ken Mori,<wbr>Acme,<wbr> Inc,<wbr> Osaka,<wbr>120</code></td><td>too-many</td><td>none (two fit)</td></tr>
+<tr><td><code>Eve Ito,<wbr>Acme,<wbr>Inc,<wbr>Nara,<wbr>30</code></td><td>too-many</td><td>none (no space)</td></tr>
+<tr><td><code>Bo Chen,<wbr>Chen Ltd,<wbr>Lyon,<wbr>12,<wbr>5</code></td><td>too-many</td><td>none (not grouped)</td></tr>
+<tr><td><code>Ana Lima,<wbr>Lima,<wbr> Co,<wbr>Porto,<wbr>1,<wbr>234</code></td><td>too-many</td><td>none (commas apart)</td></tr>
+<tr><td><code>Bo Chen,<wbr>Chen Ltd,<wbr>Lyon,<wbr>15,<wbr>,<wbr></code></td><td>trailing-delimiter</td><td>drop the empties</td></tr>
+<tr><td><code>Sam Fox,<wbr>Fox Ltd,<wbr>120</code></td><td>too-few</td><td>none</td></tr>
+<tr><td><code>Sam Fox,<wbr>Fox 5" Ltd,<wbr>Leeds,<wbr>5</code></td><td>stray-quote</td><td>row as read</td></tr>
+<tr><td><code>Zed Roe,<wbr>"Zeta" Corp,<wbr>Oslo,<wbr>8</code></td><td>text-after-quote</td><td><code>Zeta Corp</code></td></tr>
+<tr><td><code>Mia Ross,<wbr>"Ross ""M"" Ltd",<wbr>Leeds,<wbr>7</code></td><td>none, imported</td><td>(read as <code>Ross "M" Ltd</code>)</td></tr>
+</table>
+<p>Each issue carries a message ready to show, such as <code>Line 5: 5 values, the header has 4. "Acme, Inc" as one value fits the other rows.</code> For a row with too few values, the message adds a hint when this line and the next together have the right count, which is what an unquoted line break inside a value looks like. That case gets no suggestion: a row that is simply missing a value looks the same, and the hint can also appear when the next line is a short row of its own.</p>
+<p>Empty values after the last column (<code>15,,</code>) are common in exports and lose nothing when dropped, but they are only dropped if the remaining values fit the columns. <code>Bo Chen,Lyon,15,,</code> in the same file is reported as too many values with no suggestion, because <code>15</code> would land in City: that row is missing its company. <code>Ken Mori,Acme, Inc,Osaka,</code> (Amount left blank) gets the <code>Acme, Inc</code> join.</p>
+<p>An unclosed quote is the one problem that hides other rows. In a file whose lines 2 to 5 are <code>Yui,Acme,49</code> / <code>Ken,"Mori Ltd,120</code> / <code>Li,Orbit,7</code> / <code>Bo,Chen,9</code>, everything from line 3 on becomes one value, so only Yui's row is imported and the message reads <code>Line 3: a quote opens on line 3 and never closes, so lines 3 to 5 became one value.</code> The user has to fix the file; any automatic recovery would be a guess about where the value was meant to end.</p>
+
+<h2>Step 6: let the user confirm</h2>
+<p><code>importCsv</code> connects the parts to your interface. <code>confirm</code> is a function you supply: show the message and the suggested row, return <code>true</code> if the user accepts.</p>
+{{code:CSVF_USE}}
+<p>Check <code>delimiterSure</code> before anything else: if it is false, ask the user to pick the delimiter and run <code>checkCsv</code> with their choice, without showing the row issues from the guess. Accepted rows go back in file order, so line numbers in later messages still match. Everything left in <code>open</code> needs the user to edit the file or skip the row; list those by line number and let them download the list. A wrong delimiter makes every row look broken, which is why the delimiter comes first.</p>
+<p>A repaired value is still text: <code>1,234</code> needs its separator removed before <code>Number()</code>, which returns <code>NaN</code> for it. Parsing numbers, including decimal commas, is covered in <a href="../parse-european-number-formats-javascript/">parsing European number formats</a>.</p>
+<p>If you already use a CSV library, you do not have to replace it. Run <code>checkCsv</code> on the same text when the library reports rows with the wrong number of fields, and import the rows it accepts plus the suggestions your user confirms.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>A broken header row.</strong> The header sets the number of columns, so an unquoted comma in it, or a delimiter at its end, makes every row look wrong. If most rows have one value more or fewer than the header, check the header first.</li>
+<li><strong>Two separate unquoted commas in one row.</strong> Only one run of neighbouring values is joined, so such rows are flagged without a suggestion.</li>
+<li><strong>Files written as <code>a, b, c</code></strong> without quotes get flags only (and grouped-number joins), since the space rule is off for them.</li>
+<li><strong>A first line such as <code>sep=;</code></strong> that names the delimiter. If your files can have one, remove it before calling <code>checkCsv</code>, or it becomes the header.</li>
+<li><strong>Kinds beyond plain numbers.</strong> <code>$49</code>, <code>12.5%</code> and dates are treated as text. Extend <code>NUMBER</code> or add kinds for the formats your columns hold.</li>
+<li><strong>Files where few rows are clean.</strong> With fewer than two clean values in a column, its kind is <code>"any"</code> and only the space rule can explain a join.</li>
+<li><strong>Repairing line breaks</strong> inside unquoted values: you get a hint, not a fix.</li>
+<li><strong>Very large files.</strong> The whole text is parsed in memory, which is fine for typical uploads.</li>
+<li><strong>Decoding and header detection</strong>, which come before this. See <a href="../decode-shift-jis-windows-1252-utf-16-csv-javascript/">reading Shift_JIS, Windows-1252 and UTF-16 files</a> and <a href="../detect-header-row-spreadsheet-javascript/">detecting the header row</a>.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer. In the demo on our homepage, a row with more values than columns is marked for a decision instead of being cut silently, with a note that a value may contain an unquoted comma; suggested repairs like the ones in this post are not in the demo yet. It runs in your browser: drop in a file and nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. You are free to use the functions in this post in your own code.</p>
