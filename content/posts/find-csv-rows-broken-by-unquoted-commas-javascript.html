@@ -20,12 +20,13 @@ date: 2026-11-13
 <li><strong>A quote that never closes.</strong> Everything from there to the end of the file becomes one value. The record remembers where the quote opened, so the message can point at it.</li>
 </ul>
 <p>A short trace of <code>Zed Roe,"Zeta" Corp,8</code>: the quote after the first comma opens a quoted value, <code>Zeta</code> is read inside it, and the next quote closes it. The space after it is held back in <code>spaces</code>; if a delimiter came next it would be dropped, but <code>C</code> comes, so the space and <code>Corp</code> are added and the record gets the note <code>text-after-quote</code>.</p>
-<p>Line breaks can be <code>\r\n</code> (Windows), <code>\n</code>, or a lone <code>\r</code> (old Mac exports); all three count as one line, inside and outside quotes. <code>limit</code> stops after that many records, which step 2 uses.</p>
+<p>A second trace, for a file written as <code>"Yui", "Acme, Inc", 49</code>: after the first comma, the next character is a space, so the record is marked <code>spaced</code>. The space is added to the field, but the quote that follows still opens a quoted value because the field holds only spaces so far; <code>field = ""</code> drops them. The comma inside the quotes is kept as text.</p>
+<p>Line breaks can be <code>\r\n</code> (Windows), <code>\n</code>, or a lone <code>\r</code>; all three count as one line, inside and outside quotes. Each record also notes whether any of its delimiters is followed by a space (<code>spaced</code>), which step 4 needs. <code>limit</code> stops after that many records, which step 2 uses.</p>
 
 <h2>Step 2: guess the delimiter, and say when you are not sure</h2>
 <p>A semicolon file read with commas also gives the "wrong" number of values on many rows, so settle the delimiter first. For each candidate, <code>guessDelimiter</code> parses the first 30 records and scores the share of rows with as many values as the first row:</p>
 {{code:CSVF_DELIM}}
-<p>It is sure when more than half of the rows agree and no other candidate scores more than half as well. One broken row in a small file does not make it unsure; a file where most rows are broken does. Our tests give:</p>
+<p>It is sure when more than half of the rows agree and no other candidate scores more than half as well. In a file with at least three data rows, one broken row does not make it unsure; a file where most rows are broken does. Our tests give:</p>
 <table>
 <tr><th>File</th><th>Result</th></tr>
 <tr><td><code>Name,Amount</code> / <code>Yui,49</code> / <code>Li,7</code></td><td><code>,</code> sure</td></tr>
@@ -36,7 +37,7 @@ date: 2026-11-13
 <tr><td><code>a;b,c</code> / <code>1;2,3</code> (both delimiters fit)</td><td><code>,</code> not sure</td></tr>
 <tr><td>One column, or only a header row</td><td><code>,</code> not sure</td></tr>
 </table>
-<p>When it is not sure, show the first rows split both ways and let the user pick.</p>
+<p>When it is not sure, show the first rows split each way and let the user pick; step 6 then runs with their choice. The fifth row shows why a guess cannot do better: when every row is broken, the commas split the rows into different numbers of values, just as a wrong delimiter would.</p>
 
 <h2>Step 3: learn what each column looks like</h2>
 <p>To judge a repair you need to know what a column normally holds. <code>columnKinds</code> looks only at rows that parsed cleanly with the right number of values:</p>
@@ -48,13 +49,14 @@ date: 2026-11-13
 {{code:CSVF_JOINS}}
 <p>Fitting the column kinds is not enough. In <code>Ken Mori,Acme, Inc,Osaka,120</code>, joining <code>Ken Mori,Acme</code> also leaves a row whose kinds fit, because every text column accepts <code>Inc</code>. So a join must also be explained by one of two patterns:</p>
 <ul>
-<li><strong>A comma inside a sentence.</strong> When people type a comma in a name or a note, a space usually follows it, as in <code>Acme, Inc</code>. The rule assumes the file's own delimiters are not followed by a space, and checks that on the clean rows first: if any value after the first column starts with a space (a file written as <code>a, b, c</code>), the rule is switched off. It is also off for tab files.</li>
+<li><strong>A comma inside a sentence.</strong> When people type a comma in a name or a note, a space usually follows it, as in <code>Acme, Inc</code>. The rule assumes the file's own delimiters are not followed by a space, and checks that on the clean rows first: if any delimiter there is followed by a space (a file written as <code>a, b, c</code> or <code>"a", "b"</code>), the rule is switched off. A quoted value that starts with a space, such as <code>" Orbit"</code>, does not count. The rule is also off for tab files.</li>
 <li><strong>A thousands separator</strong> in a number column: <code>1</code> + <code>234</code> joined is <code>1,234</code>, a valid grouped number. <code>12,5</code> is not (it would be a decimal comma), so it is not joined. A grouped join can still be wrong, since <code>Porto,1,234</code> may also be a row shifted by one column, which is why it is only a suggestion.</li>
 </ul>
-<p>Several commas next to each other are one run: <code>Ken,hello, world, again,5</code> under <code>Name,Note,Amount</code> gives the note <code>hello, world, again</code>. The space rule wants exactly one space followed by text, so <code>Acme,  Inc</code> (two spaces) is not explained, and a single clean row with a value starting with a space turns the rule off for the whole file. Commas in different places would need two joins, which this code does not try. Only a single explained join becomes a suggestion. Two candidates mean the data cannot decide, and choosing one would be a guess.</p>
+<p>Several commas next to each other are one run: <code>Ken,hello, world, again,5</code> under <code>Name,Note,Amount</code> gives the note <code>hello, world, again</code>. The space rule wants exactly one space followed by text, so <code>Acme,  Inc</code> (two spaces) is not explained, and a single clean row with a space after a delimiter turns the rule off for the whole file. Only a single explained join becomes a suggestion. Two candidates mean the data cannot decide, and choosing one would be a guess.</p>
+<p>Commas in different places, as in <code>Mori, Ken,Acme, Inc,Osaka,120</code>, would need two joins, which this code does not try. When a row has two or more extra values and no single join explains them, the message says "more than one value may need quotes", so the user knows to look for two values, not one.</p>
 
 <h2>Step 5: sort every row into imported or "needs a look"</h2>
-<p><code>checkCsv</code> puts it together. It skips blank lines and removes a byte order mark at the start of the text.</p>
+<p><code>checkCsv</code> puts it together. It skips blank lines and rows whose values are all empty (such as <code>,,,</code>), and removes a byte order mark at the start of the text.</p>
 <p><code>headerIndex</code> counts records after blank lines are removed, not physical lines. If your header detection (see <a href="../detect-header-row-spreadsheet-javascript/">detecting the header row</a>) returns a line number, convert it first.</p>
 <p>A row with empty values at the end is treated as "trailing delimiters" only when the rest of it fits; otherwise it goes through the join search like any other row with too many values:</p>
 {{code:CSVF_CHECK}}
@@ -75,24 +77,25 @@ date: 2026-11-13
 <tr><td><code>Zed Roe,<wbr>"Zeta" Corp,<wbr>Oslo,<wbr>8</code></td><td>text-after-quote</td><td><code>Zeta Corp</code></td></tr>
 <tr><td><code>Mia Ross,<wbr>"Ross ""M"" Ltd",<wbr>Leeds,<wbr>7</code></td><td>none, imported</td><td>(read as <code>Ross "M" Ltd</code>)</td></tr>
 </table>
-<p>Each issue carries a message ready to show, such as <code>Line 5: 5 values, the header has 4. "Acme, Inc" as one value fits the other rows.</code> For a row with too few values, the message adds a hint when this line and the next together have the right count, which is what an unquoted line break inside a value looks like. That case gets no suggestion: a row that is simply missing a value looks the same, and the hint can also appear when the next line is a short row of its own.</p>
+<p>Each issue carries a message ready to show, such as <code>Line 5: 5 values, the header has 4. "Acme, Inc" as one value fits the other rows.</code> Rows with a quote problem and the wrong number of values get both in one message, with no suggestion.</p>
+<p>For a row with too few values, the issue covers the next line too when the two together have the right count, which is what an unquoted line break inside a value looks like: <code>Line 4: 2 values, the header has 3. With line 5 it would fit: a line break inside a value?</code> Its <code>endLine</code> is 5, and line 5 gets no issue of its own. There is no suggestion: two short rows that are each missing a value can look the same.</p>
 <p>Empty values after the last column (<code>15,,</code>) are common in exports and lose nothing when dropped, but they are only dropped if the remaining values fit the columns. <code>Bo Chen,Lyon,15,,</code> in the same file is reported as too many values with no suggestion, because <code>15</code> would land in City: that row is missing its company. <code>Ken Mori,Acme, Inc,Osaka,</code> (Amount left blank) gets the <code>Acme, Inc</code> join.</p>
 <p>An unclosed quote is the one problem that hides other rows. In a file whose lines 2 to 5 are <code>Yui,Acme,49</code> / <code>Ken,"Mori Ltd,120</code> / <code>Li,Orbit,7</code> / <code>Bo,Chen,9</code>, everything from line 3 on becomes one value, so only Yui's row is imported and the message reads <code>Line 3: a quote opens on line 3 and never closes, so lines 3 to 5 became one value.</code> The user has to fix the file; any automatic recovery would be a guess about where the value was meant to end.</p>
 
 <h2>Step 6: let the user confirm</h2>
-<p><code>importCsv</code> connects the parts to your interface. <code>confirm</code> is a function you supply: show the message and the suggested row, return <code>true</code> if the user accepts.</p>
+<p><code>importCsv</code> connects the parts to your interface. <code>confirm</code> is a function you supply: show the message and the suggested row, and return <code>true</code> (or a promise of <code>true</code>, from a modal) if the user accepts. Anything else counts as no. Because of that, <code>importCsv</code> returns a promise: <code>const result = await importCsv(text, confirm)</code>.</p>
 {{code:CSVF_USE}}
-<p>Check <code>delimiterSure</code> before anything else: if it is false, ask the user to pick the delimiter and run <code>checkCsv</code> with their choice, without showing the row issues from the guess. Accepted rows go back in file order, so line numbers in later messages still match. Everything left in <code>open</code> needs the user to edit the file or skip the row; list those by line number and let them download the list. A wrong delimiter makes every row look broken, which is why the delimiter comes first.</p>
-<p>A repaired value is still text: <code>1,234</code> needs its separator removed before <code>Number()</code>, which returns <code>NaN</code> for it. Parsing numbers, including decimal commas, is covered in <a href="../parse-european-number-formats-javascript/">parsing European number formats</a>.</p>
+<p>If the delimiter guess is not sure, <code>importCsv</code> returns no rows and <code>delimiterSure: false</code>: ask the user to pick, then call it again with their choice as the third argument. Row issues from a wrong delimiter would be noise. Accepted rows go back in file order, so line numbers in later messages still match. Everything left in <code>open</code> needs the user to edit the file or skip the row; list those by line number and let them download the list. A wrong delimiter makes every row look broken, which is why the delimiter comes first.</p>
+<p>Values are returned as they were in the file, spaces included, so trim them when you store them. A repaired value is still text: <code>1,234</code> needs its separator removed before <code>Number()</code>, which returns <code>NaN</code> for it. Parsing numbers, including decimal commas, is covered in <a href="../parse-european-number-formats-javascript/">parsing European number formats</a>.</p>
 <p>If you already use a CSV library, you do not have to replace it. Run <code>checkCsv</code> on the same text when the library reports rows with the wrong number of fields, and import the rows it accepts plus the suggestions your user confirms.</p>
 
 <h2>What this does not cover</h2>
 <ul>
 <li><strong>A broken header row.</strong> The header sets the number of columns, so an unquoted comma in it, or a delimiter at its end, makes every row look wrong. If most rows have one value more or fewer than the header, check the header first.</li>
 <li><strong>Two separate unquoted commas in one row.</strong> Only one run of neighbouring values is joined, so such rows are flagged without a suggestion.</li>
-<li><strong>Files written as <code>a, b, c</code></strong> without quotes get flags only (and grouped-number joins), since the space rule is off for them.</li>
+<li><strong>Files written as <code>a, b, c</code></strong>, or with even one clean row that has a space after a delimiter, get flags only (and grouped-number joins), since the space rule is off for them.</li>
 <li><strong>A first line such as <code>sep=;</code></strong> that names the delimiter. If your files can have one, remove it before calling <code>checkCsv</code>, or it becomes the header.</li>
-<li><strong>Kinds beyond plain numbers.</strong> <code>$49</code>, <code>12.5%</code> and dates are treated as text. Extend <code>NUMBER</code> or add kinds for the formats your columns hold.</li>
+<li><strong>Kinds beyond plain numbers.</strong> Decimal commas such as <code>1,5</code> count as numbers only when the delimiter is not a comma. <code>$49</code>, <code>12.5%</code> and dates are treated as text. Extend <code>isNumber</code> or add kinds for the formats your columns hold.</li>
 <li><strong>Files where few rows are clean.</strong> With fewer than two clean values in a column, its kind is <code>"any"</code> and only the space rule can explain a join.</li>
 <li><strong>Repairing line breaks</strong> inside unquoted values: you get a hint, not a fix.</li>
 <li><strong>Very large files.</strong> The whole text is parsed in memory, which is fine for typical uploads.</li>

@@ -940,8 +940,8 @@ ok("csvf: messages name the line and the cause", () => {
   assert.deepStrictEqual(r.issues.map((i) => i.message), [
     'Line 5: 5 values, the header has 4. "Acme, Inc" as one value fits the other rows.',
     "Line 6: 3 values, the header has 4.",
-    "Line 7: 5 values, the header has 4. No single join fits the other rows.",
-    "Line 8: 6 values, the header has 4. No single join fits the other rows.",
+    "Line 7: 5 values, the header has 4. No join is explained by a space after the delimiter or a grouped number, so the data cannot tell which values belong together.",
+    "Line 8: 6 values, the header has 4. No single join of neighbouring values explains them: more than one value may need quotes.",
   ]);
 });
 ok("csvf: ambiguous joins are not suggested", () => {
@@ -964,7 +964,7 @@ ok("csvf: spaced files with quotes, and long prose joins", () => {
 ok("csvf: trailing delimiters only when the rest fits", () => {
   const r = checkCsv("Name,Company,City,Amount\nYui,Acme,Tokyo,49\nLi,Orbit,Lyon,7\nBo Chen,Lyon,15,,\nAl,Ace,Rome,3,\n");
   assert.deepStrictEqual(r.issues.map((i) => [i.message, i.suggestion]), [
-    ["Line 4: 5 values, the header has 4. No single join fits the other rows.", null],
+    ["Line 4: 5 values, the header has 4. No join is explained by a space after the delimiter or a grouped number, so the data cannot tell which values belong together.", null],
     ["Line 5: 1 value after the last column, all empty.", ["Al", "Ace", "Rome", "3"]],
   ]);
 });
@@ -983,9 +983,12 @@ ok("csvf: tab files never join", () => {
 });
 ok("csvf: too few values, and a line break inside a value", () => {
   const r = checkCsv("Name,Note,Amount\nYui,ok,49\nLi,fine,7\nKen,first part\nsecond part,120\n");
-  assert.deepStrictEqual(r.issues.map((i) => [i.line, i.kind]), [[4, "too-few"], [5, "too-few"]]);
-  assert(r.issues[0].message.endsWith("With the next line it would fit: a line break inside a value?"));
-  assert.strictEqual(r.issues[1].message, "Line 5: 2 values, the header has 3.");
+  assert.deepStrictEqual(r.issues.map((i) => [i.line, i.endLine, i.kind]), [[4, 5, "too-few"]]);
+  assert.strictEqual(r.issues[0].message, "Line 4: 2 values, the header has 3. With line 5 it would fit: a line break inside a value?");
+  assert.strictEqual(r.rows.length, 2);
+  // Two short rows that do not add up stay two issues.
+  const two = checkCsv("Name,Note,Amount\nYui,ok,49\nKen\nLi\n");
+  assert.deepStrictEqual(two.issues.map((i) => [i.line, i.endLine]), [[3, 3], [4, 4]]);
   assert.strictEqual(checkCsv("Name,Amount\nYui\n").issues[0].message, "Line 2: 1 value, the header has 2.");
   assert.strictEqual(r.issues[0].suggestion, null);
 });
@@ -995,7 +998,7 @@ ok("csvf: an unclosed quote stops the import there", () => {
   assert.deepStrictEqual(r.issues.map((i) => i.message), ["Line 3: a quote opens on line 3 and never closes, so lines 3 to 5 became one value."]);
   assert.strictEqual(r.issues[0].suggestion, null);
   const noNewline = checkCsv("Name,Note\nYui,\"open");
-  assert(noNewline.issues[0].message.includes("lines 2 to 2"));
+  assert(noNewline.issues[0].message.endsWith("so the rest of the file became one value."));
 });
 ok("csvf: parseRecords keeps physical line numbers", () => {
   const recs = parseRecords('Name,Note\r\n"Yui","two\r\nlines"\r\nKen,"a ""quoted"" word"\rLi,""\n\nBo,x');
@@ -1052,15 +1055,64 @@ ok("csvf: kinds need two values; fits ignores blanks", () => {
   assert(Number.isNaN(Number("1,234"))); // why a repaired value still needs parsing
   for (const v of ["12,5", "1,2345", "$49", "1.234,50", ",123", "1,23"]) assert(!NUMBER.test(v), v);
 });
-ok("csvf: importCsv keeps file order and leaves the rest open", () => {
+ok("csvf: importCsv keeps file order and leaves the rest open", async () => {
   const text = "Name,Company,Amount\nYui,Acme,49\nKen,Acme, Inc,120\nLi,Orbit,7\nBo,Chen,,\nSam,Fox\n";
-  const yes = importCsv(text, () => true);
+  const unsure = await importCsv(text, () => true);
+  assert.deepStrictEqual(unsure, { header: [], rows: [], open: [], delimiter: ",", delimiterSure: false });
+  const yes = await importCsv(text, () => true, ",");
   assert.deepStrictEqual(yes.rows.map((r) => r.fields), [["Yui", "Acme", "49"], ["Ken", "Acme, Inc", "120"], ["Li", "Orbit", "7"], ["Bo", "Chen", ""]]);
   assert.deepStrictEqual(yes.open.map((i) => i.kind), ["too-few"]);
-  assert.deepStrictEqual([yes.delimiter, yes.delimiterSure], [",", false]);
-  const no = importCsv(text, () => false);
+  assert.deepStrictEqual([yes.delimiter, yes.delimiterSure], [",", true]);
+  const no = await importCsv(text, () => false, ",");
   assert.deepStrictEqual(no.rows.map((r) => r.line), [2, 4]);
   assert.deepStrictEqual(no.open.map((i) => i.kind), ["too-many", "trailing-delimiter", "too-few"]);
+  // A modal that answers later: a promise of false must not count as yes.
+  const later = await importCsv(text, async () => false, ",");
+  assert.deepStrictEqual(later.rows.map((r) => r.line), [2, 4]);
+  const laterYes = await importCsv(text, async () => true, ",");
+  assert.strictEqual(laterYes.rows.length, 4);
+});
+ok("csvf: a short row before a complete row is not merged with it", () => {
+  const r = checkCsv("Name,Company,Amount\nYui,Acme,49\nSam\nLi,Orbit,7\n");
+  assert.deepStrictEqual(r.rows.map((x) => x.line), [2, 4]);
+  assert.deepStrictEqual(r.issues.map((i) => [i.line, i.endLine, i.message]), [[3, 3, "Line 3: 1 value, the header has 3."]]);
+});
+ok("csvf: decimal commas count as numbers when the delimiter is not a comma", () => {
+  const r = checkCsv("Name;Amount\nA;1,5\nB;2,5\nC;3;\nD;x;\n", { delimiter: ";" });
+  assert.deepStrictEqual(r.issues.map((i) => [i.kind, i.suggestion]), [["trailing-delimiter", ["C", "3"]], ["too-many", null]]);
+  assert(isNumber("1.234,50", ";") && isNumber("1.5", ";") && !isNumber("1,5") && !isNumber("1.234,50"));
+});
+ok("csvf: an unclosed quote ignores blank lines at the end", () => {
+  const r = checkCsv('Name,Note\nYui,ok\nKen,"x\n\n\n');
+  assert.strictEqual(r.issues[0].message, "Line 3: a quote opens on line 3 and never closes, so the rest of the file became one value.");
+  const two = checkCsv('Name,Note\nKen,"x\ny\r\n\r\n');
+  assert(two.issues[0].message.includes("lines 2 to 3"));
+});
+ok("csvf: rows of empty values are skipped like blank lines", () => {
+  const r = checkCsv("Name,Company,City,Amount\nYui,Acme,Tokyo,49\n,,,\n , ,\n,,\nLi,Orbit,Lyon,7\n");
+  assert.deepStrictEqual([r.rows.map((x) => x.line), r.issues], [[2, 6], []]);
+  assert.strictEqual(checkCsv('Name,Note\n,""\n').issues.length, 0);
+});
+ok("csvf: a quote problem with the wrong count says both", () => {
+  const r = checkCsv(CSVF_BASE + 'Sam Fox,Fox 5" Ltd, Inc,Leeds,5\n');
+  assert.deepStrictEqual([r.issues[0].kind, r.issues[0].suggestion], ["stray-quote", null]);
+  assert.strictEqual(r.issues[0].message, "Line 5: 5 values, the header has 4, and a quote mark inside a value that does not start with one. Check that it reads correctly.");
+});
+ok("csvf: only a space after a delimiter makes a file spaced", () => {
+  // A quoted value that starts with a space does not switch the rule off.
+  const r = checkCsv(CSVF_BASE + 'Li Wei," Orbit",Lyon,7\nKen Mori,Acme, Inc,Osaka,120\n');
+  assert.deepStrictEqual(r.issues.map((i) => i.suggestion), [["Ken Mori", "Acme, Inc", "Osaka", "120"]]);
+  // A space after a delimiter does, even before a quote.
+  const s = checkCsv(CSVF_BASE + 'Li Wei, "Orbit",Lyon,7\nKen Mori,Acme, Inc,Osaka,120\n');
+  assert.strictEqual(s.issues[0].suggestion, null);
+  assert.deepStrictEqual(parseRecords('a, b\nc,d').map((x) => x.spaced), [true, false]);
+});
+ok("csvf: two separate unquoted commas get no suggestion", () => {
+  const r = checkCsv(CSVF_BASE + "Mori, Ken,Acme, Inc,Osaka,120\n");
+  assert.deepStrictEqual([r.issues[0].kind, r.issues[0].suggestion], ["too-many", null]);
+  assert(r.issues[0].message.endsWith("No single join of neighbouring values explains them: more than one value may need quotes."));
+  const apart = checkCsv(CSVF_BASE + "Ana Lima,Lima, Co,Porto,1,234\n");
+  assert(apart.issues[0].message.endsWith("more than one value may need quotes."));
 });
 ok("csvf: no invisible characters in the snippets", () => {
   for (const s of %%CSVF_ALL_JSON%%) assert(!/[\u00A0\u200B-\u200F\u2028\u2029\uFEFF]/.test(s));

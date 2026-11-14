@@ -1655,14 +1655,15 @@ ok("map: no invisible characters in the snippets", () => {
 function parseRecords(text, delimiter = ",", limit = Infinity) {
   const records = [];
   let fields = [], field = "", line = 1, start = 1, problems = [];
-  let quoted = false, closed = false, quoteLine = 0, spaces = "";
+  let quoted = false, closed = false, quoteLine = 0, spaces = "", spaced = false;
   const note = (problem) => { if (!problems.includes(problem)) problems.push(problem); };
   const endField = () => { fields.push(field); field = ""; closed = false; spaces = ""; };
   const endRecord = () => {
     endField();
-    records.push({ line: start, fields, problems });
+    records.push({ line: start, fields, problems, spaced });
     fields = [];
     problems = [];
+    spaced = false;
   };
   for (let i = 0; i < text.length && records.length < limit; i++) {
     const c = text[i];
@@ -1674,6 +1675,7 @@ function parseRecords(text, delimiter = ",", limit = Infinity) {
         field += c;
       }
     } else if (c === delimiter) {
+      if (text[i + 1] === " ") spaced = true; // the file may write "a, b, c"
       endField();
     } else if (c === "\n" || c === "\r") {
       if (c === "\r" && text[i + 1] === "\n") i++;
@@ -1695,15 +1697,18 @@ function parseRecords(text, delimiter = ",", limit = Infinity) {
   if (quoted) {
     // The quote never closed: the rest of the file became one value.
     fields.push(field);
-    const lastLine = /[\r\n]$/.test(text) ? line - 1 : line;
-    records.push({ line: start, fields, problems: ["unclosed-quote"], quoteLine, lastLine });
+    // The last line with text on it; blank lines at the end do not count.
+    const lastLine = quoteLine + (field.trimEnd().match(/\r\n|\r|\n/g) || []).length;
+    records.push({ line: start, fields, problems: ["unclosed-quote"], spaced, quoteLine, lastLine });
   } else if (field !== "" || fields.length || closed) {
     endRecord();
   }
   return records;
 }
 
-const isBlank = (record) => record.fields.length === 1 && record.fields[0] === "";
+// A blank line, or a row of empty values such as ",,," from Excel.
+const isBlank = (record) =>
+  !record.problems.length && record.fields.every((f) => f.trim() === "");
 
 function guessDelimiter(text, candidates = [",", ";", "\t", "|"]) {
   const scores = candidates.map((delimiter) => {
@@ -1724,24 +1729,28 @@ function guessDelimiter(text, candidates = [",", ";", "\t", "|"]) {
 
 // A plain number, with or without thousands separators: 49, -1,234.50
 const NUMBER = /^[-+]?(\d+|\d{1,3}(,\d{3})+)(\.\d+)?$/;
+// Files that do not use the comma as delimiter often use it for decimals: 1.234,50
+const DECIMAL_COMMA = /^[-+]?(\d+|\d{1,3}(\.\d{3})+)(,\d+)?$/;
+const isNumber = (v, delimiter = ",") =>
+  NUMBER.test(v) || (delimiter !== "," && DECIMAL_COMMA.test(v));
 
 // "number" if every value in the column is a number, "text" if none is,
 // "any" if it is mixed or has fewer than two values.
-function columnKinds(rows, width) {
+function columnKinds(rows, width, delimiter = ",") {
   return Array.from({ length: width }, (_, column) => {
     const values = rows.map((r) => r.fields[column].trim()).filter(Boolean);
     if (values.length < 2) return "any";
-    const numbers = values.filter((v) => NUMBER.test(v)).length;
+    const numbers = values.filter((v) => isNumber(v, delimiter)).length;
     if (numbers === values.length) return "number";
     return numbers === 0 ? "text" : "any";
   });
 }
 
-function fits(fields, kinds) {
+function fits(fields, kinds, delimiter = ",") {
   return fields.every((value, column) => {
     const v = value.trim();
     if (!v || kinds[column] === "any") return true;
-    return (kinds[column] === "number") === NUMBER.test(v);
+    return (kinds[column] === "number") === isNumber(v, delimiter);
   });
 }
 
@@ -1760,7 +1769,7 @@ function findJoins(fields, width, kinds, delimiter, spacedFile) {
     const grouped = delimiter === "," && kinds[at] === "number" &&
       NUMBER.test(joined.trim());
     const result = [...fields.slice(0, at), joined, ...fields.slice(at + extra + 1)];
-    if ((prose || grouped) && fits(result, kinds)) joins.push({ at, result });
+    if ((prose || grouped) && fits(result, kinds, delimiter)) joins.push({ at, result });
   }
   return joins;
 }
@@ -1780,29 +1789,35 @@ function checkCsv(text, { delimiter = ",", headerIndex = 0 } = {}) {
   const width = header.fields.length;
   const body = records.slice(headerIndex + 1);
   const good = body.filter((r) => r.fields.length === width && !r.problems.length);
-  const kinds = columnKinds(good, width);
-  // If the file writes "a, b, c", a leading space explains nothing.
-  const spacedFile = good.some((r) => r.fields.slice(1).some((f) => f.startsWith(" ")));
+  const kinds = columnKinds(good, width, delimiter);
+  // If the file writes "a, b, c", a space after a comma explains nothing.
+  const spacedFile = good.some((r) => r.spaced);
   const rows = [], issues = [];
   const values = (n) => `${n} ${n === 1 ? "value" : "values"}`;
-  const report = (r, kind, message, suggestion = null) => issues.push({
-    line: r.line, kind, message: `Line ${r.line}: ${message}`, fields: r.fields, suggestion,
+  const report = (r, kind, message, suggestion = null, endLine = r.line) => issues.push({
+    line: r.line, endLine, kind, message: `Line ${r.line}: ${message}`, fields: r.fields,
+    suggestion,
   });
+  let skip = -1; // a line already covered by the issue before it
 
   body.forEach((r, index) => {
+    if (index === skip) return;
     const count = r.fields.length;
     if (r.problems.includes("unclosed-quote")) {
+      const lines = r.lastLine > r.quoteLine
+        ? `lines ${r.quoteLine} to ${r.lastLine}` : "the rest of the file";
       report(r, "unclosed-quote", `a quote opens on line ${r.quoteLine} and never ` +
-        `closes, so lines ${r.quoteLine} to ${r.lastLine} became one value.`);
+        `closes, so ${lines} became one value.`);
     } else if (r.problems.length) {
       const what = r.problems.map((p) => QUOTE_PROBLEMS[p]).join(" and ");
-      report(r, r.problems[0], `${what}. Check that it reads correctly.`,
+      const counted = count === width ? "" : `${values(count)}, the header has ${width}, and `;
+      report(r, r.problems[0], `${counted}${what}. Check that it reads correctly.`,
         count === width ? r.fields : null);
     } else if (count === width) {
       rows.push(r);
     } else if (count > width) {
       const kept = r.fields.slice(0, width);
-      if (r.fields.slice(width).every((f) => !f.trim()) && fits(kept, kinds)) {
+      if (r.fields.slice(width).every((f) => !f.trim()) && fits(kept, kinds, delimiter)) {
         report(r, "trailing-delimiter", `${values(count - width)} after the last column, ` +
           "all empty.", kept);
         return;
@@ -1811,28 +1826,41 @@ function checkCsv(text, { delimiter = ",", headerIndex = 0 } = {}) {
       const why = joins.length === 1
         ? `${JSON.stringify(joins[0].result[joins[0].at])} as one value fits the other rows.`
         : joins.length ? `${joins.length} different joins would fit, so none is suggested.`
-        : "No single join fits the other rows.";
+        : count - width > 1 ? "No single join of neighbouring values explains them: " +
+          "more than one value may need quotes."
+        : "No join is explained by a space after the delimiter or a grouped number, " +
+          "so the data cannot tell which values belong together.";
       report(r, "too-many", `${values(count)}, the header has ${width}. ${why}`,
         joins.length === 1 ? joins[0].result : null);
     } else {
+      // An unquoted line break splits one row into two short ones.
       const next = body[index + 1];
-      const hint = next && count + next.fields.length - 1 === width
-        ? " With the next line it would fit: a line break inside a value?" : "";
-      report(r, "too-few", `${values(count)}, the header has ${width}.${hint}`);
+      const short = next && !next.problems.length && next.fields.length < width;
+      if (short && count + next.fields.length - 1 === width) {
+        skip = index + 1;
+        report(r, "too-few", `${values(count)}, the header has ${width}. With line ` +
+          `${next.line} it would fit: a line break inside a value?`, null, next.line);
+      } else {
+        report(r, "too-few", `${values(count)}, the header has ${width}.`);
+      }
     }
   });
   return { header: header.fields, rows, issues };
 }
 
-// confirm(issue) is your UI: show issue.message and issue.suggestion,
-// return true if the user accepts the suggestion.
-function importCsv(text, confirm) {
-  const guess = guessDelimiter(text);
+// confirm(issue) is your UI: show issue.message and issue.suggestion, and
+// return (or resolve to) true if the user accepts the suggestion. Pass `delimiter` once the
+// user has picked one; without it, an unsure guess returns no rows.
+async function importCsv(text, confirm, delimiter) {
+  const guess = delimiter ? { delimiter, sure: true } : guessDelimiter(text);
+  if (!guess.sure) {
+    return { header: [], rows: [], open: [], delimiter: guess.delimiter, delimiterSure: false };
+  }
   const { header, rows, issues } = checkCsv(text, { delimiter: guess.delimiter });
   const accepted = rows.map((r) => ({ line: r.line, fields: r.fields }));
   const open = [];
   for (const issue of issues) {
-    if (issue.suggestion && confirm(issue)) {
+    if (issue.suggestion && (await confirm(issue)) === true) {
       accepted.push({ line: issue.line, fields: issue.suggestion });
     } else {
       open.push(issue);
@@ -1868,8 +1896,8 @@ ok("csvf: messages name the line and the cause", () => {
   assert.deepStrictEqual(r.issues.map((i) => i.message), [
     'Line 5: 5 values, the header has 4. "Acme, Inc" as one value fits the other rows.',
     "Line 6: 3 values, the header has 4.",
-    "Line 7: 5 values, the header has 4. No single join fits the other rows.",
-    "Line 8: 6 values, the header has 4. No single join fits the other rows.",
+    "Line 7: 5 values, the header has 4. No join is explained by a space after the delimiter or a grouped number, so the data cannot tell which values belong together.",
+    "Line 8: 6 values, the header has 4. No single join of neighbouring values explains them: more than one value may need quotes.",
   ]);
 });
 ok("csvf: ambiguous joins are not suggested", () => {
@@ -1892,7 +1920,7 @@ ok("csvf: spaced files with quotes, and long prose joins", () => {
 ok("csvf: trailing delimiters only when the rest fits", () => {
   const r = checkCsv("Name,Company,City,Amount\nYui,Acme,Tokyo,49\nLi,Orbit,Lyon,7\nBo Chen,Lyon,15,,\nAl,Ace,Rome,3,\n");
   assert.deepStrictEqual(r.issues.map((i) => [i.message, i.suggestion]), [
-    ["Line 4: 5 values, the header has 4. No single join fits the other rows.", null],
+    ["Line 4: 5 values, the header has 4. No join is explained by a space after the delimiter or a grouped number, so the data cannot tell which values belong together.", null],
     ["Line 5: 1 value after the last column, all empty.", ["Al", "Ace", "Rome", "3"]],
   ]);
 });
@@ -1911,9 +1939,12 @@ ok("csvf: tab files never join", () => {
 });
 ok("csvf: too few values, and a line break inside a value", () => {
   const r = checkCsv("Name,Note,Amount\nYui,ok,49\nLi,fine,7\nKen,first part\nsecond part,120\n");
-  assert.deepStrictEqual(r.issues.map((i) => [i.line, i.kind]), [[4, "too-few"], [5, "too-few"]]);
-  assert(r.issues[0].message.endsWith("With the next line it would fit: a line break inside a value?"));
-  assert.strictEqual(r.issues[1].message, "Line 5: 2 values, the header has 3.");
+  assert.deepStrictEqual(r.issues.map((i) => [i.line, i.endLine, i.kind]), [[4, 5, "too-few"]]);
+  assert.strictEqual(r.issues[0].message, "Line 4: 2 values, the header has 3. With line 5 it would fit: a line break inside a value?");
+  assert.strictEqual(r.rows.length, 2);
+  // Two short rows that do not add up stay two issues.
+  const two = checkCsv("Name,Note,Amount\nYui,ok,49\nKen\nLi\n");
+  assert.deepStrictEqual(two.issues.map((i) => [i.line, i.endLine]), [[3, 3], [4, 4]]);
   assert.strictEqual(checkCsv("Name,Amount\nYui\n").issues[0].message, "Line 2: 1 value, the header has 2.");
   assert.strictEqual(r.issues[0].suggestion, null);
 });
@@ -1923,7 +1954,7 @@ ok("csvf: an unclosed quote stops the import there", () => {
   assert.deepStrictEqual(r.issues.map((i) => i.message), ["Line 3: a quote opens on line 3 and never closes, so lines 3 to 5 became one value."]);
   assert.strictEqual(r.issues[0].suggestion, null);
   const noNewline = checkCsv("Name,Note\nYui,\"open");
-  assert(noNewline.issues[0].message.includes("lines 2 to 2"));
+  assert(noNewline.issues[0].message.endsWith("so the rest of the file became one value."));
 });
 ok("csvf: parseRecords keeps physical line numbers", () => {
   const recs = parseRecords('Name,Note\r\n"Yui","two\r\nlines"\r\nKen,"a ""quoted"" word"\rLi,""\n\nBo,x');
@@ -1980,17 +2011,66 @@ ok("csvf: kinds need two values; fits ignores blanks", () => {
   assert(Number.isNaN(Number("1,234"))); // why a repaired value still needs parsing
   for (const v of ["12,5", "1,2345", "$49", "1.234,50", ",123", "1,23"]) assert(!NUMBER.test(v), v);
 });
-ok("csvf: importCsv keeps file order and leaves the rest open", () => {
+ok("csvf: importCsv keeps file order and leaves the rest open", async () => {
   const text = "Name,Company,Amount\nYui,Acme,49\nKen,Acme, Inc,120\nLi,Orbit,7\nBo,Chen,,\nSam,Fox\n";
-  const yes = importCsv(text, () => true);
+  const unsure = await importCsv(text, () => true);
+  assert.deepStrictEqual(unsure, { header: [], rows: [], open: [], delimiter: ",", delimiterSure: false });
+  const yes = await importCsv(text, () => true, ",");
   assert.deepStrictEqual(yes.rows.map((r) => r.fields), [["Yui", "Acme", "49"], ["Ken", "Acme, Inc", "120"], ["Li", "Orbit", "7"], ["Bo", "Chen", ""]]);
   assert.deepStrictEqual(yes.open.map((i) => i.kind), ["too-few"]);
-  assert.deepStrictEqual([yes.delimiter, yes.delimiterSure], [",", false]);
-  const no = importCsv(text, () => false);
+  assert.deepStrictEqual([yes.delimiter, yes.delimiterSure], [",", true]);
+  const no = await importCsv(text, () => false, ",");
   assert.deepStrictEqual(no.rows.map((r) => r.line), [2, 4]);
   assert.deepStrictEqual(no.open.map((i) => i.kind), ["too-many", "trailing-delimiter", "too-few"]);
+  // A modal that answers later: a promise of false must not count as yes.
+  const later = await importCsv(text, async () => false, ",");
+  assert.deepStrictEqual(later.rows.map((r) => r.line), [2, 4]);
+  const laterYes = await importCsv(text, async () => true, ",");
+  assert.strictEqual(laterYes.rows.length, 4);
+});
+ok("csvf: a short row before a complete row is not merged with it", () => {
+  const r = checkCsv("Name,Company,Amount\nYui,Acme,49\nSam\nLi,Orbit,7\n");
+  assert.deepStrictEqual(r.rows.map((x) => x.line), [2, 4]);
+  assert.deepStrictEqual(r.issues.map((i) => [i.line, i.endLine, i.message]), [[3, 3, "Line 3: 1 value, the header has 3."]]);
+});
+ok("csvf: decimal commas count as numbers when the delimiter is not a comma", () => {
+  const r = checkCsv("Name;Amount\nA;1,5\nB;2,5\nC;3;\nD;x;\n", { delimiter: ";" });
+  assert.deepStrictEqual(r.issues.map((i) => [i.kind, i.suggestion]), [["trailing-delimiter", ["C", "3"]], ["too-many", null]]);
+  assert(isNumber("1.234,50", ";") && isNumber("1.5", ";") && !isNumber("1,5") && !isNumber("1.234,50"));
+});
+ok("csvf: an unclosed quote ignores blank lines at the end", () => {
+  const r = checkCsv('Name,Note\nYui,ok\nKen,"x\n\n\n');
+  assert.strictEqual(r.issues[0].message, "Line 3: a quote opens on line 3 and never closes, so the rest of the file became one value.");
+  const two = checkCsv('Name,Note\nKen,"x\ny\r\n\r\n');
+  assert(two.issues[0].message.includes("lines 2 to 3"));
+});
+ok("csvf: rows of empty values are skipped like blank lines", () => {
+  const r = checkCsv("Name,Company,City,Amount\nYui,Acme,Tokyo,49\n,,,\n , ,\n,,\nLi,Orbit,Lyon,7\n");
+  assert.deepStrictEqual([r.rows.map((x) => x.line), r.issues], [[2, 6], []]);
+  assert.strictEqual(checkCsv('Name,Note\n,""\n').issues.length, 0);
+});
+ok("csvf: a quote problem with the wrong count says both", () => {
+  const r = checkCsv(CSVF_BASE + 'Sam Fox,Fox 5" Ltd, Inc,Leeds,5\n');
+  assert.deepStrictEqual([r.issues[0].kind, r.issues[0].suggestion], ["stray-quote", null]);
+  assert.strictEqual(r.issues[0].message, "Line 5: 5 values, the header has 4, and a quote mark inside a value that does not start with one. Check that it reads correctly.");
+});
+ok("csvf: only a space after a delimiter makes a file spaced", () => {
+  // A quoted value that starts with a space does not switch the rule off.
+  const r = checkCsv(CSVF_BASE + 'Li Wei," Orbit",Lyon,7\nKen Mori,Acme, Inc,Osaka,120\n');
+  assert.deepStrictEqual(r.issues.map((i) => i.suggestion), [["Ken Mori", "Acme, Inc", "Osaka", "120"]]);
+  // A space after a delimiter does, even before a quote.
+  const s = checkCsv(CSVF_BASE + 'Li Wei, "Orbit",Lyon,7\nKen Mori,Acme, Inc,Osaka,120\n');
+  assert.strictEqual(s.issues[0].suggestion, null);
+  assert.deepStrictEqual(parseRecords('a, b\nc,d').map((x) => x.spaced), [true, false]);
+});
+ok("csvf: two separate unquoted commas get no suggestion", () => {
+  const r = checkCsv(CSVF_BASE + "Mori, Ken,Acme, Inc,Osaka,120\n");
+  assert.deepStrictEqual([r.issues[0].kind, r.issues[0].suggestion], ["too-many", null]);
+  assert(r.issues[0].message.endsWith("No single join of neighbouring values explains them: more than one value may need quotes."));
+  const apart = checkCsv(CSVF_BASE + "Ana Lima,Lima, Co,Porto,1,234\n");
+  assert(apart.issues[0].message.endsWith("more than one value may need quotes."));
 });
 ok("csvf: no invisible characters in the snippets", () => {
-  for (const s of ["// Reads CSV text into records. Each record keeps the line it starts on and\n// a list of quote problems, so nothing odd is accepted without a note.\nfunction parseRecords(text, delimiter = \",\", limit = Infinity) {\n  const records = [];\n  let fields = [], field = \"\", line = 1, start = 1, problems = [];\n  let quoted = false, closed = false, quoteLine = 0, spaces = \"\";\n  const note = (problem) => { if (!problems.includes(problem)) problems.push(problem); };\n  const endField = () => { fields.push(field); field = \"\"; closed = false; spaces = \"\"; };\n  const endRecord = () => {\n    endField();\n    records.push({ line: start, fields, problems });\n    fields = [];\n    problems = [];\n  };\n  for (let i = 0; i < text.length && records.length < limit; i++) {\n    const c = text[i];\n    if (quoted) {\n      if (c === '\"' && text[i + 1] === '\"') { field += '\"'; i++; }\n      else if (c === '\"') { quoted = false; closed = true; }\n      else {\n        if (c === \"\\n\" || (c === \"\\r\" && text[i + 1] !== \"\\n\")) line++;\n        field += c;\n      }\n    } else if (c === delimiter) {\n      endField();\n    } else if (c === \"\\n\" || c === \"\\r\") {\n      if (c === \"\\r\" && text[i + 1] === \"\\n\") i++;\n      endRecord();\n      start = ++line;\n    } else if (c === '\"' && field.trim() === \"\" && !closed) {\n      quoted = true; // spaces before an opening quote are dropped: a, \"b, c\"\n      quoteLine = line;\n      field = \"\";\n    } else if (closed && (c === \" \" || c === \"\\t\")) {\n      spaces += c; // kept only if more text follows the closing quote\n    } else {\n      if (closed) { note(\"text-after-quote\"); field += spaces; spaces = \"\"; }\n      if (c === '\"') note(\"stray-quote\");\n      field += c;\n    }\n  }\n  if (records.length >= limit) return records;\n  if (quoted) {\n    // The quote never closed: the rest of the file became one value.\n    fields.push(field);\n    const lastLine = /[\\r\\n]$/.test(text) ? line - 1 : line;\n    records.push({ line: start, fields, problems: [\"unclosed-quote\"], quoteLine, lastLine });\n  } else if (field !== \"\" || fields.length || closed) {\n    endRecord();\n  }\n  return records;\n}\n\nconst isBlank = (record) => record.fields.length === 1 && record.fields[0] === \"\";", "function guessDelimiter(text, candidates = [\",\", \";\", \"\\t\", \"|\"]) {\n  const scores = candidates.map((delimiter) => {\n    const records = parseRecords(text.replace(/^\\uFEFF/, \"\"), delimiter, 30)\n      .filter((r) => !isBlank(r));\n    const width = records.length ? records[0].fields.length : 0;\n    const rest = records.slice(1);\n    const same = rest.filter((r) => r.fields.length === width).length;\n    const score = width < 2 ? 0 : rest.length ? same / rest.length : 0.5;\n    return { delimiter, score };\n  });\n  scores.sort((a, b) => b.score - a.score);\n  const [best, next] = scores;\n  if (best.score === 0) return { delimiter: \",\", sure: false };\n  // Sure when most rows agree and no other delimiter comes close.\n  return { delimiter: best.delimiter, sure: best.score > 0.5 && next.score <= best.score / 2 };\n}", "// A plain number, with or without thousands separators: 49, -1,234.50\nconst NUMBER = /^[-+]?(\\d+|\\d{1,3}(,\\d{3})+)(\\.\\d+)?$/;\n\n// \"number\" if every value in the column is a number, \"text\" if none is,\n// \"any\" if it is mixed or has fewer than two values.\nfunction columnKinds(rows, width) {\n  return Array.from({ length: width }, (_, column) => {\n    const values = rows.map((r) => r.fields[column].trim()).filter(Boolean);\n    if (values.length < 2) return \"any\";\n    const numbers = values.filter((v) => NUMBER.test(v)).length;\n    if (numbers === values.length) return \"number\";\n    return numbers === 0 ? \"text\" : \"any\";\n  });\n}\n\nfunction fits(fields, kinds) {\n  return fields.every((value, column) => {\n    const v = value.trim();\n    if (!v || kinds[column] === \"any\") return true;\n    return (kinds[column] === \"number\") === NUMBER.test(v);\n  });\n}", "// Which run of fields, joined back with the delimiter, gives the right width?\n// A join counts only if something explains it: every piece after the first\n// starts with a space (a comma inside a sentence), or the joined value is a\n// grouped number such as 1,234 in a number column. It must also fit the kinds.\nfunction findJoins(fields, width, kinds, delimiter, spacedFile) {\n  const extra = fields.length - width;\n  const joins = [];\n  for (let at = 0; at + extra < fields.length; at++) {\n    const pieces = fields.slice(at, at + extra + 1);\n    const joined = pieces.join(delimiter);\n    const prose = !spacedFile && delimiter !== \"\\t\" &&\n      pieces.slice(1).every((p) => /^ \\S/.test(p));\n    const grouped = delimiter === \",\" && kinds[at] === \"number\" &&\n      NUMBER.test(joined.trim());\n    const result = [...fields.slice(0, at), joined, ...fields.slice(at + extra + 1)];\n    if ((prose || grouped) && fits(result, kinds)) joins.push({ at, result });\n  }\n  return joins;\n}", "const QUOTE_PROBLEMS = {\n  \"stray-quote\": \"a quote mark inside a value that does not start with one\",\n  \"text-after-quote\": \"text after the closing quote of a value\",\n};\n\n// Splits a file into rows you can import and issues a person must look at.\n// A row with a problem is never in `rows`; a suggestion waits for a yes.\nfunction checkCsv(text, { delimiter = \",\", headerIndex = 0 } = {}) {\n  const records = parseRecords(text.replace(/^\\uFEFF/, \"\"), delimiter)\n    .filter((r) => !isBlank(r));\n  const header = records[headerIndex];\n  if (!header) return { header: [], rows: [], issues: [] };\n  const width = header.fields.length;\n  const body = records.slice(headerIndex + 1);\n  const good = body.filter((r) => r.fields.length === width && !r.problems.length);\n  const kinds = columnKinds(good, width);\n  // If the file writes \"a, b, c\", a leading space explains nothing.\n  const spacedFile = good.some((r) => r.fields.slice(1).some((f) => f.startsWith(\" \")));\n  const rows = [], issues = [];\n  const values = (n) => `${n} ${n === 1 ? \"value\" : \"values\"}`;\n  const report = (r, kind, message, suggestion = null) => issues.push({\n    line: r.line, kind, message: `Line ${r.line}: ${message}`, fields: r.fields, suggestion,\n  });\n\n  body.forEach((r, index) => {\n    const count = r.fields.length;\n    if (r.problems.includes(\"unclosed-quote\")) {\n      report(r, \"unclosed-quote\", `a quote opens on line ${r.quoteLine} and never ` +\n        `closes, so lines ${r.quoteLine} to ${r.lastLine} became one value.`);\n    } else if (r.problems.length) {\n      const what = r.problems.map((p) => QUOTE_PROBLEMS[p]).join(\" and \");\n      report(r, r.problems[0], `${what}. Check that it reads correctly.`,\n        count === width ? r.fields : null);\n    } else if (count === width) {\n      rows.push(r);\n    } else if (count > width) {\n      const kept = r.fields.slice(0, width);\n      if (r.fields.slice(width).every((f) => !f.trim()) && fits(kept, kinds)) {\n        report(r, \"trailing-delimiter\", `${values(count - width)} after the last column, ` +\n          \"all empty.\", kept);\n        return;\n      }\n      const joins = findJoins(r.fields, width, kinds, delimiter, spacedFile);\n      const why = joins.length === 1\n        ? `${JSON.stringify(joins[0].result[joins[0].at])} as one value fits the other rows.`\n        : joins.length ? `${joins.length} different joins would fit, so none is suggested.`\n        : \"No single join fits the other rows.\";\n      report(r, \"too-many\", `${values(count)}, the header has ${width}. ${why}`,\n        joins.length === 1 ? joins[0].result : null);\n    } else {\n      const next = body[index + 1];\n      const hint = next && count + next.fields.length - 1 === width\n        ? \" With the next line it would fit: a line break inside a value?\" : \"\";\n      report(r, \"too-few\", `${values(count)}, the header has ${width}.${hint}`);\n    }\n  });\n  return { header: header.fields, rows, issues };\n}", "// confirm(issue) is your UI: show issue.message and issue.suggestion,\n// return true if the user accepts the suggestion.\nfunction importCsv(text, confirm) {\n  const guess = guessDelimiter(text);\n  const { header, rows, issues } = checkCsv(text, { delimiter: guess.delimiter });\n  const accepted = rows.map((r) => ({ line: r.line, fields: r.fields }));\n  const open = [];\n  for (const issue of issues) {\n    if (issue.suggestion && confirm(issue)) {\n      accepted.push({ line: issue.line, fields: issue.suggestion });\n    } else {\n      open.push(issue);\n    }\n  }\n  accepted.sort((a, b) => a.line - b.line);\n  return { header, rows: accepted, open, delimiter: guess.delimiter, delimiterSure: guess.sure };\n}", "const header = \"Name,Company,Amount\".split(\",\");\nconst row = \"Ken Mori,Acme, Inc,120\".split(\",\");\nrow.length; // 4, but the header has 3\nObject.fromEntries(header.map((name, i) => [name, row[i]]));\n// { Name: \"Ken Mori\", Company: \"Acme\", Amount: \" Inc\" } and 120 is gone"]) assert(!/[\u00A0\u200B-\u200F\u2028\u2029\uFEFF]/.test(s));
+  for (const s of ["// Reads CSV text into records. Each record keeps the line it starts on and\n// a list of quote problems, so nothing odd is accepted without a note.\nfunction parseRecords(text, delimiter = \",\", limit = Infinity) {\n  const records = [];\n  let fields = [], field = \"\", line = 1, start = 1, problems = [];\n  let quoted = false, closed = false, quoteLine = 0, spaces = \"\", spaced = false;\n  const note = (problem) => { if (!problems.includes(problem)) problems.push(problem); };\n  const endField = () => { fields.push(field); field = \"\"; closed = false; spaces = \"\"; };\n  const endRecord = () => {\n    endField();\n    records.push({ line: start, fields, problems, spaced });\n    fields = [];\n    problems = [];\n    spaced = false;\n  };\n  for (let i = 0; i < text.length && records.length < limit; i++) {\n    const c = text[i];\n    if (quoted) {\n      if (c === '\"' && text[i + 1] === '\"') { field += '\"'; i++; }\n      else if (c === '\"') { quoted = false; closed = true; }\n      else {\n        if (c === \"\\n\" || (c === \"\\r\" && text[i + 1] !== \"\\n\")) line++;\n        field += c;\n      }\n    } else if (c === delimiter) {\n      if (text[i + 1] === \" \") spaced = true; // the file may write \"a, b, c\"\n      endField();\n    } else if (c === \"\\n\" || c === \"\\r\") {\n      if (c === \"\\r\" && text[i + 1] === \"\\n\") i++;\n      endRecord();\n      start = ++line;\n    } else if (c === '\"' && field.trim() === \"\" && !closed) {\n      quoted = true; // spaces before an opening quote are dropped: a, \"b, c\"\n      quoteLine = line;\n      field = \"\";\n    } else if (closed && (c === \" \" || c === \"\\t\")) {\n      spaces += c; // kept only if more text follows the closing quote\n    } else {\n      if (closed) { note(\"text-after-quote\"); field += spaces; spaces = \"\"; }\n      if (c === '\"') note(\"stray-quote\");\n      field += c;\n    }\n  }\n  if (records.length >= limit) return records;\n  if (quoted) {\n    // The quote never closed: the rest of the file became one value.\n    fields.push(field);\n    // The last line with text on it; blank lines at the end do not count.\n    const lastLine = quoteLine + (field.trimEnd().match(/\\r\\n|\\r|\\n/g) || []).length;\n    records.push({ line: start, fields, problems: [\"unclosed-quote\"], spaced, quoteLine, lastLine });\n  } else if (field !== \"\" || fields.length || closed) {\n    endRecord();\n  }\n  return records;\n}\n\n// A blank line, or a row of empty values such as \",,,\" from Excel.\nconst isBlank = (record) =>\n  !record.problems.length && record.fields.every((f) => f.trim() === \"\");", "function guessDelimiter(text, candidates = [\",\", \";\", \"\\t\", \"|\"]) {\n  const scores = candidates.map((delimiter) => {\n    const records = parseRecords(text.replace(/^\\uFEFF/, \"\"), delimiter, 30)\n      .filter((r) => !isBlank(r));\n    const width = records.length ? records[0].fields.length : 0;\n    const rest = records.slice(1);\n    const same = rest.filter((r) => r.fields.length === width).length;\n    const score = width < 2 ? 0 : rest.length ? same / rest.length : 0.5;\n    return { delimiter, score };\n  });\n  scores.sort((a, b) => b.score - a.score);\n  const [best, next] = scores;\n  if (best.score === 0) return { delimiter: \",\", sure: false };\n  // Sure when most rows agree and no other delimiter comes close.\n  return { delimiter: best.delimiter, sure: best.score > 0.5 && next.score <= best.score / 2 };\n}", "// A plain number, with or without thousands separators: 49, -1,234.50\nconst NUMBER = /^[-+]?(\\d+|\\d{1,3}(,\\d{3})+)(\\.\\d+)?$/;\n// Files that do not use the comma as delimiter often use it for decimals: 1.234,50\nconst DECIMAL_COMMA = /^[-+]?(\\d+|\\d{1,3}(\\.\\d{3})+)(,\\d+)?$/;\nconst isNumber = (v, delimiter = \",\") =>\n  NUMBER.test(v) || (delimiter !== \",\" && DECIMAL_COMMA.test(v));\n\n// \"number\" if every value in the column is a number, \"text\" if none is,\n// \"any\" if it is mixed or has fewer than two values.\nfunction columnKinds(rows, width, delimiter = \",\") {\n  return Array.from({ length: width }, (_, column) => {\n    const values = rows.map((r) => r.fields[column].trim()).filter(Boolean);\n    if (values.length < 2) return \"any\";\n    const numbers = values.filter((v) => isNumber(v, delimiter)).length;\n    if (numbers === values.length) return \"number\";\n    return numbers === 0 ? \"text\" : \"any\";\n  });\n}\n\nfunction fits(fields, kinds, delimiter = \",\") {\n  return fields.every((value, column) => {\n    const v = value.trim();\n    if (!v || kinds[column] === \"any\") return true;\n    return (kinds[column] === \"number\") === isNumber(v, delimiter);\n  });\n}", "// Which run of fields, joined back with the delimiter, gives the right width?\n// A join counts only if something explains it: every piece after the first\n// starts with a space (a comma inside a sentence), or the joined value is a\n// grouped number such as 1,234 in a number column. It must also fit the kinds.\nfunction findJoins(fields, width, kinds, delimiter, spacedFile) {\n  const extra = fields.length - width;\n  const joins = [];\n  for (let at = 0; at + extra < fields.length; at++) {\n    const pieces = fields.slice(at, at + extra + 1);\n    const joined = pieces.join(delimiter);\n    const prose = !spacedFile && delimiter !== \"\\t\" &&\n      pieces.slice(1).every((p) => /^ \\S/.test(p));\n    const grouped = delimiter === \",\" && kinds[at] === \"number\" &&\n      NUMBER.test(joined.trim());\n    const result = [...fields.slice(0, at), joined, ...fields.slice(at + extra + 1)];\n    if ((prose || grouped) && fits(result, kinds, delimiter)) joins.push({ at, result });\n  }\n  return joins;\n}", "const QUOTE_PROBLEMS = {\n  \"stray-quote\": \"a quote mark inside a value that does not start with one\",\n  \"text-after-quote\": \"text after the closing quote of a value\",\n};\n\n// Splits a file into rows you can import and issues a person must look at.\n// A row with a problem is never in `rows`; a suggestion waits for a yes.\nfunction checkCsv(text, { delimiter = \",\", headerIndex = 0 } = {}) {\n  const records = parseRecords(text.replace(/^\\uFEFF/, \"\"), delimiter)\n    .filter((r) => !isBlank(r));\n  const header = records[headerIndex];\n  if (!header) return { header: [], rows: [], issues: [] };\n  const width = header.fields.length;\n  const body = records.slice(headerIndex + 1);\n  const good = body.filter((r) => r.fields.length === width && !r.problems.length);\n  const kinds = columnKinds(good, width, delimiter);\n  // If the file writes \"a, b, c\", a space after a comma explains nothing.\n  const spacedFile = good.some((r) => r.spaced);\n  const rows = [], issues = [];\n  const values = (n) => `${n} ${n === 1 ? \"value\" : \"values\"}`;\n  const report = (r, kind, message, suggestion = null, endLine = r.line) => issues.push({\n    line: r.line, endLine, kind, message: `Line ${r.line}: ${message}`, fields: r.fields,\n    suggestion,\n  });\n  let skip = -1; // a line already covered by the issue before it\n\n  body.forEach((r, index) => {\n    if (index === skip) return;\n    const count = r.fields.length;\n    if (r.problems.includes(\"unclosed-quote\")) {\n      const lines = r.lastLine > r.quoteLine\n        ? `lines ${r.quoteLine} to ${r.lastLine}` : \"the rest of the file\";\n      report(r, \"unclosed-quote\", `a quote opens on line ${r.quoteLine} and never ` +\n        `closes, so ${lines} became one value.`);\n    } else if (r.problems.length) {\n      const what = r.problems.map((p) => QUOTE_PROBLEMS[p]).join(\" and \");\n      const counted = count === width ? \"\" : `${values(count)}, the header has ${width}, and `;\n      report(r, r.problems[0], `${counted}${what}. Check that it reads correctly.`,\n        count === width ? r.fields : null);\n    } else if (count === width) {\n      rows.push(r);\n    } else if (count > width) {\n      const kept = r.fields.slice(0, width);\n      if (r.fields.slice(width).every((f) => !f.trim()) && fits(kept, kinds, delimiter)) {\n        report(r, \"trailing-delimiter\", `${values(count - width)} after the last column, ` +\n          \"all empty.\", kept);\n        return;\n      }\n      const joins = findJoins(r.fields, width, kinds, delimiter, spacedFile);\n      const why = joins.length === 1\n        ? `${JSON.stringify(joins[0].result[joins[0].at])} as one value fits the other rows.`\n        : joins.length ? `${joins.length} different joins would fit, so none is suggested.`\n        : count - width > 1 ? \"No single join of neighbouring values explains them: \" +\n          \"more than one value may need quotes.\"\n        : \"No join is explained by a space after the delimiter or a grouped number, \" +\n          \"so the data cannot tell which values belong together.\";\n      report(r, \"too-many\", `${values(count)}, the header has ${width}. ${why}`,\n        joins.length === 1 ? joins[0].result : null);\n    } else {\n      // An unquoted line break splits one row into two short ones.\n      const next = body[index + 1];\n      const short = next && !next.problems.length && next.fields.length < width;\n      if (short && count + next.fields.length - 1 === width) {\n        skip = index + 1;\n        report(r, \"too-few\", `${values(count)}, the header has ${width}. With line ` +\n          `${next.line} it would fit: a line break inside a value?`, null, next.line);\n      } else {\n        report(r, \"too-few\", `${values(count)}, the header has ${width}.`);\n      }\n    }\n  });\n  return { header: header.fields, rows, issues };\n}", "// confirm(issue) is your UI: show issue.message and issue.suggestion, and\n// return (or resolve to) true if the user accepts the suggestion. Pass `delimiter` once the\n// user has picked one; without it, an unsure guess returns no rows.\nasync function importCsv(text, confirm, delimiter) {\n  const guess = delimiter ? { delimiter, sure: true } : guessDelimiter(text);\n  if (!guess.sure) {\n    return { header: [], rows: [], open: [], delimiter: guess.delimiter, delimiterSure: false };\n  }\n  const { header, rows, issues } = checkCsv(text, { delimiter: guess.delimiter });\n  const accepted = rows.map((r) => ({ line: r.line, fields: r.fields }));\n  const open = [];\n  for (const issue of issues) {\n    if (issue.suggestion && (await confirm(issue)) === true) {\n      accepted.push({ line: issue.line, fields: issue.suggestion });\n    } else {\n      open.push(issue);\n    }\n  }\n  accepted.sort((a, b) => a.line - b.line);\n  return { header, rows: accepted, open, delimiter: guess.delimiter, delimiterSure: guess.sure };\n}", "const header = \"Name,Company,Amount\".split(\",\");\nconst row = \"Ken Mori,Acme, Inc,120\".split(\",\");\nrow.length; // 4, but the header has 3\nObject.fromEntries(header.map((name, i) => [name, row[i]]));\n// { Name: \"Ken Mori\", Company: \"Acme\", Amount: \" Inc\" } and 120 is gone"]) assert(!/[\u00A0\u200B-\u200F\u2028\u2029\uFEFF]/.test(s));
 });
 }
