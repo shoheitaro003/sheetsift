@@ -16,8 +16,8 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400&display=swap">
 <link rel="stylesheet" href="../../blog.css">
 <meta property="og:type" content="article">
-<meta property="article:published_time" content="2026-11-13">
-<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "Find CSV rows broken by unquoted commas in JavaScript", "description": "A value like Acme, Inc without quotes shifts every column after it. Tested JavaScript that finds these rows by line number and suggests a fix to confirm.", "datePublished": "2026-11-13", "dateModified": "2026-11-13", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/find-csv-rows-broken-by-unquoted-commas-javascript/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
+<meta property="article:published_time" content="2026-11-15">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "Find CSV rows broken by unquoted commas in JavaScript", "description": "A value like Acme, Inc without quotes shifts every column after it. Tested JavaScript that finds these rows by line number and suggests a fix to confirm.", "datePublished": "2026-11-15", "dateModified": "2026-11-15", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/find-csv-rows-broken-by-unquoted-commas-javascript/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
 </head>
 <body>
 <header class="top"><div class="wrap">
@@ -27,9 +27,18 @@
 <main><div class="wrap">
 <article>
 <h1>Find CSV rows broken by unquoted commas in JavaScript</h1>
-<p class="meta"><time datetime="2026-11-13">2026-11-13</time></p>
+<p class="meta"><time datetime="2026-11-15">2026-11-15</time></p>
 <p>A customer uploads a CSV with the header <code>Name,Company,Amount</code>. One row reads <code>Ken Mori,Acme, Inc,120</code>. Whoever wrote the file did not put quotes around <code>Acme, Inc</code>, so the row has four values for three columns: <code>Inc</code> lands in Amount and <code>120</code> is dropped, or your import fails with "wrong number of fields" and no hint why.</p>
 <p>By the end of this post you will have <code>checkCsv(text)</code>, a small module with no dependencies. It returns the rows that are safe to import and, for every other row, an issue with its line number, the cause, and a repaired row when exactly one repair is explained by the data. Nothing is fixed without a person saying yes. Every function and every result below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22.</p>
+<p>This is what you get once the module is assembled:</p>
+<pre><code>const text = &quot;Name,Company,City,Amount\n&quot; +
+  &quot;Yui Tanaka,Acme,Tokyo,49\nLi Wei,Orbit,Lyon,7\nKen Mori,Acme, Inc,Osaka,120\n&quot;;
+const { rows, issues } = checkCsv(text);
+rows.length; // 2: the clean rows, as { line, fields }
+issues[0].message;
+// &#x27;Line 4: 5 values, the header has 4. &quot;Acme, Inc&quot; as one value fits the other rows.&#x27;
+issues[0].suggestion; // [&quot;Ken Mori&quot;, &quot;Acme, Inc&quot;, &quot;Osaka&quot;, &quot;120&quot;], applied only after a yes</code></pre>
+<p>The whole module is one file, <a href="../../examples/check-csv.js">check-csv.js</a> (an ES module, generated from the same code as this post and tested with it). The rest of the post builds it step by step, so you can change any rule you disagree with. If you already use a CSV library, you can keep it for clean files; step 6 says how to fall back to this module.</p>
 
 <h2>Why the parser cannot fix this on its own</h2>
 <pre><code>const header = &quot;Name,Company,Amount&quot;.split(&quot;,&quot;);
@@ -40,76 +49,103 @@ Object.fromEntries(header.map((name, i) =&gt; [name, row[i]]));
 <p>A better parser does not help. In the CSV this post handles (and step 1 parses), a value that contains the delimiter is wrapped in double quotes, and a quote inside such a value is written twice (<code>"Ross ""M"" Ltd"</code>). Without the quotes, <code>Acme, Inc</code> <em>is</em> two values as far as a parser can tell. The rest of the file can tell more: if every other row has a number in Amount and no row starts a value with a space, then <code>Acme</code> + <code>, Inc</code> is far more likely than a fourth column. The code below turns that reasoning into rules you can test; its parts go into one module, in order.</p>
 
 <h2>Step 1: parse, and keep line numbers and quote problems</h2>
-<p>To tell the user where a problem is, you need the line it is on in their file. A record (one row of values) can span several lines when a quoted value contains a line break, so counting records is not enough. <code>parseRecords</code> keeps the <em>physical line</em> each record starts on, the way a text editor numbers lines:</p>
-<pre><code>// Reads CSV text into records. Each record keeps the line it starts on and
+<p>To tell the user where a problem is, you need the line it is on in their file. A record (one row of values) can span several lines when a quoted value contains a line break, so counting records is not enough. The parser keeps the <em>physical line</em> each record starts on, the way a text editor numbers lines. It is split into four small functions; each one uses only those above it:</p>
+<pre><code>// \r\n, \n and a lone \r each end one line. Returns 2, 1, or 0 (no line break).
+function breakLength(text, i) {
+  if (text[i] === &quot;\r&quot; &amp;&amp; text[i + 1] === &quot;\n&quot;) return 2;
+  return text[i] === &quot;\n&quot; || text[i] === &quot;\r&quot; ? 1 : 0;
+}
+const countBreaks = (s) =&gt; (s.match(/\r\n|\r|\n/g) || []).length;
+
+// Reads a quoted value; text[open] is the opening quote. &quot;&quot; inside it is one quote.
+function readQuoted(text, open) {
+  let value = &quot;&quot;, breaks = 0, i = open + 1;
+  while (i &lt; text.length) {
+    if (text[i] === &#x27;&quot;&#x27; &amp;&amp; text[i + 1] === &#x27;&quot;&#x27;) { value += &#x27;&quot;&#x27;; i += 2; continue; }
+    if (text[i] === &#x27;&quot;&#x27;) return { value, end: i + 1, breaks, closed: true };
+    const n = breakLength(text, i);
+    if (n) breaks++;
+    value += text.slice(i, i + (n || 1));
+    i += n || 1;
+  }
+  return { value, end: i, breaks, closed: false };
+}
+
+// Reads one value starting at text[i]. `end` is the index of the delimiter,
+// line break or end of text that stops it.
+function readField(text, i, delimiter) {
+  const stopsAt = (j) =&gt;
+    j &gt;= text.length || text[j] === delimiter || breakLength(text, j) &gt; 0;
+  const scanTo = (j) =&gt; { while (!stopsAt(j)) j++; return j; };
+  let open = i;
+  while (text[open] === &quot; &quot;) open++;        // spaces before an opening quote
+  if (text[open] !== &#x27;&quot;&#x27;) {                 // unquoted: everything up to the stop
+    const end = scanTo(i);
+    const value = text.slice(i, end);
+    const problems = value.includes(&#x27;&quot;&#x27;) ? [&quot;stray-quote&quot;] : [];
+    return { value, end, breaks: 0, problems };
+  }
+  const quoted = readQuoted(text, open);
+  if (!quoted.closed) {
+    const { value, end, breaks } = quoted;
+    return { value, end, breaks, problems: [&quot;unclosed-quote&quot;] };
+  }
+  const end = scanTo(quoted.end);
+  const after = text.slice(quoted.end, end).trimEnd(); // text after the closing quote
+  const problems = [];
+  if (after) problems.push(&quot;text-after-quote&quot;);
+  if (after.includes(&#x27;&quot;&#x27;)) problems.push(&quot;stray-quote&quot;);
+  return { value: quoted.value + after, end, breaks: quoted.breaks, problems };
+}
+
+// Reads CSV text into records. Each record keeps the line it starts on and
 // a list of quote problems, so nothing odd is accepted without a note.
 function parseRecords(text, delimiter = &quot;,&quot;, limit = Infinity) {
   const records = [];
-  let fields = [], field = &quot;&quot;, line = 1, start = 1, problems = [];
-  let quoted = false, closed = false, quoteLine = 0, spaces = &quot;&quot;, spaced = false;
-  const note = (problem) =&gt; { if (!problems.includes(problem)) problems.push(problem); };
-  const endField = () =&gt; { fields.push(field); field = &quot;&quot;; closed = false; spaces = &quot;&quot;; };
-  const endRecord = () =&gt; {
-    endField();
-    records.push({ line: start, fields, problems, spaced });
-    fields = [];
-    problems = [];
-    spaced = false;
-  };
-  for (let i = 0; i &lt; text.length &amp;&amp; records.length &lt; limit; i++) {
-    const c = text[i];
-    if (quoted) {
-      if (c === &#x27;&quot;&#x27; &amp;&amp; text[i + 1] === &#x27;&quot;&#x27;) { field += &#x27;&quot;&#x27;; i++; }
-      else if (c === &#x27;&quot;&#x27;) { quoted = false; closed = true; }
-      else {
-        if (c === &quot;\n&quot; || (c === &quot;\r&quot; &amp;&amp; text[i + 1] !== &quot;\n&quot;)) line++;
-        field += c;
+  let i = 0, line = 1;
+  while (i &lt; text.length &amp;&amp; records.length &lt; limit) {
+    const record = { line, fields: [], problems: [], spaced: false };
+    for (;;) {
+      const field = readField(text, i, delimiter);
+      record.fields.push(field.value);
+      for (const p of field.problems) {
+        if (!record.problems.includes(p)) record.problems.push(p);
       }
-    } else if (c === delimiter) {
-      if (text[i + 1] === &quot; &quot;) spaced = true; // the file may write &quot;a, b, c&quot;
-      endField();
-    } else if (c === &quot;\n&quot; || c === &quot;\r&quot;) {
-      if (c === &quot;\r&quot; &amp;&amp; text[i + 1] === &quot;\n&quot;) i++;
-      endRecord();
-      start = ++line;
-    } else if (c === &#x27;&quot;&#x27; &amp;&amp; field.trim() === &quot;&quot; &amp;&amp; !closed) {
-      quoted = true; // spaces before an opening quote are dropped: a, &quot;b, c&quot;
-      quoteLine = line;
-      field = &quot;&quot;;
-    } else if (closed &amp;&amp; (c === &quot; &quot; || c === &quot;\t&quot;)) {
-      spaces += c; // kept only if more text follows the closing quote
-    } else {
-      if (closed) { note(&quot;text-after-quote&quot;); field += spaces; spaces = &quot;&quot;; }
-      if (c === &#x27;&quot;&#x27;) note(&quot;stray-quote&quot;);
-      field += c;
+      if (field.problems.includes(&quot;unclosed-quote&quot;)) {
+        record.quoteLine = line;
+        // The last line with text on it; blank lines at the end do not count.
+        record.lastLine = line + countBreaks(field.value.trimEnd());
+      }
+      line += field.breaks;
+      i = field.end;
+      if (text[i] !== delimiter) break;     // a line break or the end of the text
+      if (text[i + 1] === &quot; &quot;) record.spaced = true; // the file may write &quot;a, b, c&quot;
+      i++;
     }
-  }
-  if (records.length &gt;= limit) return records;
-  if (quoted) {
-    // The quote never closed: the rest of the file became one value.
-    fields.push(field);
-    // The last line with text on it; blank lines at the end do not count.
-    const lastLine = quoteLine + (field.trimEnd().match(/\r\n|\r|\n/g) || []).length;
-    records.push({ line: start, fields, problems: [&quot;unclosed-quote&quot;], spaced, quoteLine, lastLine });
-  } else if (field !== &quot;&quot; || fields.length || closed) {
-    endRecord();
+    records.push(record);
+    i += breakLength(text, i);
+    line++;
   }
   return records;
 }
 
-// A blank line, or a row of empty values such as &quot;,,,&quot; from Excel.
+// A blank line, or a row of empty values such as &quot;,,,&quot;.
 const isBlank = (record) =&gt;
   !record.problems.length &amp;&amp; record.fields.every((f) =&gt; f.trim() === &quot;&quot;);</code></pre>
-<p>It reads one character at a time, because quotes change the meaning of everything after them. It also handles four quote cases; the first two and the last are noted, because a careful importer should not accept them silently:</p>
 <ul>
-<li><strong>A stray quote</strong>, as in <code>Fox 5" Ltd</code>: a quote inside a value that did not start with one. The value is kept as written, which is usually right, and flagged.</li>
-<li><strong>Text after a closing quote</strong>, as in <code>"Zeta" Corp</code>. The parts are joined to <code>Zeta Corp</code> and flagged.</li>
-<li><strong>Spaces around a quoted value</strong>, as in <code>"Yui", "Acme, Inc", 49</code>. Some files are written this way, so spaces before an opening quote and after a closing quote are dropped without a note.</li>
-<li><strong>A quote that never closes.</strong> Everything from there to the end of the file becomes one value. The record remembers where the quote opened, so the message can point at it.</li>
+<li><code>breakLength</code> treats <code>\r\n</code> (Windows), <code>\n</code> and a lone <code>\r</code> as one line break each, so line numbers match the editor.</li>
+<li><code>readQuoted</code> starts at an opening quote and reads to the closing one. A doubled quote inside (<code>""</code>) is one quote character. It counts the line breaks it passes, and reports <code>closed: false</code> if the text ends first.</li>
+<li><code>readField</code> reads one value up to the next delimiter or line break. If the value starts with a quote (spaces before it are allowed), it calls <code>readQuoted</code>; otherwise it takes the text as it is.</li>
+<li><code>parseRecords</code> calls <code>readField</code> until a value ends at a line break, then starts a new record on the next line.</li>
 </ul>
-<p>A short trace of <code>Zed Roe,"Zeta" Corp,8</code>: the quote after the first comma opens a quoted value, <code>Zeta</code> is read inside it, and the next quote closes it. The space after it is held back in <code>spaces</code>; if a delimiter came next it would be dropped, but <code>C</code> comes, so the space and <code>Corp</code> are added and the record gets the note <code>text-after-quote</code>.</p>
-<p>A second trace, for a file written as <code>"Yui", "Acme, Inc", 49</code>: after the first comma, the next character is a space, so the record is marked <code>spaced</code>. The space is added to the field, but the quote that follows still opens a quoted value because the field holds only spaces so far; <code>field = ""</code> drops them. The comma inside the quotes is kept as text.</p>
-<p>Line breaks can be <code>\r\n</code> (Windows), <code>\n</code>, or a lone <code>\r</code>; all three count as one line, inside and outside quotes. Each record also notes whether any of its delimiters is followed by a space (<code>spaced</code>), which step 4 needs. <code>limit</code> stops after that many records, which step 2 uses.</p>
+<p>Quotes are where real files go wrong, so <code>readField</code> flags three cases instead of accepting them silently:</p>
+<ul>
+<li><strong>A stray quote</strong>, as in <code>Fox 5" Ltd</code>: a quote inside a value that did not start with one. The value is kept as written, which is usually right, and flagged <code>stray-quote</code>.</li>
+<li><strong>Text after a closing quote</strong>, as in <code>"Zeta" Corp</code>. The parts are joined to <code>Zeta Corp</code> and flagged <code>text-after-quote</code>.</li>
+<li><strong>A quote that never closes.</strong> Everything from there to the end of the file becomes one value, flagged <code>unclosed-quote</code>. The record keeps <code>quoteLine</code>, where the quote opened, and <code>lastLine</code>, the last line with text, so the message can point at them.</li>
+</ul>
+<p>Spaces before or after a quoted value, as in <code>"Yui", "Acme, Inc" , 49</code>, are allowed without a note, because some files are written this way. The comma inside the quotes stays part of the value.</p>
+<p>Each record also notes whether any of its delimiters is followed by a space (<code>spaced</code>), which step 4 needs. <code>limit</code> stops after that many records, which step 2 uses. <code>isBlank</code> marks blank lines and rows of empty values such as <code>,,,</code>, which later steps skip.</p>
 
 <h2>Step 2: guess the delimiter, and say when you are not sure</h2>
 <p>A semicolon file read with commas also gives the "wrong" number of values on many rows, so settle the delimiter first. For each candidate, <code>guessDelimiter</code> parses the first 30 records and scores the share of rows with as many values as the first row:</p>
@@ -135,7 +171,7 @@ const isBlank = (record) =&gt;
 <tr><td><code>Name,Amount</code> / <code>Yui,49</code> / <code>Li,7</code></td><td><code>,</code> sure</td></tr>
 <tr><td><code>Kunde;Betrag</code> / <code>A GmbH;1.234,50</code> / <code>B AG;99,90</code></td><td><code>;</code> sure</td></tr>
 <tr><td>Tab-separated, with <code>ok, fine</code> in a value</td><td>tab, sure</td></tr>
-<tr><td>The file from step 5 with the <code>Acme, Inc</code> row (1 of 4 rows broken)</td><td><code>,</code> sure</td></tr>
+<tr><td>A 4-column file with three clean rows and one <code>Ken Mori,Acme, Inc,Osaka,120</code> row</td><td><code>,</code> sure</td></tr>
 <tr><td><code>Name,Company</code> / <code>Yui,Acme, Inc</code> / <code>Li,Orbit, Ltd</code> (every row broken)</td><td><code>,</code> not sure</td></tr>
 <tr><td><code>a;b,c</code> / <code>1;2,3</code> (both delimiters fit)</td><td><code>,</code> not sure</td></tr>
 <tr><td>One column, or only a header row</td><td><code>,</code> not sure</td></tr>
@@ -150,12 +186,15 @@ const NUMBER = /^[-+]?(\d+|\d{1,3}(,\d{3})+)(\.\d+)?$/;
 const DECIMAL_COMMA = /^[-+]?(\d+|\d{1,3}(\.\d{3})+)(,\d+)?$/;
 const isNumber = (v, delimiter = &quot;,&quot;) =&gt;
   NUMBER.test(v) || (delimiter !== &quot;,&quot; &amp;&amp; DECIMAL_COMMA.test(v));
+// Placeholders that mean &quot;no value&quot; count as blank: &quot;-&quot;, &quot;n/a&quot;, &quot;N/A&quot;, &quot;na&quot;.
+const isEmpty = (v) =&gt; v === &quot;&quot; || /^(-|n\/?a)$/i.test(v);
 
 // &quot;number&quot; if every value in the column is a number, &quot;text&quot; if none is,
-// &quot;any&quot; if it is mixed or has fewer than two values.
+// &quot;any&quot; if it is mixed or has fewer than two values (blanks are ignored).
 function columnKinds(rows, width, delimiter = &quot;,&quot;) {
   return Array.from({ length: width }, (_, column) =&gt; {
-    const values = rows.map((r) =&gt; r.fields[column].trim()).filter(Boolean);
+    const values = rows.map((r) =&gt; r.fields[column].trim())
+      .filter((v) =&gt; !isEmpty(v));
     if (values.length &lt; 2) return &quot;any&quot;;
     const numbers = values.filter((v) =&gt; isNumber(v, delimiter)).length;
     if (numbers === values.length) return &quot;number&quot;;
@@ -166,11 +205,11 @@ function columnKinds(rows, width, delimiter = &quot;,&quot;) {
 function fits(fields, kinds, delimiter = &quot;,&quot;) {
   return fields.every((value, column) =&gt; {
     const v = value.trim();
-    if (!v || kinds[column] === &quot;any&quot;) return true;
+    if (isEmpty(v) || kinds[column] === &quot;any&quot;) return true;
     return (kinds[column] === &quot;number&quot;) === isNumber(v, delimiter);
   });
 }</code></pre>
-<p>Three kinds are enough for the rules in step 4. A column is <code>"number"</code> when every value is a plain number, and <code>"text"</code> when no value is, so a number landing in a Company column counts as wrong. Mixed columns, and columns with fewer than two values, accept anything. Blank cells always fit.</p>
+<p>Three kinds are enough for the rules in step 4. A column is <code>"number"</code> when every value is a plain number, and <code>"text"</code> when no value is, so a number landing in a Company column counts as wrong. Mixed columns, and columns with fewer than two values, accept anything. Blank cells always fit, and so do the placeholders <code>-</code>, <code>n/a</code> and <code>na</code> (any case), so one <code>n/a</code> in an Amount column does not turn its number checks off. They count as blank in every column, so remove any that are real values in your files (such as <code>NA</code> for a region), and add the ones your files use.</p>
 
 <h2>Step 4: find a join that the data explains</h2>
 <p>A row with <em>k</em> extra values was split at <em>k</em> commas too many. If they are next to each other, joining <em>k</em> + 1 neighbouring values back together repairs the row. <code>findJoins</code> tries every position:</p>
@@ -189,7 +228,9 @@ function findJoins(fields, width, kinds, delimiter, spacedFile) {
     const grouped = delimiter === &quot;,&quot; &amp;&amp; kinds[at] === &quot;number&quot; &amp;&amp;
       NUMBER.test(joined.trim());
     const result = [...fields.slice(0, at), joined, ...fields.slice(at + extra + 1)];
-    if ((prose || grouped) &amp;&amp; fits(result, kinds, delimiter)) joins.push({ at, result });
+    if ((prose || grouped) &amp;&amp; fits(result, kinds, delimiter)) {
+      joins.push({ at, result, grouped: grouped &amp;&amp; !prose });
+    }
   }
   return joins;
 }</code></pre>
@@ -198,7 +239,8 @@ function findJoins(fields, width, kinds, delimiter, spacedFile) {
 <li><strong>A comma inside a sentence.</strong> When people type a comma in a name or a note, a space usually follows it, as in <code>Acme, Inc</code>. The rule assumes the file's own delimiters are not followed by a space, and checks that on the clean rows first: if any delimiter there is followed by a space (a file written as <code>a, b, c</code> or <code>"a", "b"</code>), the rule is switched off. A quoted value that starts with a space, such as <code>" Orbit"</code>, does not count. The rule is also off for tab files.</li>
 <li><strong>A thousands separator</strong> in a number column: <code>1</code> + <code>234</code> joined is <code>1,234</code>, a valid grouped number. <code>12,5</code> is not (it would be a decimal comma), so it is not joined. A grouped join can still be wrong, since <code>Porto,1,234</code> may also be a row shifted by one column, which is why it is only a suggestion.</li>
 </ul>
-<p>Several commas next to each other are one run: <code>Ken,hello, world, again,5</code> under <code>Name,Note,Amount</code> gives the note <code>hello, world, again</code>. The space rule wants exactly one space followed by text, so <code>Acme,  Inc</code> (two spaces) is not explained, and a single clean row with a space after a delimiter turns the rule off for the whole file. Only a single explained join becomes a suggestion. Two candidates mean the data cannot decide, and choosing one would be a guess.</p>
+<p>Several commas next to each other are one run: <code>Ken,hello, world, again,5</code> under <code>Name,Note,Amount</code> gives the note <code>hello, world, again</code>. The space rule wants exactly one space followed by text. So <code>Acme,  Inc</code>, with two spaces, is not explained.</p>
+<p>Only a single explained join becomes a suggestion. Two candidates mean the data cannot decide, and choosing one would be a guess.</p>
 <p>Commas in different places, as in <code>Mori, Ken,Acme, Inc,Osaka,120</code>, would need two joins, which this code does not try. When a row has two or more extra values and no single join explains them, the message says "more than one value may need quotes", so the user knows to look for two values, not one.</p>
 
 <h2>Step 5: sort every row into imported or "needs a look"</h2>
@@ -209,6 +251,30 @@ function findJoins(fields, width, kinds, delimiter, spacedFile) {
   &quot;stray-quote&quot;: &quot;a quote mark inside a value that does not start with one&quot;,
   &quot;text-after-quote&quot;: &quot;text after the closing quote of a value&quot;,
 };
+
+// The message for a row with too many values: why a join is or is not suggested.
+function whyJoin(joins, extra, kinds) {
+  if (joins.length &gt; 1) {
+    return `${joins.length} different joins would fit, so none is suggested.`;
+  }
+  if (joins.length === 0) {
+    return extra &gt; 1
+      ? &quot;No single join of neighbouring values explains them: &quot; +
+        &quot;more than one value may need quotes.&quot;
+      : &quot;No join is explained by a space after the delimiter or a grouped number, &quot; +
+        &quot;so the data cannot tell which values belong together.&quot;;
+  }
+  const { result, at, dropped, grouped } = joins[0];
+  const checked = kinds.some((k) =&gt; k !== &quot;any&quot;)
+    ? &quot;fits the other rows&quot;
+    : &quot;gives the right count (too few complete rows to check the columns)&quot;;
+  const empties = dropped === 1 ? &quot;, once the empty value at the end is dropped&quot;
+    : dropped ? `, once the ${dropped} empty values at the end are dropped` : &quot;&quot;;
+  // A grouped number can also be a row shifted by one column: Porto,1,234
+  const shifted = grouped ? &quot; Check that the row is not shifted by one column.&quot; : &quot;&quot;;
+  return `${JSON.stringify(result[at])} as one value ${checked}${empties}.${shifted}`;
+}
+const values = (n) =&gt; `${n} ${n === 1 ? &quot;value&quot; : &quot;values&quot;}`;
 
 // Splits a file into rows you can import and issues a person must look at.
 // A row with a problem is never in `rows`; a suggestion waits for a yes.
@@ -224,7 +290,6 @@ function checkCsv(text, { delimiter = &quot;,&quot;, headerIndex = 0 } = {}) {
   // If the file writes &quot;a, b, c&quot;, a space after a comma explains nothing.
   const spacedFile = good.some((r) =&gt; r.spaced);
   const rows = [], issues = [];
-  const values = (n) =&gt; `${n} ${n === 1 ? &quot;value&quot; : &quot;values&quot;}`;
   const report = (r, kind, message, suggestion = null, endLine = r.line) =&gt; issues.push({
     line: r.line, endLine, kind, message: `Line ${r.line}: ${message}`, fields: r.fields,
     suggestion,
@@ -245,24 +310,27 @@ function checkCsv(text, { delimiter = &quot;,&quot;, headerIndex = 0 } = {}) {
       report(r, r.problems[0], `${counted}${what}. Check that it reads correctly.`,
         count === width ? r.fields : null);
     } else if (count === width) {
-      rows.push(r);
+      rows.push({ line: r.line, fields: r.fields });
     } else if (count &gt; width) {
-      const kept = r.fields.slice(0, width);
-      if (r.fields.slice(width).every((f) =&gt; !f.trim()) &amp;&amp; fits(kept, kinds, delimiter)) {
+      // Empty values at the end (&quot;15,,&quot; or &quot;120,&quot;) lose nothing when dropped.
+      let last = count;
+      while (last &gt; width &amp;&amp; !r.fields[last - 1].trim()) last--;
+      const kept = r.fields.slice(0, last);
+      if (last === width &amp;&amp; fits(kept, kinds, delimiter)) {
         report(r, &quot;trailing-delimiter&quot;, `${values(count - width)} after the last column, ` +
           &quot;all empty.&quot;, kept);
         return;
       }
-      const joins = findJoins(r.fields, width, kinds, delimiter, spacedFile);
-      const why = joins.length === 1
-        ? `${JSON.stringify(joins[0].result[joins[0].at])} as one value fits the other rows.`
-        : joins.length ? `${joins.length} different joins would fit, so none is suggested.`
-        : count - width &gt; 1 ? &quot;No single join of neighbouring values explains them: &quot; +
-          &quot;more than one value may need quotes.&quot;
-        : &quot;No join is explained by a space after the delimiter or a grouped number, &quot; +
-          &quot;so the data cannot tell which values belong together.&quot;;
-      report(r, &quot;too-many&quot;, `${values(count)}, the header has ${width}. ${why}`,
-        joins.length === 1 ? joins[0].result : null);
+      // Look for joins with all values, then with the empty ones at the end dropped.
+      const joins = [];
+      for (let n = count; n &gt;= Math.max(last, width + 1); n--) {
+        const fields = r.fields.slice(0, n);
+        for (const join of findJoins(fields, width, kinds, delimiter, spacedFile)) {
+          joins.push({ ...join, dropped: count - n });
+        }
+      }
+      report(r, &quot;too-many&quot;, `${values(count)}, the header has ${width}. ` +
+        whyJoin(joins, count - width, kinds), joins.length === 1 ? joins[0].result : null);
     } else {
       // An unquoted line break splits one row into two short ones.
       const next = body[index + 1];
@@ -278,17 +346,17 @@ function checkCsv(text, { delimiter = &quot;,&quot;, headerIndex = 0 } = {}) {
   });
   return { header: header.fields, rows, issues };
 }</code></pre>
-<p>With the header <code>Name,Company,City,Amount</code> and three clean rows (<code>Yui Tanaka,Acme,Tokyo,49</code>, <code>Li Wei,Orbit,Lyon,7</code> and <code>Kim Park,"Park, Ltd",Seoul,9</code>), our tests give these results for one more line. "Two fit" means two joins are explained; "no space" means <code>Acme,Inc</code> could just as well be a shifted column.</p>
+<p>With the header <code>Name,Company,City,Amount</code> and three clean rows (<code>Yui Tanaka,Acme,Tokyo,49</code>, <code>Li Wei,Orbit,Lyon,7</code> and <code>Kim Park,"Park, Ltd",Seoul,9</code>), our tests give these results for one more line. A grouped-number suggestion such as <code>1,234</code> could also be a row shifted by one column, so its message asks the user to check that.</p>
 <table>
 <tr><th>Line</th><th>Issue</th><th>Suggestion</th></tr>
 <tr><td><code>Ken Mori,<wbr>Acme,<wbr> Inc,<wbr>Osaka,<wbr>120</code></td><td>too-many</td><td><code>Acme, Inc</code></td></tr>
 <tr><td><code>Mori,<wbr> Ken,<wbr>Acme,<wbr>Osaka,<wbr>120</code></td><td>too-many</td><td><code>Mori, Ken</code></td></tr>
 <tr><td><code>Ana Lima,<wbr>Lima &amp; Co,<wbr>Porto,<wbr>1,<wbr>234</code></td><td>too-many</td><td><code>1,234</code></td></tr>
 <tr><td><code>Ana Lima,<wbr>Lima &amp; Co,<wbr>Porto,<wbr>1,<wbr>234.50</code></td><td>too-many</td><td><code>1,234.50</code></td></tr>
-<tr><td><code>Ken Mori,<wbr>Acme,<wbr> Inc,<wbr> Osaka,<wbr>120</code></td><td>too-many</td><td>none (two fit)</td></tr>
-<tr><td><code>Eve Ito,<wbr>Acme,<wbr>Inc,<wbr>Nara,<wbr>30</code></td><td>too-many</td><td>none (no space)</td></tr>
-<tr><td><code>Bo Chen,<wbr>Chen Ltd,<wbr>Lyon,<wbr>12,<wbr>5</code></td><td>too-many</td><td>none (not grouped)</td></tr>
-<tr><td><code>Ana Lima,<wbr>Lima,<wbr> Co,<wbr>Porto,<wbr>1,<wbr>234</code></td><td>too-many</td><td>none (commas apart)</td></tr>
+<tr><td><code>Ken Mori,<wbr>Acme,<wbr> Inc,<wbr> Osaka,<wbr>120</code></td><td>too-many</td><td>none (two joins fit)</td></tr>
+<tr><td><code>Eve Ito,<wbr>Acme,<wbr>Inc,<wbr>Nara,<wbr>30</code></td><td>too-many</td><td>none (no space after the comma)</td></tr>
+<tr><td><code>Bo Chen,<wbr>Chen Ltd,<wbr>Lyon,<wbr>12,<wbr>5</code></td><td>too-many</td><td>none (12,5 is not a grouped number)</td></tr>
+<tr><td><code>Ana Lima,<wbr>Lima,<wbr> Co,<wbr>Porto,<wbr>1,<wbr>234</code></td><td>too-many</td><td>none (two separate commas)</td></tr>
 <tr><td><code>Bo Chen,<wbr>Chen Ltd,<wbr>Lyon,<wbr>15,<wbr>,<wbr></code></td><td>trailing-delimiter</td><td>drop the empties</td></tr>
 <tr><td><code>Sam Fox,<wbr>Fox Ltd,<wbr>120</code></td><td>too-few</td><td>none</td></tr>
 <tr><td><code>Sam Fox,<wbr>Fox 5" Ltd,<wbr>Leeds,<wbr>5</code></td><td>stray-quote</td><td>row as read</td></tr>
@@ -297,21 +365,24 @@ function checkCsv(text, { delimiter = &quot;,&quot;, headerIndex = 0 } = {}) {
 </table>
 <p>Each issue carries a message ready to show, such as <code>Line 5: 5 values, the header has 4. "Acme, Inc" as one value fits the other rows.</code> Rows with a quote problem and the wrong number of values get both in one message, with no suggestion.</p>
 <p>For a row with too few values, the issue covers the next line too when the two together have the right count, which is what an unquoted line break inside a value looks like: <code>Line 4: 2 values, the header has 3. With line 5 it would fit: a line break inside a value?</code> Its <code>endLine</code> is 5, and line 5 gets no issue of its own. There is no suggestion: two short rows that are each missing a value can look the same.</p>
-<p>Empty values after the last column (<code>15,,</code>) are common in exports and lose nothing when dropped, but they are only dropped if the remaining values fit the columns. <code>Bo Chen,Lyon,15,,</code> in the same file is reported as too many values with no suggestion, because <code>15</code> would land in City: that row is missing its company. <code>Ken Mori,Acme, Inc,Osaka,</code> (Amount left blank) gets the <code>Acme, Inc</code> join.</p>
+<p>Empty values after the last column (<code>15,,</code>) are common in exports and lose nothing when dropped, but they are only dropped if the remaining values fit the columns. <code>Bo Chen,Lyon,15,,</code> in the same file is reported as too many values with no suggestion, because <code>15</code> would land in City: that row is missing its company. A row can have both problems: <code>Ken Mori,Acme, Inc,Osaka,120,</code> gets the <code>Acme, Inc</code> join, and the message says the empty value at the end is dropped. <code>Ken Mori,Acme, Inc,Osaka,</code> (Amount left blank) gets the same join and keeps its blank Amount.</p>
+<p>With fewer than two complete rows, the column kinds are unknown and only the space rule can explain a join. The message then says <code>gives the right count (too few complete rows to check the columns)</code> instead of claiming the join fits the other rows. A file with a header and a single broken row also leaves step 2 unsure, so the user picks the delimiter first.</p>
 <p>An unclosed quote is the one problem that hides other rows. In a file whose lines 2 to 5 are <code>Yui,Acme,49</code> / <code>Ken,"Mori Ltd,120</code> / <code>Li,Orbit,7</code> / <code>Bo,Chen,9</code>, everything from line 3 on becomes one value, so only Yui's row is imported and the message reads <code>Line 3: a quote opens on line 3 and never closes, so lines 3 to 5 became one value.</code> The user has to fix the file; any automatic recovery would be a guess about where the value was meant to end.</p>
 
 <h2>Step 6: let the user confirm</h2>
-<p><code>importCsv</code> connects the parts to your interface. <code>confirm</code> is a function you supply: show the message and the suggested row, and return <code>true</code> (or a promise of <code>true</code>, from a modal) if the user accepts. Anything else counts as no. Because of that, <code>importCsv</code> returns a promise: <code>const result = await importCsv(text, confirm)</code>.</p>
+<p><code>importCsv</code> connects the parts to your interface. Its options are <code>delimiter</code> and <code>headerIndex</code>, both passed to <code>checkCsv</code>. <code>confirm</code> is a function you supply: show the message and the suggested row, and return <code>true</code> (or a promise of <code>true</code>, from a modal) if the user accepts. Anything else counts as no. Because of that, <code>importCsv</code> returns a promise: <code>const result = await importCsv(text, confirm)</code>.</p>
 <pre><code>// confirm(issue) is your UI: show issue.message and issue.suggestion, and
-// return (or resolve to) true if the user accepts the suggestion. Pass `delimiter` once the
-// user has picked one; without it, an unsure guess returns no rows.
-async function importCsv(text, confirm, delimiter) {
+// return (or resolve to) true if the user accepts the suggestion.
+// Pass `delimiter` once the user has picked one; without it, an unsure guess
+// returns no rows. `headerIndex` is passed on to checkCsv.
+async function importCsv(text, confirm, { delimiter, headerIndex = 0 } = {}) {
   const guess = delimiter ? { delimiter, sure: true } : guessDelimiter(text);
   if (!guess.sure) {
-    return { header: [], rows: [], open: [], delimiter: guess.delimiter, delimiterSure: false };
+    const { delimiter: guessed } = guess;
+    return { header: [], rows: [], open: [], delimiter: guessed, delimiterSure: false };
   }
-  const { header, rows, issues } = checkCsv(text, { delimiter: guess.delimiter });
-  const accepted = rows.map((r) =&gt; ({ line: r.line, fields: r.fields }));
+  const { header, rows, issues } = checkCsv(text, { delimiter: guess.delimiter, headerIndex });
+  const accepted = [...rows];
   const open = [];
   for (const issue of issues) {
     if (issue.suggestion &amp;&amp; (await confirm(issue)) === true) {
@@ -321,19 +392,19 @@ async function importCsv(text, confirm, delimiter) {
     }
   }
   accepted.sort((a, b) =&gt; a.line - b.line);
-  return { header, rows: accepted, open, delimiter: guess.delimiter, delimiterSure: guess.sure };
+  return { header, rows: accepted, open, delimiter: guess.delimiter, delimiterSure: true };
 }</code></pre>
-<p>If the delimiter guess is not sure, <code>importCsv</code> returns no rows and <code>delimiterSure: false</code>: ask the user to pick, then call it again with their choice as the third argument. Row issues from a wrong delimiter would be noise. Accepted rows go back in file order, so line numbers in later messages still match. Everything left in <code>open</code> needs the user to edit the file or skip the row; list those by line number and let them download the list. A wrong delimiter makes every row look broken, which is why the delimiter comes first.</p>
+<p>If the delimiter guess is not sure, <code>importCsv</code> returns no rows and <code>delimiterSure: false</code>: ask the user to pick, then call it again with <code>{ delimiter: choice }</code>. Row issues from a wrong delimiter would be noise. Accepted rows go back in file order, so line numbers in later messages still match. Everything left in <code>open</code> needs the user to edit the file or skip the row; list those by line number and let them download the list. A wrong delimiter makes every row look broken, which is why the delimiter comes first.</p>
 <p>Values are returned as they were in the file, spaces included, so trim them when you store them. A repaired value is still text: <code>1,234</code> needs its separator removed before <code>Number()</code>, which returns <code>NaN</code> for it. Parsing numbers, including decimal commas, is covered in <a href="../parse-european-number-formats-javascript/">parsing European number formats</a>.</p>
-<p>If you already use a CSV library, you do not have to replace it. Run <code>checkCsv</code> on the same text when the library reports rows with the wrong number of fields, and import the rows it accepts plus the suggestions your user confirms.</p>
+<p>If you already use a CSV library, you do not have to replace it. When it reports rows with the wrong number of fields, switch to <code>importCsv</code> for that file and take every row from it, none from the library: the two parsers can read odd quotes differently, and mixing their rows can lose or duplicate rows.</p>
 
 <h2>What this does not cover</h2>
 <ul>
 <li><strong>A broken header row.</strong> The header sets the number of columns, so an unquoted comma in it, or a delimiter at its end, makes every row look wrong. If most rows have one value more or fewer than the header, check the header first.</li>
 <li><strong>Two separate unquoted commas in one row.</strong> Only one run of neighbouring values is joined, so such rows are flagged without a suggestion.</li>
-<li><strong>Files written as <code>a, b, c</code></strong>, or with even one clean row that has a space after a delimiter, get flags only (and grouped-number joins), since the space rule is off for them.</li>
+<li><strong>Files written as <code>a, b, c</code>.</strong> The space rule is off for them (see step 4), so only grouped numbers can be suggested; other broken rows are flagged.</li>
 <li><strong>A first line such as <code>sep=;</code></strong> that names the delimiter. If your files can have one, remove it before calling <code>checkCsv</code>, or it becomes the header.</li>
-<li><strong>Kinds beyond plain numbers.</strong> Decimal commas such as <code>1,5</code> count as numbers only when the delimiter is not a comma. <code>$49</code>, <code>12.5%</code> and dates are treated as text. Extend <code>isNumber</code> or add kinds for the formats your columns hold.</li>
+<li><strong>Kinds beyond plain numbers.</strong> Placeholders other than <code>-</code> and <code>n/a</code> (such as <code>TBD</code>) make a number column mixed, which turns its checks off. Decimal commas such as <code>1,5</code> count as numbers only when the delimiter is not a comma. <code>$49</code>, <code>12.5%</code> and dates are treated as text. Extend <code>isNumber</code> or add kinds for the formats your columns hold.</li>
 <li><strong>Files where few rows are clean.</strong> With fewer than two clean values in a column, its kind is <code>"any"</code> and only the space rule can explain a join.</li>
 <li><strong>Repairing line breaks</strong> inside unquoted values: you get a hint, not a fix.</li>
 <li><strong>Very large files.</strong> The whole text is parsed in memory, which is fine for typical uploads.</li>

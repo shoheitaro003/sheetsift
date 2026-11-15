@@ -941,8 +941,38 @@ ok("csvf: messages name the line and the cause", () => {
     'Line 5: 5 values, the header has 4. "Acme, Inc" as one value fits the other rows.',
     "Line 6: 3 values, the header has 4.",
     "Line 7: 5 values, the header has 4. No join is explained by a space after the delimiter or a grouped number, so the data cannot tell which values belong together.",
-    "Line 8: 6 values, the header has 4. No single join of neighbouring values explains them: more than one value may need quotes.",
+    'Line 8: 6 values, the header has 4. "1,234" as one value fits the other rows, once the empty value at the end is dropped. Check that the row is not shifted by one column.',
   ]);
+});
+ok("csvf: an unquoted comma and empty values at the end in one row", () => {
+  const r = checkCsv(CSVF_BASE + "Ken Mori,Acme, Inc,Osaka,120,\nEve Ito,Acme, Inc,Nara,30,,\nBo Chen,Lyon,15,,,\n");
+  assert.deepStrictEqual(r.issues.map((i) => [i.kind, i.suggestion]), [
+    ["too-many", ["Ken Mori", "Acme, Inc", "Osaka", "120"]],
+    ["too-many", ["Eve Ito", "Acme, Inc", "Nara", "30"]],
+    ["too-many", null],
+  ]);
+  assert(r.issues[1].message.endsWith('"Acme, Inc" as one value fits the other rows, once the 2 empty values at the end are dropped.'));
+  // A blank last value that belongs to the row is kept: Amount left empty.
+  const blank = checkCsv(CSVF_BASE + "Ken Mori,Acme, Inc,Osaka,\n");
+  assert.deepStrictEqual(blank.issues[0].suggestion, ["Ken Mori", "Acme, Inc", "Osaka", ""]);
+});
+ok("csvf: with no complete rows the message does not claim the columns were checked", () => {
+  const r = checkCsv("Name,Company,Amount\nKen,Acme, Inc,120\n");
+  assert.deepStrictEqual(r.issues[0].suggestion, ["Ken", "Acme, Inc", "120"]);
+  assert.strictEqual(r.issues[0].message, 'Line 2: 4 values, the header has 3. "Acme, Inc" as one value gives the right count (too few complete rows to check the columns).');
+  const one = checkCsv("Name,Company,Amount\nYui,Acme,49\nKen,Acme, Inc,120\n");
+  assert(one.issues[0].message.includes("too few complete rows"));
+  // A header and one broken row: nothing to compare, so the delimiter guess is not sure.
+  assert.deepStrictEqual(guessDelimiter("Name,Company,Amount\nKen,Acme, Inc,120\n"), { delimiter: ",", sure: false });
+  assert.deepStrictEqual(guessDelimiter("Name,Company,Amount\nKen,Acme,120\n"), { delimiter: ",", sure: true });
+});
+ok("csvf: the parser helpers", () => {
+  assert.deepStrictEqual([breakLength("a\r\nb", 1), breakLength("\n", 0), breakLength("\r", 0), breakLength("a", 0)], [2, 1, 1, 0]);
+  assert.deepStrictEqual(readQuoted('"a ""b"" c",x', 0), { value: 'a "b" c', end: 11, breaks: 0, closed: true });
+  assert.deepStrictEqual(readQuoted('"two\r\nlines', 0), { value: "two\r\nlines", end: 11, breaks: 1, closed: false });
+  assert.deepStrictEqual(readField('  "Acme, Inc"  ,9', 0, ","), { value: "Acme, Inc", end: 15, breaks: 0, problems: [] });
+  assert.deepStrictEqual(readField('x,"Zeta" Corp"s\n', 2, ",").problems, ["text-after-quote", "stray-quote"]);
+  assert.deepStrictEqual(readField(" Inc,120", 0, ","), { value: " Inc", end: 4, breaks: 0, problems: [] });
 });
 ok("csvf: ambiguous joins are not suggested", () => {
   const r = checkCsv(CSVF_BASE + "Ken Mori,Acme, Inc, Osaka,120\n");
@@ -1059,17 +1089,17 @@ ok("csvf: importCsv keeps file order and leaves the rest open", async () => {
   const text = "Name,Company,Amount\nYui,Acme,49\nKen,Acme, Inc,120\nLi,Orbit,7\nBo,Chen,,\nSam,Fox\n";
   const unsure = await importCsv(text, () => true);
   assert.deepStrictEqual(unsure, { header: [], rows: [], open: [], delimiter: ",", delimiterSure: false });
-  const yes = await importCsv(text, () => true, ",");
+  const yes = await importCsv(text, () => true, { delimiter: "," });
   assert.deepStrictEqual(yes.rows.map((r) => r.fields), [["Yui", "Acme", "49"], ["Ken", "Acme, Inc", "120"], ["Li", "Orbit", "7"], ["Bo", "Chen", ""]]);
   assert.deepStrictEqual(yes.open.map((i) => i.kind), ["too-few"]);
   assert.deepStrictEqual([yes.delimiter, yes.delimiterSure], [",", true]);
-  const no = await importCsv(text, () => false, ",");
+  const no = await importCsv(text, () => false, { delimiter: "," });
   assert.deepStrictEqual(no.rows.map((r) => r.line), [2, 4]);
   assert.deepStrictEqual(no.open.map((i) => i.kind), ["too-many", "trailing-delimiter", "too-few"]);
   // A modal that answers later: a promise of false must not count as yes.
-  const later = await importCsv(text, async () => false, ",");
+  const later = await importCsv(text, async () => false, { delimiter: "," });
   assert.deepStrictEqual(later.rows.map((r) => r.line), [2, 4]);
-  const laterYes = await importCsv(text, async () => true, ",");
+  const laterYes = await importCsv(text, async () => true, { delimiter: "," });
   assert.strictEqual(laterYes.rows.length, 4);
 });
 ok("csvf: a short row before a complete row is not merged with it", () => {
@@ -1114,6 +1144,34 @@ ok("csvf: two separate unquoted commas get no suggestion", () => {
   const apart = checkCsv(CSVF_BASE + "Ana Lima,Lima, Co,Porto,1,234\n");
   assert(apart.issues[0].message.endsWith("more than one value may need quotes."));
 });
+ok("csvf: the quick-use example prints what its comments say", () => {
+  const out = new Function("checkCsv", %%CSVF_QUICK_JSON%% +
+    "\nreturn [rows.length, issues[0].message, issues[0].suggestion, issues.length];")(checkCsv);
+  assert.deepStrictEqual(out, [2, 'Line 4: 5 values, the header has 4. "Acme, Inc" as one value fits the other rows.', ["Ken Mori", "Acme, Inc", "Osaka", "120"], 1]);
+});
+ok("csvf: placeholders such as n/a count as blank when learning kinds", () => {
+  const r = checkCsv("Name,Amount\nYui,n/a\nLi,7\nBo,9\nAna,1,234\nEd,-\n");
+  assert.deepStrictEqual(r.issues.map((i) => i.suggestion), [["Ana", "1,234"]]);
+  assert.deepStrictEqual(r.rows.map((x) => x.line), [2, 3, 4, 6]);
+  assert.deepStrictEqual(columnKinds([{ fields: ["N/A"] }, { fields: ["2"] }, { fields: ["na"] }, { fields: ["3"] }], 1), ["number"]);
+  assert(!isEmpty("none") && isEmpty("") && isEmpty("-") && isEmpty("N/A"));
+});
+ok("csvf: importCsv passes headerIndex on", async () => {
+  const r = await importCsv("Report\nName,Amount\nYui,49\nKen,7\n", () => true, { delimiter: ",", headerIndex: 1 });
+  assert.deepStrictEqual([r.header, r.rows.map((x) => x.line), r.open], [["Name", "Amount"], [3, 4], []]);
+});
+ok("csvf: the assembled module file runs the quick-use example", async () => {
+  const { pathToFileURL } = require("url");
+  const file = require("path").join(__dirname, "..", "examples", "check-csv.js");
+  const mod = await import(pathToFileURL(file).href);
+  const out = new Function("checkCsv", %%CSVF_QUICK_JSON%% +
+    "\nreturn [rows.length, issues[0].suggestion];")(mod.checkCsv);
+  assert.deepStrictEqual(out, [2, ["Ken Mori", "Acme, Inc", "Osaka", "120"]]);
+  assert.strictEqual(typeof mod.importCsv, "function");
+});
+ok("csvf: checkCsv returns rows as { line, fields }", () => {
+  assert.deepStrictEqual(checkCsv("a,b\n1,2\n").rows, [{ line: 2, fields: ["1", "2"] }]);
+});
 ok("csvf: no invisible characters in the snippets", () => {
   for (const s of %%CSVF_ALL_JSON%%) assert(!/[\u00A0\u200B-\u200F\u2028\u2029\uFEFF]/.test(s));
 });
@@ -1137,7 +1195,8 @@ CSVF_TABLE = [
   ["Kim Park,\"Park, Ltd\",Seoul,9", {"kind": "imported", "fields": ["Kim Park", "Park, Ltd", "Seoul", "9"]}],
   ["Mia Ross,\"Ross \"\"M\"\" Ltd\",Leeds,7", {"kind": "imported", "fields": ["Mia Ross", "Ross \"M\" Ltd", "Leeds", "7"]}],
 ]
-_csvf_names = ["CSVF_PARSE", "CSVF_DELIM", "CSVF_KINDS", "CSVF_JOINS", "CSVF_CHECK", "CSVF_USE"]
+CSVF_TESTS = CSVF_TESTS.replace("%%CSVF_QUICK_JSON%%", _json.dumps(CSVF_QUICK))
+_csvf_names = ["CSVF_QUICK", "CSVF_PARSE", "CSVF_DELIM", "CSVF_KINDS", "CSVF_JOINS", "CSVF_CHECK", "CSVF_USE"]
 for _k in _csvf_names:
     CSVF_TESTS = CSVF_TESTS.replace("%%" + _k + "%%", globals()[_k])
 _csvf_problem_body = CSVF_PROBLEM.replace("Object.fromEntries", "return Object.fromEntries")
@@ -1145,4 +1204,12 @@ CSVF_TESTS = CSVF_TESTS.replace("%%CSVF_PROBLEM_BODY%%", _csvf_problem_body)
 CSVF_TESTS = CSVF_TESTS.replace("%%CSVF_TABLE_JSON%%", _json.dumps(CSVF_TABLE, ensure_ascii=False))
 CSVF_TESTS = CSVF_TESTS.replace("%%CSVF_ALL_JSON%%", _json.dumps([globals()[k] for k in _csvf_names + ["CSVF_PROBLEM"]]))
 out += CSVF_TESTS
+# The assembled module the post links to, generated from the same snippets.
+_examples = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples")
+os.makedirs(_examples, exist_ok=True)
+with open(os.path.join(_examples, "check-csv.js"), "w") as _f:
+    _f.write("// Generated from tools/snippets.py by tools/make_article_tests.py. Do not edit.\n"
+             "// From https://shoheitaro003.github.io/sheetsift/blog/find-csv-rows-broken-by-unquoted-commas-javascript/\n\n"
+             + "\n\n".join(globals()[k] for k in _csvf_names[1:]) +
+             "\n\nexport { parseRecords, guessDelimiter, columnKinds, findJoins, checkCsv, importCsv };\n")
 open(sys.argv[1] if len(sys.argv) > 1 else "/dev/stdout", "w").write(out)
