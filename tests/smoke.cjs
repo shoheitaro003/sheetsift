@@ -232,6 +232,70 @@ function check(name, ok, detail) {
 
   check("no script errors on the page", errors.length === 0, errors);
 
+  // 9b. Large CSV post: the article's three modules, served over http, in a real Chromium module Worker
+  {
+    const modules = JSON.parse(fs.readFileSync(path.join(__dirname, "article-browser.json"), "utf8"));
+    const p4 = await browser.newPage();
+    const errs4 = []; p4.on("pageerror", (e) => errs4.push(String(e)));
+    await p4.route("http://large-csv.test/**", (route) => {
+      const name = new URL(route.request().url()).pathname.slice(1);
+      if (modules[name]) return route.fulfill({ body: modules[name], contentType: "text/javascript" });
+      return route.fulfill({ body: "<!doctype html><title>t</title>", contentType: "text/html" });
+    });
+    await p4.goto("http://large-csv.test/");
+    const big = await p4.evaluate(async () => {
+      const { importCsv } = await import("/import-csv.js");
+      const { createCsvParser } = await import("/csv-stream.js");
+      const cols = "id,name,email,company,note,amount,date,status\r\n";
+      const text = cols + Array.from({ length: 100000 }, (_, i) =>
+        `${i},"Name ${i}",u${i}@example.com,"Acme, Inc","He said ""hi""\nthen left 日本",${i}.5,2026-01-05,active`).join("\r\n") + "\r\n";
+      const file = new File([text], "big.csv", { type: "text/csv" });
+      // The longest gap between timer ticks: how long the page could not respond.
+      const watch = () => {
+        let last = performance.now(), max = 0;
+        const id = setInterval(() => { const t = performance.now(); max = Math.max(max, t - last); last = t; }, 5);
+        return () => { clearInterval(id); return Math.round(Math.max(max, performance.now() - last)); };
+      };
+      const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+      let stop = watch(); await pause(30);
+      let t0 = performance.now();
+      const all = await file.text();
+      let mainRows = 0;
+      const parser = createCsvParser({ onRow: () => mainRows++ });
+      parser.push(all); parser.end();
+      const mainMs = Math.round(performance.now() - t0);
+      await pause(30);
+      const mainGap = stop();
+      stop = watch();
+      let rows = 0, batches = 0, last = null;
+      t0 = performance.now();
+      const job = importCsv(file, { onBatch: (r) => { rows += r.length; batches++; if (r.length) last = r.at(-1); } });
+      const result = await job.result;
+      const workerMs = Math.round(performance.now() - t0);
+      const workerGap = stop();
+      // Cancel stops the worker: no batch arrives after it.
+      let afterCancel = 0, cancelled = false;
+      const c = importCsv(file, { onBatch: () => { if (cancelled) afterCancel++; else { cancelled = true; c.cancel(); } } });
+      const cancelError = await c.result.catch((e) => e.name);
+      await pause(100);
+      // Bytes that are not UTF-8 fail with an error in Chromium too.
+      const bad = await importCsv(new File([new Uint8Array([0x43, 0x61, 0x66, 0xe9])], "x.csv"), { onBatch() {} }).result.catch((e) => e.name + ": " + e.message);
+      // Chunk sizes of File.stream() in Chromium (Node 22 gives one chunk; see tests/article-examples.cjs).
+      const reader = file.stream().getReader(), chunks = [];
+      for (;;) { const { value, done } = await reader.read(); if (done) break; chunks.push(value.length); }
+      return { mainMs, workerMs, mainRows, mainGap, rows, batches, result, last, workerGap, cancelError, afterCancel, bad, chunks, size: file.size };
+    });
+    console.log("  large CSV (100,000 rows): longest main-thread pause " + big.mainGap + " ms parsing on the page, " + big.workerGap + " ms with the worker, " + big.batches + " batches; total " + big.mainMs + " ms on the page, " + big.workerMs + " ms with the worker");
+    check("large csv: the worker returns every row", big.rows === 100001 && big.mainRows === 100001 && big.result.rowCount === 100001, big);
+    check("large csv: line numbers survive quoted line breaks", big.last && big.last.line === 200000 && big.last.cells[4] === 'He said "hi"\nthen left 日本', big.last);
+    check("large csv: the page keeps responding with the worker", big.workerGap < big.mainGap && big.workerGap < 100, big);
+    check("large csv: cancel stops the worker", big.cancelError === "AbortError" && big.afterCancel === 0, big);
+    check("large csv: non-UTF-8 bytes are an error", /^Error: .*not valid/i.test(big.bad), big.bad);
+    check("large csv: Chromium streams the file in chunks of at most 2 MiB", big.chunks.length > 1 && Math.max(...big.chunks) <= 2097152 && big.chunks.reduce((x, y) => x + y, 0) === big.size, big.chunks);
+    check("large csv: no script errors", errs4.length === 0, errs4);
+    await p4.close();
+  }
+
   // 10. Blog: every page renders on a phone and every local link points to a real file
   const root = path.resolve(__dirname, "..");
   const pages = ["index.html", "blog/index.html"].concat(

@@ -948,3 +948,273 @@ function applyMapping(rows, headerRow, byField) {
     .filter((row) => used.some(([, match]) => String(cell(row, match)).trim() !== ""))
     .map(toRecord);
 }'''
+
+BIG_PROBLEM = r'''const csv = 'id,note\n1,"Line one\nline two"\n2,"Acme, Inc"\n';
+const rows = csv.trim().split("\n").map((line) => line.split(","));
+rows.length; // 4
+rows[1].length; // 2
+rows[3].length; // 3'''
+BIG_PARSER = r'''// csv-stream.js
+// Splits CSV text into rows. The text can arrive in chunks that end anywhere:
+// inside a quoted cell, between the two quotes of "", or between \r and \n.
+export function createCsvParser(options) {
+  const { delimiter = ",", maxCellLength = 1000000, onRow } = options;
+  const onError = options.onError ?? (() => {});
+  if (delimiter.length !== 1 || "\"\r\n".includes(delimiter)) {
+    throw new Error(`delimiter must be one character, not a quote or line break`);
+  }
+  let cell = "", row = [];
+  let inQuotes = false;     // inside "..."
+  let afterQuote = false;   // just read a closing quote, or the first quote of ""
+  let cellQuoted = false;   // the current cell started with a quote
+  let rowQuoted = false;    // some cell in this row started with a quote
+  let afterCR = false;      // the last character was \r (as in a Windows \r\n)
+  let line = 1, rowLine = 1, started = false;
+
+  function endCell() {
+    row.push(cell);
+    cell = "";
+    afterQuote = cellQuoted = false;
+  }
+  function endRow() {
+    endCell();
+    // An empty line is skipped. A line with only "" is a row with one empty cell.
+    if (row.length > 1 || row[0] !== "" || rowQuoted) onRow(row, rowLine);
+    row = [];
+    rowQuoted = false;
+  }
+
+  function push(text) {
+    if (!started && text) {
+      if (text[0] === "\uFEFF") text = text.slice(1); // byte order mark
+      started = true;
+    }
+    for (const ch of text) {
+      const secondHalfOfCRLF = afterCR && ch === "\n";
+      afterCR = ch === "\r";
+      if (inQuotes) {
+        if (ch === '"') {
+          inQuotes = false;
+          afterQuote = true;
+        } else {
+          cell += ch; // line breaks inside quotes belong to the cell
+          if (ch === "\r" || (ch === "\n" && !secondHalfOfCRLF)) line++;
+        }
+      } else if (secondHalfOfCRLF) {
+        // The row already ended at the \r.
+      } else if (ch === '"' && afterQuote) {
+        cell += '"'; // "" inside a quoted cell is one quote
+        inQuotes = true;
+        afterQuote = false;
+      } else if (ch === delimiter) {
+        endCell();
+      } else if (ch === "\r" || ch === "\n") {
+        endRow();
+        rowLine = ++line;
+      } else if (ch === '"' && cell === "" && !cellQuoted) {
+        inQuotes = cellQuoted = rowQuoted = true;
+      } else {
+        if (afterQuote) {
+          const message = `text after a closing quote: ${JSON.stringify(ch)}`;
+          onError({ line, message });
+          afterQuote = false;
+        }
+        cell += ch; // includes a quote in the middle of a cell, as in 5" screen
+      }
+      if (cell.length > maxCellLength) {
+        // Usually a quote that is never closed: stop, do not read on.
+        const limit = `${maxCellLength} characters`;
+        throw new Error(`line ${rowLine}: a cell is longer than ${limit}`);
+      }
+    }
+  }
+
+  function end() {
+    if (inQuotes) {
+      const message = "a quote opened on this line is never closed";
+      onError({ line: rowLine, message });
+    }
+    if (row.length > 0 || cell !== "" || cellQuoted) endRow();
+  }
+
+  return { push, end };
+}'''
+BIG_BATCHES = r'''const PIECE = 65536; // characters parsed at a time, however big the chunk
+
+// Reads a File (or Blob) as a stream and yields parsed rows in batches.
+export async function* csvBatches(file, options = {}) {
+  const { batchSize = 2000, encoding = "utf-8", ...parserOptions } = options;
+  if (!Number.isInteger(batchSize) || batchSize < 1) {
+    throw new Error("batchSize must be a whole number of at least 1");
+  }
+  let rows = [], errors = [], bytesRead = 0;
+  const full = []; // batches of exactly batchSize rows, waiting to be yielded
+  const parser = createCsvParser({
+    ...parserOptions,
+    onRow(cells, line) {
+      rows.push({ line, cells });
+      if (rows.length === batchSize) {
+        full.push({ rows, errors });
+        rows = [];
+        errors = [];
+      }
+    },
+    onError: (error) => errors.push(error),
+  });
+  const countBytes = new TransformStream({
+    transform(chunk, controller) {
+      bytesRead += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+  });
+  // fatal: true turns bytes that are not valid in `encoding` into an error.
+  const reader = file.stream().pipeThrough(countBytes)
+    .pipeThrough(new TextDecoderStream(encoding, { fatal: true })).getReader();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) {
+        parser.end();
+        while (full.length) yield { ...full.shift(), bytesRead, done: false };
+        yield { rows, errors, bytesRead, done: true }; // may have no rows
+        return;
+      }
+      for (let i = 0; i < value.length; i += PIECE) {
+        parser.push(value.slice(i, i + PIECE));
+        while (full.length) yield { ...full.shift(), bytesRead, done: false };
+      }
+    }
+  } finally {
+    // Runs on errors and when the caller stops early (break): release the file.
+    reader.cancel().catch(() => {});
+  }
+}'''
+BIG_WORKER = r'''// csv-worker.js
+import { csvBatches } from "./csv-stream.js";
+
+let continueReading = null;
+
+self.onmessage = async ({ data }) => {
+  if (data.type === "next") return continueReading?.();
+  try {
+    let rowCount = 0;
+    for await (const batch of csvBatches(data.file, data.options)) {
+      rowCount += batch.rows.length;
+      // Wait until the page has handled this batch, so unread rows never pile up.
+      const handled = new Promise((resolve) => (continueReading = resolve));
+      self.postMessage({ type: "batch", ...batch, rowCount });
+      await handled;
+    }
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    self.postMessage({ type: "failed", message });
+  }
+};'''
+BIG_MAIN = r'''// import-csv.js
+// Parses a CSV file in a worker. onBatch(rows, errors, signal) may be async:
+// the worker waits for it before sending more, and signal aborts on cancel().
+// options (batchSize, encoding, delimiter, maxCellLength) must be plain data.
+export function importCsv(file, { onBatch, onProgress, options = {} }) {
+  let worker = new Worker(new URL("./csv-worker.js", import.meta.url), {
+    type: "module",
+  });
+  const aborter = new AbortController();
+  let resolveResult, rejectResult;
+  const result = new Promise((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult = reject;
+  });
+  // Each returns false when the import had already ended.
+  const stop = () => {
+    if (!worker) return false;
+    worker.terminate();
+    worker = null;
+    return true;
+  };
+  const finish = (value) => stop() && (resolveResult(value), true);
+  const fail = (error) => stop() && (rejectResult(error), true);
+
+  worker.onmessage = async ({ data }) => {
+    if (!worker) return; // cancelled while this message was waiting
+    if (data.type === "failed") return fail(new Error(data.message));
+    try {
+      await onBatch(data.rows, data.errors, aborter.signal);
+      if (!worker) return; // cancelled while onBatch was running
+      onProgress?.(file.size ? data.bytesRead / file.size : 1);
+      if (data.done) finish({ rowCount: data.rowCount });
+      else worker.postMessage({ type: "next" });
+    } catch (error) {
+      fail(error); // from onBatch or onProgress: stop instead of hanging
+    }
+  };
+  worker.onerror = (event) => {
+    fail(new Error(event.message || "the CSV worker failed"));
+  };
+  worker.onmessageerror = () => fail(new Error("a batch could not be received"));
+  try {
+    worker.postMessage({ type: "start", file, options });
+  } catch (error) {
+    fail(error); // for example a function in options, which cannot be sent
+  }
+
+  const cancel = () => {
+    if (fail(new DOMException("Import cancelled", "AbortError"))) aborter.abort();
+  };
+  return { result, cancel };
+}'''
+BIG_USE = r'''import { importCsv } from "./import-csv.js";
+
+const MAX_PROBLEMS = 100; // a wrong delimiter makes every row a problem
+const input = document.querySelector("#csv-file");
+const status = document.querySelector("#import-status");
+const cancelButton = document.querySelector("#cancel-import");
+let current = null;
+
+input.addEventListener("change", async () => {
+  const file = input.files[0];
+  input.value = ""; // so that choosing the same file again fires "change"
+  if (!file) return;
+  current?.cancel(); // a new file replaces an import that is still running
+  const importId = crypto.randomUUID();
+  const problems = [];
+  let header = null;
+  const show = (text) => {
+    if (current === job) status.textContent = text;
+  };
+  const job = importCsv(file, {
+    async onBatch(rows, errors, signal) {
+      problems.push(...errors);
+      const records = [];
+      for (const row of rows) {
+        if (!header) {
+          header = row.cells; // the first row is the header, not a record
+          continue;
+        }
+        if (row.cells.length !== header.length) {
+          const message = `${row.cells.length} cells, header has ${header.length}`;
+          problems.push({ line: row.line, message });
+        }
+        records.push(row);
+      }
+      if (problems.length > MAX_PROBLEMS) throw new Error("too many problems");
+      await saveRows(importId, header, records, signal); // yours: stage, not live
+    },
+    onProgress: (share) => show(`${Math.round(share * 100)}% read`),
+  });
+  current = job;
+  cancelButton.onclick = job.cancel;
+  try {
+    const { rowCount } = await job.result;
+    if (problems.length) throw new Error("problems");
+    await commitImport(importId); // yours: make the staged rows live
+    show(`Imported ${Math.max(rowCount - 1, 0)} rows`);
+  } catch (error) {
+    // yours: delete the staged rows (your server should also refuse late saves)
+    await discardImport(importId).catch(() => {});
+    if (error.name === "AbortError") return show("Import cancelled");
+    const first = problems[0];
+    show(first
+      ? `${problems.length} problems; line ${first.line}: ${first.message}`
+      : `Import failed: ${error.message}`);
+  }
+});'''

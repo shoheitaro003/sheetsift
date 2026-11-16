@@ -1,0 +1,88 @@
+title: Parse a large CSV file in the browser without freezing the page
+description: Tested JavaScript that streams a 100,000-row CSV through a Web Worker in batches, with progress, cancel, line numbers and quotes split across chunks.
+date: 2026-11-16
+---
+<p>A user picks an 11 MB CSV export and your import screen calls <code>file.text()</code> and parses it. In our Chromium test the page could not run anything else for about 400 ms, on a fast machine; a slower device or a bigger file makes the pause longer. The whole file also sits in memory twice, as one string and as an array of rows. With a quick <code>split("\n")</code> parser, the rows can be wrong as well.</p>
+<p>By the end of this post you will have <code>importCsv(file, { onBatch })</code>: three small ES modules with no dependencies. It reads the file as a stream inside a Web Worker and hands your page rows in batches, each row with its line number, plus a list of problems, progress and cancel. Every result quoted below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22, and the browser results by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/smoke.cjs">a Chromium test</a>.</p>
+
+<h2>Why the page stalls, and why split() is not enough</h2>
+<p>Your page's JavaScript runs one task at a time on the page's <em>main thread</em>. A parser called there keeps the thread until it returns, so your progress bar update and your Cancel button handler wait for it. Our test measures this with <code>setInterval</code> set to 5 ms while a 100,000-row file (11 MB, 8 columns) is parsed on the page: the longest gap between ticks is the pause, 381 to 431 ms in three of our runs.</p>
+<p>The quick parser many importers start with has a second problem. A cell in quotes can contain commas and line breaks, and splitting on them cuts it apart:</p>
+{{code:BIG_PROBLEM}}
+<p>The file has two records, but splitting gives four rows, and <code>"Acme, Inc"</code> becomes two cells. So the fix has three parts: a parser that understands quotes and accepts the text in pieces (step 1), a reader that feeds it the file piece by piece (step 2), and a <em>Web Worker</em>, a script that runs on its own thread next to the page, so the parsing leaves the main thread (steps 3 and 4).</p>
+<p>If you would rather use a library: the README of <a href="https://www.npmjs.com/package/papaparse">Papa Parse 5.7.1 on npm</a> (read on 2026-11-16) lists streaming large files, worker threads to keep the page reactive, and pause, resume and abort. This post is for when you want the code in your own repository, and it shows the pieces a SaaS import needs around the parser: the worker waits for your saving code, every row carries its line number, and invalid bytes are an error. What you give up: the same README lists delimiter detection and header row support, and a maintained library gets fixes you would otherwise write yourself.</p>
+
+<h2>Step 1: a parser that accepts chunks</h2>
+<p>A stream delivers the text in chunks, and a chunk can end anywhere: inside a quoted cell, between the two quotes of <code>""</code> (an escaped quote inside a quoted cell), or between the <code>\r</code> and <code>\n</code> of a Windows line end. So the parser cannot look ahead. It keeps its state in a few variables between calls and handles each character the moment it arrives. Put it in <code>csv-stream.js</code>:</p>
+{{code:BIG_PARSER}}
+<p><code>afterQuote</code> is what makes chunk boundaries safe. After a quote inside a quoted cell, the parser does not yet know whether the cell ended or an escaped quote started, so it waits for the next character, even if that arrives in the next chunk. <code>afterCR</code> does the same for <code>\r\n</code>. The test feeds the same tricky text in every possible two-way split, in more than 1,000 three-way splits and one character at a time, and checks that the rows are always identical.</p>
+<p><code>line</code> counts physical lines, so a row's line number is where it starts in the file, even when earlier cells contain line breaks. That is the number a user needs to find a bad row in a text editor.</p>
+<p>The parser keeps reading after a problem and reports it through <code>onError</code>, so one bad row does not hide the others. Here is what it does with the cases our tests cover:</p>
+<div class="table"><table>
+<tr><th>Input</th><th>Rows (line: cells)</th><th>Reported problem</th></tr>
+<tr><td><code>a,b\r\nc,d\r\n</code></td><td>1: <code>a</code> <code>b</code>; 2: <code>c</code> <code>d</code></td><td>none</td></tr>
+<tr><td><code>a,b\rc,d</code> (<code>\r</code> line ends, no final line end)</td><td>1: <code>a</code> <code>b</code>; 2: <code>c</code> <code>d</code></td><td>none</td></tr>
+<tr><td><code>1,"two\r\nlines"\n2,x</code></td><td>1: <code>1</code> <code>two\r\nlines</code>; 3: <code>2</code> <code>x</code></td><td>none</td></tr>
+<tr><td><code>"He said ""hi"""</code></td><td>1: <code>He said "hi"</code></td><td>none</td></tr>
+<tr><td><code>Ken,5" screen</code></td><td>1: <code>Ken</code> <code>5" screen</code> (a quote inside a cell is kept)</td><td>none</td></tr>
+<tr><td><code>"Acme" Inc,1</code></td><td>1: <code>Acme Inc</code> <code>1</code></td><td>line 1: text after a closing quote: <code>" "</code></td></tr>
+<tr><td><code>a\n\n\nb</code></td><td>1: <code>a</code>; 4: <code>b</code> (empty lines are skipped)</td><td>none</td></tr>
+<tr><td><code>a\n""</code></td><td>1: <code>a</code>; 2: one empty cell</td><td>none</td></tr>
+<tr><td><code>a,\n,</code></td><td>1: <code>a</code> and an empty cell; 2: two empty cells</td><td>none</td></tr>
+<tr><td><code>a\n"open,1\n2,3</code></td><td>1: <code>a</code>; 2: one cell with the rest of the file</td><td>line 2: a quote opened on this line is never closed</td></tr>
+<tr><td>the same, with more than <code>maxCellLength</code> characters after the quote</td><td>parsing stops</td><td>throws: line 2: a cell is longer than &hellip; characters</td></tr>
+<tr><td><code>a;b\n1,5;2</code> with <code>delimiter: ";"</code></td><td>1: <code>a</code> <code>b</code>; 2: <code>1,5</code> <code>2</code></td><td>none</td></tr>
+<tr><td><code> a , b </code></td><td>1: <code> a </code> <code> b </code> (spaces are kept)</td><td>none</td></tr>
+<tr><td>any input with <code>delimiter: ";;"</code>, <code>'"'</code> or a line break</td><td>none</td><td>throws: delimiter must be one character&hellip;</td></tr>
+</table></div>
+<p>The unclosed quote matters most in large files. One stray quote at the start of a cell turns everything after it into a single cell, so without a limit the parser would read the rest of the file into one string. <code>maxCellLength</code> (one million characters by default) stops the import as soon as a cell grows past it, with the line where the cell started. Set it to the longest value your fields can hold.</p>
+
+<h2>Step 2: read the file as a stream</h2>
+<p><code>file.stream()</code> reads the file in chunks of bytes, so the whole file never has to be in memory as one string. <code>TextDecoderStream</code> turns the bytes into text and keeps a character whose bytes are split between two chunks for the next one; the test cuts a file at every byte, including inside <code>山</code> and inside the byte order mark, and gets the same rows each time. A <code>TransformStream</code> in between counts bytes for the progress bar. Add this to <code>csv-stream.js</code>:</p>
+{{code:BIG_BATCHES}}
+<p>The generator yields batches of exactly <code>batchSize</code> rows, then a last batch, possibly empty, with <code>done: true</code>. Each row is <code>{ line, cells }</code>, and the first one is your header row. A problem comes in the batch that was being filled when it was found, with its line number; an unclosed quote is only known at the end, so it comes in the last batch.</p>
+<p>If the loop stops early, because of an error or because your code leaves the <code>for await</code> loop, <code>finally</code> cancels the reader and releases the file. A <code>batchSize</code> that is not a whole number of at least 1 is refused, since it would put the whole file in one batch.</p>
+<p>Chunk sizes differ a lot between runtimes: in our tests, Chromium 153 delivered the 11 MB file in chunks of up to 2 MiB, and Node 22 delivered it as one chunk. That is why the loop parses 65,536 characters at a time. It is also why <code>bytesRead</code> is a share of the file <em>read</em>, not parsed: it can run ahead of the rows by one chunk, so treat it as a rough progress bar.</p>
+<p><code>fatal: true</code> makes bytes that are not valid in the chosen encoding throw a <code>TypeError</code>. Without it, a Windows-1252 file turns every <code>é</code> into <code>&#xFFFD;</code> without any error. For files in older encodings, pass the right label as <code>encoding</code>, such as <code>"shift_jis"</code>; our post on <a href="../decode-shift-jis-windows-1252-utf-16-csv-javascript/">reading Shift_JIS, Windows-1252 and UTF-16 CSV files</a> shows how to detect it. <code>TextDecoderStream</code> already removes a UTF-8 byte order mark; the parser removes one too, for text that comes from somewhere else.</p>
+
+<h2>Step 3: move the work into a worker</h2>
+<p>The worker is a <em>module worker</em>, so it can import <code>csvBatches</code> instead of keeping a second copy of it:</p>
+{{code:BIG_WORKER}}
+<p>The worker waits for the page to say <code>"next"</code> before it reads further. Without that, it parses as fast as it can and sends every batch at once. If your page saves each batch to an API more slowly than the worker parses, all 100,000 rows then pile up in memory waiting to be saved, which is what streaming was meant to avoid. With the wait, at most one batch is in flight; the test checks that the worker never gets more than one batch ahead.</p>
+
+<h2>Step 4: the page side</h2>
+{{code:BIG_MAIN}}
+<p><code>importCsv</code> returns <code>{ result, cancel }</code>. <code>result</code> resolves with <code>{ rowCount }</code>, header included, after the last batch. It rejects when the worker fails, when bytes are not valid in the chosen encoding, when a cell passes <code>maxCellLength</code>, when your <code>onBatch</code> or <code>onProgress</code> throws, or when <code>options</code> contains something that cannot be sent to a worker, such as a function. Every failure ends the import instead of leaving it waiting, and the tests cover each one. Always await or catch <code>result</code>, also after <code>cancel()</code>, or the rejection goes unhandled.</p>
+<p><code>cancel()</code> stops the worker, rejects <code>result</code> with an <code>AbortError</code> and aborts the <code>signal</code> passed to <code>onBatch</code>, so you can pass it to <code>fetch</code> and stop a save in flight. The tests check that no batch and no progress call arrive after a cancel, even when it happens while <code>onBatch</code> is still saving, and that a cancel after the end changes nothing.</p>
+<p><code>import.meta.url</code> means the file with <code>importCsv</code> must itself be an ES module, and <code>csv-worker.js</code> and <code>csv-stream.js</code> must be served next to it. Our test runs the three files unbundled, as module scripts in Chromium 153. We have not tested a bundler: if you use one, check in its documentation which form of <code>new Worker(...)</code> it recognizes and whether it bundles the worker's imports.</p>
+
+<h2>Using it in an upload form</h2>
+<p>An import can fail at row 80,000, after tens of thousands of rows have already been sent to your API. So save batches to a staging area under an import id, and only make them live after the last batch and after checking the problems. <code>saveRows</code>, <code>commitImport</code> and <code>discardImport</code> are your code. A save that was already on its way can still reach your server after the discard, so the server should refuse saves for an import id it has discarded.</p>
+{{code:BIG_USE}}
+<p>The first row is kept as <code>header</code> and not saved as a record. The loop also catches rows with a different number of cells from the header, which is how an unquoted comma usually shows up, as in <code>Acme, Inc</code> without quotes. A wrong delimiter makes every row a problem, so the import stops once there are more than <code>MAX_PROBLEMS</code>, before saving anything more. Choosing a new file cancels a running import, and the cancelled import cannot overwrite the new status.</p>
+<p>The progress bar moves after each batch is saved, so it shows how far the import has got, not only the reading. The test runs this code with a 5,000-row file, a ragged row, a parser problem, a wrong delimiter, invalid bytes with a failing discard, a cancel and two files chosen one after the other.</p>
+<p>You could also run <code>csvBatches</code> on the page and wait for a timer between pieces. The page would still parse every character itself, though; with a worker, it only receives finished batches.</p>
+
+<h2>What our Chromium test shows</h2>
+<p>The test builds the 100,000-row, 11 MB file in the page, with a quoted comma, an escaped quote, a line break and Japanese text in every row. In those three runs, parsing on the page took 381 to 431 ms in one piece, so the pause was that long. Through the worker the longest pause was 30 to 36 ms, and all 100,001 rows (header included) arrived in 51 batches, with the last row on line 200,000.</p>
+<p>The worker is slower overall: 577 to 730 ms from start to the last batch, because each batch is copied to the page and the worker waits for the page before reading on. That is the trade: the page stays usable, and the import takes longer. The remaining pauses come from receiving the batches, so a bigger <code>batchSize</code> means fewer but longer pauses; measure with your own rows.</p>
+<p>These are numbers from the machine that ran our tests, not a benchmark. The test itself only checks that the pause with the worker is shorter than without it and under 100 ms, that every row arrives with the right line number, and that cancel stops the worker.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Excel files.</strong> They are not text, so this parser cannot read them. Our post on <a href="../read-excel-dates-javascript-sheetjs/">reading Excel dates with SheetJS</a> shows one way to read them.</li>
+<li><strong>Guessing the delimiter or the encoding.</strong> You pass both. Read the first piece of the file with <code>file.slice(0, 65536)</code> if you want to guess them before starting. A first line such as <code>sep=;</code> is read as an ordinary row.</li>
+<li><strong>Finding the header row and mapping columns.</strong> Our posts on <a href="../detect-header-row-spreadsheet-javascript/">detecting the header row</a> and <a href="../map-spreadsheet-columns-to-fields-javascript/">mapping columns to your fields</a> cover these; run them on the first batch.</li>
+<li><strong>Memory on your side.</strong> If <code>onBatch</code> pushes every row into one array, the whole file ends up in memory anyway. Save or process each batch, then let it go.</li>
+<li><strong>Very long rows.</strong> <code>maxCellLength</code> limits one cell, not a row; a file with a wrong delimiter setting and no line breaks can still build one huge row.</li>
+<li><strong>Unquoted commas in rows of the right length.</strong> The cell count check above only catches rows that end up longer or shorter than the header.</li>
+<li><strong>Running in Node.</strong> <code>csvBatches</code> works with a Node 22 <code>Blob</code>, as our tests show, but Node 22 has no global <code>Worker</code> (the test checks this), so <code>importCsv</code> does not run there. Use <code>csvBatches</code> directly.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer in early access. The demo on our homepage reads a CSV or Excel file in your browser, finds the header row and each column's type, and shows the first 100 rows; nothing is uploaded. It parses on the page, not in a worker yet, so try it with your messy files rather than your largest ones.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. The demo does not use the worker code from this post yet; you are free to use the functions in this post in your own code.</p>

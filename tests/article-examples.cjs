@@ -1647,3 +1647,455 @@ ok("map: no invisible characters in the snippets", () => {
   for (const s of ["function normalizeHeader(text) {\n  return String(text ?? \"\")\n    // \uff25\uff4d\uff41\uff49\uff4c -> Email, \uff92\uff70\uff99 -> \u30e1\u30fc\u30eb, no-break space -> space\n    .normalize(\"NFKC\")\n    // zero-width spaces and byte order marks\n    .replace(/\\p{Cf}/gu, \"\")\n    // signupDate -> signup Date\n    .replace(/(\\p{Ll})(\\p{Lu})/gu, \"$1 $2\")\n    .toLowerCase()\n    // \u00e9 -> e, but the mark in Japanese \u30c9 stays\n    .normalize(\"NFD\")\n    .replace(/(\\p{Script=Latin})\\p{M}+/gu, \"$1\")\n    .normalize(\"NFC\")\n    // punctuation, underscores and runs of spaces -> one space\n    .replace(/[^\\p{L}\\p{N}]+/gu, \" \")\n    .trim();\n}\n\n// Plurals count as the same word. \"address\" is left alone.\nfunction stem(word) {\n  if (/(ss|x|ch|sh)es$/.test(word)) return word.slice(0, -2); // addresses\n  if (word.length > 3 && /[^s]s$/.test(word)) return word.slice(0, -1); // plans\n  return word;\n}\nconst words = (text) => normalizeHeader(text).split(\" \").filter(Boolean).map(stem);\nconst headerKey = (text) => words(text).join(\" \");", "// True when b is a with one letter changed, added or removed,\n// or with two neighbouring letters swapped.\nfunction oneEditApart(a, b) {\n  if (a === b || Math.abs(a.length - b.length) > 1) return false;\n  let i = 0;\n  while (a[i] === b[i]) i++; // length of the common start\n  if (a.length === b.length) {\n    return a.slice(i + 1) === b.slice(i + 1) ||\n      (a[i] === b[i + 1] && a[i + 1] === b[i] && a.slice(i + 2) === b.slice(i + 2));\n  }\n  const [longer, shorter] = a.length > b.length ? [a, b] : [b, a];\n  return longer.slice(i + 1) === shorter.slice(i);\n}\n\nfunction compareNames(header, name) {\n  const h = words(header), n = words(name);\n  if (!h.length || !n.length) return null;\n  const hJoined = h.join(\"\"), nJoined = n.join(\"\");\n  if (hJoined === nJoined) return { score: 1, why: `same as \"${name}\"` };\n  const contained = n.every((w) => h.includes(w));\n  if (contained && h.length === n.length) {\n    return { score: 0.95, why: `same words as \"${name}\"` };\n  }\n  if (contained) {\n    return { score: 0.5 + 0.4 * (n.length / h.length), why: `contains \"${name}\"` };\n  }\n  const longEnough = Math.min(hJoined.length, nJoined.length) >= 5;\n  if (longEnough && oneEditApart(hJoined, nJoined)) {\n    return { score: 0.6, why: `spelled like \"${name}\"` };\n  }\n  return null;\n}", "const looksLikeEmail = (v) => /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(String(v).trim());\nconst looksLikeNumber = (v) =>\n  typeof v === \"number\" || /^[-+(]?[$\u20ac\u00a3\u00a5]?\\s?\\d[\\d.,\\s']*\\)?$/.test(String(v).trim());\n\nconst FIELDS = [\n  { key: \"name\", label: \"Full name\", required: true,\n    aliases: [\"name\", \"customer name\", \"contact name\", \"\u6c0f\u540d\", \"\u540d\u524d\"] },\n  { key: \"email\", label: \"Email\", required: true,\n    looksLike: looksLikeEmail, findByValues: true,\n    aliases: [\"email address\", \"mail\", \"e-mail address\", \"email adresse\",\n              \"\u30e1\u30fc\u30eb\u30a2\u30c9\u30ec\u30b9\", \"\u30e1\u30fc\u30eb\"] },\n  { key: \"company\", label: \"Company\",\n    aliases: [\"company name\", \"organization\", \"organisation\", \"\u4f1a\u793e\u540d\"] },\n  { key: \"phone\", label: \"Phone\",\n    aliases: [\"phone number\", \"telephone\", \"tel\", \"mobile\", \"\u96fb\u8a71\u756a\u53f7\"] },\n  { key: \"mrr\", label: \"MRR\", looksLike: looksLikeNumber,\n    aliases: [\"monthly revenue\", \"monthly recurring revenue\"] },\n];", "const MIN_SCORE = 0.6;   // weaker name matches are ignored\nconst SURE_SCORE = 0.95; // weaker name matches need values to confirm them\nconst CLOSE = 0.1;       // a rival this close makes the choice a guess\n\n// 0 -> \"A\", 27 -> \"AB\"\nfunction columnLetter(i) {\n  const prefix = i >= 26 ? columnLetter(Math.floor(i / 26) - 1) : \"\";\n  return prefix + String.fromCharCode(65 + (i % 26));\n}\n\n// How many sample values pass the field's check (null: nothing to check).\nfunction valueShare(field, values = []) {\n  const filled = values.filter((v) => v != null && String(v).trim() !== \"\");\n  if (!field.looksLike || !filled.length) return null;\n  const pass = filled.filter(field.looksLike).length;\n  const text = `${pass} of ${filled.length} values look like ${field.label}`;\n  return { pass, of: filled.length, text };\n}\n\nfunction bestNameMatch(header, field, remembered) {\n  const key = headerKey(header);\n  if (key && remembered[key] === field.key) {\n    return { score: 1, why: \"chosen by a user before\" };\n  }\n  let best = null;\n  for (const name of [field.key, field.label, ...(field.aliases ?? [])]) {\n    const m = compareNames(header, name);\n    if (m && (!best || m.score > best.score)) best = m;\n  }\n  return best;\n}\n\nfunction mapColumns(headers, fields, { samples = [], remembered = {} } = {}) {\n  // Columns that matched a field but were not used: column -> { key, why, second }.\n  // second: a better column already fills that field.\n  const notUsed = new Map();\n  const note = (column, key, why, second = false) => {\n    if (!notUsed.has(column)) notUsed.set(column, { key, why, second });\n  };\n\n  // 1. Pairs whose names match and whose values do not contradict them.\n  const pairs = [];\n  fields.forEach((field, f) => headers.forEach((header, column) => {\n    const best = bestNameMatch(header, field, remembered);\n    if (!best || best.score < MIN_SCORE) return;\n    const share = valueShare(field, samples[column]);\n    if (share && share.pass / share.of < 0.5) {\n      return note(column, field.key, `matched by name, but only ${share.text}`);\n    }\n    const confirmed = share && share.pass / share.of >= 0.9;\n    const doubt = share && !confirmed && `only ${share.text}`;\n    pairs.push({ f, column, ...best, confirmed, doubt });\n  }));\n\n  // 2. Best pairs first; each field and each column is used once.\n  pairs.sort((a, b) => b.score - a.score || a.column - b.column || a.f - b.f);\n  const byField = Object.fromEntries(fields.map((field) => [field.key, null]));\n  const usedBy = new Map(); // column -> field key\n  for (const p of pairs) {\n    const field = fields[p.f], taken = byField[field.key];\n    if (usedBy.has(p.column)) continue;\n    if (taken) {\n      const where = columnLetter(taken.column);\n      const why = `also matches ${field.label}, which column ${where} already fills`;\n      note(p.column, field.key, why, true);\n      continue;\n    }\n    // A rival scores almost as well and could still be used: another free column\n    // for this field, or another empty field for this column.\n    const rival = pairs.find((q) => q !== p && q.score >= p.score - CLOSE && (\n      (q.f === p.f && !usedBy.has(q.column)) ||\n      (q.column === p.column && !byField[fields[q.f].key])));\n    const doubts = [];\n    if (p.score < SURE_SCORE && !p.confirmed) doubts.push(\"weak name match\");\n    const rivalColumn = rival && columnLetter(rival.column);\n    if (rival?.f === p.f) doubts.push(`column ${rivalColumn} matches too`);\n    else if (rival) doubts.push(`could also be ${fields[rival.f].label}`);\n    if (p.doubt) doubts.push(p.doubt);\n    const header = headers[p.column], sure = !doubts.length;\n    byField[field.key] = { column: p.column, header, why: p.why, sure, doubts };\n    usedBy.set(p.column, field.key);\n  }\n\n  // 3. Fields still empty: the one unused column whose values look right (9 in 10).\n  for (const field of fields) {\n    if (byField[field.key] || !field.findByValues) continue;\n    const fits = headers.map((_, column) => column).filter((column) => {\n      const share = !usedBy.has(column) && valueShare(field, samples[column]);\n      return share && share.pass / share.of >= 0.9;\n    });\n    if (fits.length !== 1) {\n      const why = `values look like ${field.label}, but so do other columns`;\n      fits.forEach((column) => note(column, field.key, why));\n      continue;\n    }\n    const [column] = fits, header = headers[column];\n    const why = `values look like ${field.label}`;\n    const doubts = [\"matched by its values, not its name\"];\n    byField[field.key] = { column, header, why, sure: false, doubts };\n    usedBy.set(column, field.key);\n  }\n\n  const unmatched = headers\n    .map((header, column) => ({ column, header }))\n    .filter(({ column }) => !usedBy.has(column))\n    .map((c) => ({ ...c, why: notUsed.get(c.column)?.why ??\n      (normalizeHeader(c.header) ? \"no field has this name\" : \"empty header\") }));\n  const missing = fields.filter((f) => f.required && !byField[f.key])\n    .map((f) => f.key);\n  // A person should look when a field stayed empty although a column's name\n  // matched it, or when a second column matches a filled field (Email, Email 2).\n  const needsLook = unmatched.some(({ column }) => {\n    const n = notUsed.get(column);\n    return n && (n.second || !byField[n.key]);\n  });\n  const allSure = Object.values(byField).every((m) => !m || m.sure);\n  const sure = !missing.length && !needsLook && allSure;\n  return { byField, unmatched, missing, sure };\n}", "// After the user confirms the mapping screen, store their choices\n// (in your database or in localStorage).\nfunction rememberMapping(remembered, headers, byField) {\n  for (const [key, match] of Object.entries(byField)) {\n    const header = match && headerKey(headers[match.column]);\n    if (header) remembered[header] = key; // blank headers are not remembered\n  }\n  return remembered;\n}", "// rows: arrays of cells from your CSV or Excel parser.\n// headerRow: the index of the header row.\nfunction suggestMapping(rows, headerRow, remembered = {}) {\n  const headers = rows[headerRow] ?? [];\n  // 50 data rows are enough to check the values.\n  const firstRows = rows.slice(headerRow + 1, headerRow + 51);\n  const samples = headers.map((_, column) => firstRows.map((row) => row?.[column]));\n  return mapColumns(headers, FIELDS, { samples, remembered });\n}\n\n// Rows whose mapped cells are all blank are skipped.\nfunction applyMapping(rows, headerRow, byField) {\n  const used = Object.entries(byField).filter(([, match]) => match);\n  const cell = (row, match) => row?.[match.column] ?? \"\";\n  const toRecord = (row) =>\n    Object.fromEntries(used.map(([key, match]) => [key, cell(row, match)]));\n  return rows.slice(headerRow + 1)\n    .filter((row) => used.some(([, match]) => String(cell(row, match)).trim() !== \"\"))\n    .map(toRecord);\n}", "const EMAIL_NAMES = [\"email\", \"e-mail\", \"email address\", \"mail\"];\nconst exactMatch = (header) => EMAIL_NAMES.includes(header.trim().toLowerCase());\nexactMatch(\"E-mail\");             // true\nexactMatch(\"E-Mail-Adresse\");     // false\nexactMatch(\"Email\\u00A0address\");  // false\nexactMatch(\"\uff25\uff4d\uff41\uff49\uff4c\");         // false\n\nconst looseMatch = (header) => header.toLowerCase().includes(\"mail\");\nlooseMatch(\"Mailing address\");    // true\nlooseMatch(\"Email opt-in\");       // true"]) assert(!/[\u00A0\u200B-\u200F\u2028\u2029\uFEFF]/.test(s));
 });
 }
+
+// --- blog/parse-large-csv-browser-web-worker ---
+{
+// csv-stream.js
+// Splits CSV text into rows. The text can arrive in chunks that end anywhere:
+// inside a quoted cell, between the two quotes of "", or between \r and \n.
+function createCsvParser(options) {
+  const { delimiter = ",", maxCellLength = 1000000, onRow } = options;
+  const onError = options.onError ?? (() => {});
+  if (delimiter.length !== 1 || "\"\r\n".includes(delimiter)) {
+    throw new Error(`delimiter must be one character, not a quote or line break`);
+  }
+  let cell = "", row = [];
+  let inQuotes = false;     // inside "..."
+  let afterQuote = false;   // just read a closing quote, or the first quote of ""
+  let cellQuoted = false;   // the current cell started with a quote
+  let rowQuoted = false;    // some cell in this row started with a quote
+  let afterCR = false;      // the last character was \r (as in a Windows \r\n)
+  let line = 1, rowLine = 1, started = false;
+
+  function endCell() {
+    row.push(cell);
+    cell = "";
+    afterQuote = cellQuoted = false;
+  }
+  function endRow() {
+    endCell();
+    // An empty line is skipped. A line with only "" is a row with one empty cell.
+    if (row.length > 1 || row[0] !== "" || rowQuoted) onRow(row, rowLine);
+    row = [];
+    rowQuoted = false;
+  }
+
+  function push(text) {
+    if (!started && text) {
+      if (text[0] === "\uFEFF") text = text.slice(1); // byte order mark
+      started = true;
+    }
+    for (const ch of text) {
+      const secondHalfOfCRLF = afterCR && ch === "\n";
+      afterCR = ch === "\r";
+      if (inQuotes) {
+        if (ch === '"') {
+          inQuotes = false;
+          afterQuote = true;
+        } else {
+          cell += ch; // line breaks inside quotes belong to the cell
+          if (ch === "\r" || (ch === "\n" && !secondHalfOfCRLF)) line++;
+        }
+      } else if (secondHalfOfCRLF) {
+        // The row already ended at the \r.
+      } else if (ch === '"' && afterQuote) {
+        cell += '"'; // "" inside a quoted cell is one quote
+        inQuotes = true;
+        afterQuote = false;
+      } else if (ch === delimiter) {
+        endCell();
+      } else if (ch === "\r" || ch === "\n") {
+        endRow();
+        rowLine = ++line;
+      } else if (ch === '"' && cell === "" && !cellQuoted) {
+        inQuotes = cellQuoted = rowQuoted = true;
+      } else {
+        if (afterQuote) {
+          const message = `text after a closing quote: ${JSON.stringify(ch)}`;
+          onError({ line, message });
+          afterQuote = false;
+        }
+        cell += ch; // includes a quote in the middle of a cell, as in 5" screen
+      }
+      if (cell.length > maxCellLength) {
+        // Usually a quote that is never closed: stop, do not read on.
+        const limit = `${maxCellLength} characters`;
+        throw new Error(`line ${rowLine}: a cell is longer than ${limit}`);
+      }
+    }
+  }
+
+  function end() {
+    if (inQuotes) {
+      const message = "a quote opened on this line is never closed";
+      onError({ line: rowLine, message });
+    }
+    if (row.length > 0 || cell !== "" || cellQuoted) endRow();
+  }
+
+  return { push, end };
+}
+
+const PIECE = 65536; // characters parsed at a time, however big the chunk
+
+// Reads a File (or Blob) as a stream and yields parsed rows in batches.
+async function* csvBatches(file, options = {}) {
+  const { batchSize = 2000, encoding = "utf-8", ...parserOptions } = options;
+  if (!Number.isInteger(batchSize) || batchSize < 1) {
+    throw new Error("batchSize must be a whole number of at least 1");
+  }
+  let rows = [], errors = [], bytesRead = 0;
+  const full = []; // batches of exactly batchSize rows, waiting to be yielded
+  const parser = createCsvParser({
+    ...parserOptions,
+    onRow(cells, line) {
+      rows.push({ line, cells });
+      if (rows.length === batchSize) {
+        full.push({ rows, errors });
+        rows = [];
+        errors = [];
+      }
+    },
+    onError: (error) => errors.push(error),
+  });
+  const countBytes = new TransformStream({
+    transform(chunk, controller) {
+      bytesRead += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+  });
+  // fatal: true turns bytes that are not valid in `encoding` into an error.
+  const reader = file.stream().pipeThrough(countBytes)
+    .pipeThrough(new TextDecoderStream(encoding, { fatal: true })).getReader();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) {
+        parser.end();
+        while (full.length) yield { ...full.shift(), bytesRead, done: false };
+        yield { rows, errors, bytesRead, done: true }; // may have no rows
+        return;
+      }
+      for (let i = 0; i < value.length; i += PIECE) {
+        parser.push(value.slice(i, i + PIECE));
+        while (full.length) yield { ...full.shift(), bytesRead, done: false };
+      }
+    }
+  } finally {
+    // Runs on errors and when the caller stops early (break): release the file.
+    reader.cancel().catch(() => {});
+  }
+}
+
+const WORKER_SOURCE = "// csv-stream.js\n// Splits CSV text into rows. The text can arrive in chunks that end anywhere:\n// inside a quoted cell, between the two quotes of \"\", or between \\r and \\n.\nfunction createCsvParser(options) {\n  const { delimiter = \",\", maxCellLength = 1000000, onRow } = options;\n  const onError = options.onError ?? (() => {});\n  if (delimiter.length !== 1 || \"\\\"\\r\\n\".includes(delimiter)) {\n    throw new Error(`delimiter must be one character, not a quote or line break`);\n  }\n  let cell = \"\", row = [];\n  let inQuotes = false;     // inside \"...\"\n  let afterQuote = false;   // just read a closing quote, or the first quote of \"\"\n  let cellQuoted = false;   // the current cell started with a quote\n  let rowQuoted = false;    // some cell in this row started with a quote\n  let afterCR = false;      // the last character was \\r (as in a Windows \\r\\n)\n  let line = 1, rowLine = 1, started = false;\n\n  function endCell() {\n    row.push(cell);\n    cell = \"\";\n    afterQuote = cellQuoted = false;\n  }\n  function endRow() {\n    endCell();\n    // An empty line is skipped. A line with only \"\" is a row with one empty cell.\n    if (row.length > 1 || row[0] !== \"\" || rowQuoted) onRow(row, rowLine);\n    row = [];\n    rowQuoted = false;\n  }\n\n  function push(text) {\n    if (!started && text) {\n      if (text[0] === \"\\uFEFF\") text = text.slice(1); // byte order mark\n      started = true;\n    }\n    for (const ch of text) {\n      const secondHalfOfCRLF = afterCR && ch === \"\\n\";\n      afterCR = ch === \"\\r\";\n      if (inQuotes) {\n        if (ch === '\"') {\n          inQuotes = false;\n          afterQuote = true;\n        } else {\n          cell += ch; // line breaks inside quotes belong to the cell\n          if (ch === \"\\r\" || (ch === \"\\n\" && !secondHalfOfCRLF)) line++;\n        }\n      } else if (secondHalfOfCRLF) {\n        // The row already ended at the \\r.\n      } else if (ch === '\"' && afterQuote) {\n        cell += '\"'; // \"\" inside a quoted cell is one quote\n        inQuotes = true;\n        afterQuote = false;\n      } else if (ch === delimiter) {\n        endCell();\n      } else if (ch === \"\\r\" || ch === \"\\n\") {\n        endRow();\n        rowLine = ++line;\n      } else if (ch === '\"' && cell === \"\" && !cellQuoted) {\n        inQuotes = cellQuoted = rowQuoted = true;\n      } else {\n        if (afterQuote) {\n          const message = `text after a closing quote: ${JSON.stringify(ch)}`;\n          onError({ line, message });\n          afterQuote = false;\n        }\n        cell += ch; // includes a quote in the middle of a cell, as in 5\" screen\n      }\n      if (cell.length > maxCellLength) {\n        // Usually a quote that is never closed: stop, do not read on.\n        const limit = `${maxCellLength} characters`;\n        throw new Error(`line ${rowLine}: a cell is longer than ${limit}`);\n      }\n    }\n  }\n\n  function end() {\n    if (inQuotes) {\n      const message = \"a quote opened on this line is never closed\";\n      onError({ line: rowLine, message });\n    }\n    if (row.length > 0 || cell !== \"\" || cellQuoted) endRow();\n  }\n\n  return { push, end };\n}\n\nconst PIECE = 65536; // characters parsed at a time, however big the chunk\n\n// Reads a File (or Blob) as a stream and yields parsed rows in batches.\nasync function* csvBatches(file, options = {}) {\n  const { batchSize = 2000, encoding = \"utf-8\", ...parserOptions } = options;\n  if (!Number.isInteger(batchSize) || batchSize < 1) {\n    throw new Error(\"batchSize must be a whole number of at least 1\");\n  }\n  let rows = [], errors = [], bytesRead = 0;\n  const full = []; // batches of exactly batchSize rows, waiting to be yielded\n  const parser = createCsvParser({\n    ...parserOptions,\n    onRow(cells, line) {\n      rows.push({ line, cells });\n      if (rows.length === batchSize) {\n        full.push({ rows, errors });\n        rows = [];\n        errors = [];\n      }\n    },\n    onError: (error) => errors.push(error),\n  });\n  const countBytes = new TransformStream({\n    transform(chunk, controller) {\n      bytesRead += chunk.byteLength;\n      controller.enqueue(chunk);\n    },\n  });\n  // fatal: true turns bytes that are not valid in `encoding` into an error.\n  const reader = file.stream().pipeThrough(countBytes)\n    .pipeThrough(new TextDecoderStream(encoding, { fatal: true })).getReader();\n  try {\n    for (;;) {\n      const { value, done } = await reader.read();\n      if (done) {\n        parser.end();\n        while (full.length) yield { ...full.shift(), bytesRead, done: false };\n        yield { rows, errors, bytesRead, done: true }; // may have no rows\n        return;\n      }\n      for (let i = 0; i < value.length; i += PIECE) {\n        parser.push(value.slice(i, i + PIECE));\n        while (full.length) yield { ...full.shift(), bytesRead, done: false };\n      }\n    }\n  } finally {\n    // Runs on errors and when the caller stops early (break): release the file.\n    reader.cancel().catch(() => {});\n  }\n}\n\n// csv-worker.js\n\nlet continueReading = null;\n\nself.onmessage = async ({ data }) => {\n  if (data.type === \"next\") return continueReading?.();\n  try {\n    let rowCount = 0;\n    for await (const batch of csvBatches(data.file, data.options)) {\n      rowCount += batch.rows.length;\n      // Wait until the page has handled this batch, so unread rows never pile up.\n      const handled = new Promise((resolve) => (continueReading = resolve));\n      self.postMessage({ type: \"batch\", ...batch, rowCount });\n      await handled;\n    }\n  } catch (error) {\n    const message = String(error?.message ?? error);\n    self.postMessage({ type: \"failed\", message });\n  }\n};";
+// Runs the worker code in this thread, with messages delivered later and copied, as a browser does.
+class FakeWorker {
+  static all = [];
+  constructor(url, options) {
+    this.url = url;
+    this.type = options?.type;
+    this.terminated = false;
+    this.ahead = 0;    // batches sent but not yet acknowledged by the page
+    this.maxAhead = 0;
+    const self = { postMessage: (data) => {
+      if (this.terminated) return;
+      if (data.type === "batch") this.maxAhead = Math.max(this.maxAhead, ++this.ahead);
+      setTimeout(() => !this.terminated && this.onmessage?.({ data: structuredClone(data) }));
+    } };
+    new Function("self", WORKER_SOURCE)(self);
+    this.inner = self;
+    FakeWorker.all.push(this);
+  }
+  postMessage(data) {
+    const copy = structuredClone(data); // throws DataCloneError for functions, as browsers do
+    if (data.type === "next") this.ahead--;
+    setTimeout(() => !this.terminated && this.inner.onmessage({ data: copy }));
+  }
+  terminate() { this.terminated = true; }
+}
+const importCsv = new Function("Worker", "// import-csv.js\n// Parses a CSV file in a worker. onBatch(rows, errors, signal) may be async:\n// the worker waits for it before sending more, and signal aborts on cancel().\n// options (batchSize, encoding, delimiter, maxCellLength) must be plain data.\nfunction importCsv(file, { onBatch, onProgress, options = {} }) {\n  let worker = new Worker(new URL(\"./csv-worker.js\", import.meta.url), {\n    type: \"module\",\n  });\n  const aborter = new AbortController();\n  let resolveResult, rejectResult;\n  const result = new Promise((resolve, reject) => {\n    resolveResult = resolve;\n    rejectResult = reject;\n  });\n  // Each returns false when the import had already ended.\n  const stop = () => {\n    if (!worker) return false;\n    worker.terminate();\n    worker = null;\n    return true;\n  };\n  const finish = (value) => stop() && (resolveResult(value), true);\n  const fail = (error) => stop() && (rejectResult(error), true);\n\n  worker.onmessage = async ({ data }) => {\n    if (!worker) return; // cancelled while this message was waiting\n    if (data.type === \"failed\") return fail(new Error(data.message));\n    try {\n      await onBatch(data.rows, data.errors, aborter.signal);\n      if (!worker) return; // cancelled while onBatch was running\n      onProgress?.(file.size ? data.bytesRead / file.size : 1);\n      if (data.done) finish({ rowCount: data.rowCount });\n      else worker.postMessage({ type: \"next\" });\n    } catch (error) {\n      fail(error); // from onBatch or onProgress: stop instead of hanging\n    }\n  };\n  worker.onerror = (event) => {\n    fail(new Error(event.message || \"the CSV worker failed\"));\n  };\n  worker.onmessageerror = () => fail(new Error(\"a batch could not be received\"));\n  try {\n    worker.postMessage({ type: \"start\", file, options });\n  } catch (error) {\n    fail(error); // for example a function in options, which cannot be sent\n  }\n\n  const cancel = () => {\n    if (fail(new DOMException(\"Import cancelled\", \"AbortError\"))) aborter.abort();\n  };\n  return { result, cancel };\n}".replace('new URL("./csv-worker.js", import.meta.url)', '"csv-worker.js"') + "\nreturn importCsv;")(FakeWorker);
+
+const parseChunks = (chunks, options = {}) => {
+  const rows = [], errors = [];
+  const parser = createCsvParser({ ...options, onRow: (cells, line) => rows.push([line, cells]), onError: (e) => errors.push([e.line, e.message]) });
+  for (const chunk of chunks) parser.push(chunk);
+  parser.end();
+  return { rows, errors };
+};
+const parse = (text, options) => parseChunks([text], options);
+// A Blob-like object whose stream() returns the given byte chunks, to control where chunks end.
+const chunkedFile = (parts) => {
+  const chunks = parts.map((p) => (typeof p === "string" ? new TextEncoder().encode(p) : Uint8Array.from(p)));
+  return { size: chunks.reduce((n, c) => n + c.length, 0), stream: () => new ReadableStream({
+    start(controller) { for (const c of chunks) controller.enqueue(c); controller.close(); } }) };
+};
+const collect = async (file, options) => {
+  const batches = [];
+  for await (const b of csvBatches(file, options)) batches.push(b);
+  return batches;
+};
+const bigCsv = (n) => "id,name,note,amount\r\n" + Array.from({ length: n }, (_, i) => `${i},"Name ${i}","a, ""b""\nc 日本",${i}.5`).join("\r\n") + "\r\n";
+
+ok("big: the problem lines print what the comments say", async () => assert.strictEqual(await checkCommentedLines("const csv = 'id,note\\n1,\"Line one\\nline two\"\\n2,\"Acme, Inc\"\\n';\nconst rows = csv.trim().split(\"\\n\").map((line) => line.split(\",\"));\nrows.length; // 4\nrows[1].length; // 2\nrows[3].length; // 3"), 3));
+ok("big: parser decision table", () => {
+  const table = [["a,b\r\nc,d\r\n", null, [[1, ["a", "b"]], [2, ["c", "d"]]], []], ["a,b\rc,d", null, [[1, ["a", "b"]], [2, ["c", "d"]]], []], ["id,note\n1,\"Acme, Inc\"\n", null, [[1, ["id", "note"]], [2, ["1", "Acme, Inc"]]], []], ["id,note\n1,\"two\r\nlines\"\n2,x\n", null, [[1, ["id", "note"]], [2, ["1", "two\r\nlines"]], [4, ["2", "x"]]], []], ["\"He said \"\"hi\"\"\"", null, [[1, ["He said \"hi\""]]], []], ["Ken,5\" screen", null, [[1, ["Ken", "5\" screen"]]], []], ["\"Acme\" Inc,1", null, [[1, ["Acme Inc", "1"]]], [[1, "text after a closing quote: \" \""]]], ["a\n\n\nb\n", null, [[1, ["a"]], [4, ["b"]]], []], ["a\n\"\"\n", null, [[1, ["a"]], [2, [""]]], []], ["a,\n,\n", null, [[1, ["a", ""]], [2, ["", ""]]], []], ["﻿name", null, [[1, ["name"]]], []], ["a\n\"open,1\n2,3\n", null, [[1, ["a"]], [2, ["open,1\n2,3\n"]]], [[2, "a quote opened on this line is never closed"]]], ["a;b\n1,5;2", {"delimiter": ";"}, [[1, ["a", "b"]], [2, ["1,5", "2"]]], []], ["a\tb\n1\t2", {"delimiter": "\t"}, [[1, ["a", "b"]], [2, ["1", "2"]]], []], ["", null, [], []], [" a , b ", null, [[1, [" a ", " b "]]], []]];
+  for (const [input, options, rows, errors] of table)
+    assert.deepStrictEqual(parse(input, options ?? undefined), { rows, errors }, JSON.stringify(input));
+});
+ok("big: the same rows wherever the chunks end", () => {
+  const text = '\uFEFFName,Note\r\n"Acme, Inc","He said ""hi""\r\nthen left"\r\n\r\nKen,5" screen 😀\r"",x\n"bad" x,1\n"open,1';
+  const whole = JSON.stringify(parse(text));
+  let splits = 0;
+  for (let i = 0; i <= text.length; i++) {
+    assert.strictEqual(JSON.stringify(parseChunks([text.slice(0, i), text.slice(i)])), whole, "split at " + i);
+    for (let j = i; j <= text.length; j += 5) { assert.strictEqual(JSON.stringify(parseChunks([text.slice(0, i), text.slice(i, j), text.slice(j)])), whole); splits++; }
+    splits++;
+  }
+  assert(splits > 1000);
+  assert.strictEqual(JSON.stringify(parseChunks(Array.from(text))), whole); // one character per chunk
+  assert.strictEqual(JSON.stringify(parseChunks(text.split(""))), whole);   // emoji split into its two halves
+});
+ok("big: csvBatches across byte chunks (split characters, BOM, \\r\\n)", async () => {
+  const text = "\uFEFFname,city\r\n山田,東京\r\n\"Ken\",\"Köln\"\r\n";
+  const bytes = [...new TextEncoder().encode(text)];
+  for (let cut = 0; cut <= bytes.length; cut++) {
+    const batches = await collect(chunkedFile([bytes.slice(0, cut), bytes.slice(cut)]));
+    const rows = batches.flatMap((b) => b.rows);
+    assert.deepStrictEqual(rows, [{ line: 1, cells: ["name", "city"] }, { line: 2, cells: ["山田", "東京"] }, { line: 3, cells: ["Ken", "Köln"] }], "cut " + cut);
+    assert.strictEqual(batches.at(-1).bytesRead, bytes.length);
+    assert.strictEqual(batches.at(-1).done, true);
+  }
+  // A TextDecoder without stream: true breaks a character split this way; TextDecoderStream does not.
+  const hi = [...new TextEncoder().encode("日")];
+  assert.strictEqual(new TextDecoder().decode(Uint8Array.from(hi.slice(0, 1))), "�");
+});
+ok("big: batch sizes, row counts and progress", async () => {
+  const text = bigCsv(20000);
+  const batches = await collect(new Blob([text]), { batchSize: 1000 });
+  const rows = batches.flatMap((b) => b.rows);
+  assert.strictEqual(rows.length, 20001);
+  assert.deepStrictEqual(rows[1], { line: 2, cells: ["0", "Name 0", 'a, "b"\nc 日本', "0.5"] });
+  assert.strictEqual(rows.at(-1).line, 40000); // each record takes two lines
+  for (const b of batches.slice(0, -1)) assert(b.rows.length === 1000 && !b.done);
+  assert.strictEqual(batches.at(-1).rows.length, 1);
+  assert(batches.length > 5);
+  const read = batches.map((b) => b.bytesRead);
+  assert.deepStrictEqual(read, [...read].sort((a, b) => a - b));
+  assert.strictEqual(read.at(-1), new Blob([text]).size);
+  assert.deepStrictEqual(batches.flatMap((b) => b.errors), []);
+});
+ok("big: Node 22 gives a whole Blob as one stream chunk", async () => {
+  const reader = new Blob(["x".repeat(11000000)]).stream().getReader();
+  const sizes = [];
+  for (;;) { const { value, done } = await reader.read(); if (done) break; sizes.push(value.length); }
+  assert.deepStrictEqual(sizes, [11000000]); // so csvBatches must cut chunks into pieces itself
+});
+ok("big: without fatal, bad bytes silently become U+FFFD; Node 22 has no global Worker", async () => {
+  const reader = new Blob([Uint8Array.from([0x43, 0x61, 0x66, 0xe9, 0x2c, 0x31])]).stream().pipeThrough(new TextDecoderStream()).getReader();
+  let text = "";
+  for (;;) { const { value, done } = await reader.read(); if (done) break; text += value; }
+  assert.strictEqual(text, "Caf\uFFFD,1");
+  assert.strictEqual(typeof Worker, "undefined");
+  assert.strictEqual(parse("a,b\n1,2").rows[0][1].join(), "a,b"); // the first row is the header row
+});
+ok("big: errors arrive with the batch that contains them", async () => {
+  const batches = await collect(new Blob(['a,b\n"x" y,1\n"never closed,2\n3,4\n']));
+  assert.deepStrictEqual(batches.flatMap((b) => b.errors), [{ line: 2, message: 'text after a closing quote: " "' }, { line: 3, message: "a quote opened on this line is never closed" }]);
+  assert.deepStrictEqual(batches.flatMap((b) => b.rows).at(-1), { line: 3, cells: ["never closed,2\n3,4\n"] });
+});
+ok("big: bytes that are not valid UTF-8 fail instead of turning into �", async () => {
+  await assert.rejects(collect(chunkedFile([[0x43, 0x61, 0x66, 0xe9, 0x0a]])), TypeError);
+  const sjis = [0x8e, 0x52, 0x93, 0x63, 0x2c, 0x93, 0x8c, 0x8b, 0x9e, 0x0a]; // 山田,東京 in Shift_JIS
+  const rows = (await collect(chunkedFile([sjis.slice(0, 3), sjis.slice(3)]), { encoding: "shift_jis" })).flatMap((b) => b.rows);
+  assert.deepStrictEqual(rows, [{ line: 1, cells: ["山田", "東京"] }]);
+  assert.deepStrictEqual((await collect(chunkedFile(["a;b\n1;2"]), { delimiter: ";" })).flatMap((b) => b.rows.map((r) => r.cells)), [["a", "b"], ["1", "2"]]);
+});
+ok("big: importCsv gets every row, one batch at a time", async () => {
+  let rows = 0, calls = 0;
+  const progress = [];
+  const job = importCsv(new Blob([bigCsv(30000)]), {
+    onBatch: async (batch, errors) => { rows += batch.length; calls++; assert.deepStrictEqual(errors, []); await new Promise((r) => setTimeout(r, 2)); },
+    onProgress: (share) => progress.push(share),
+    options: { batchSize: 2000 },
+  });
+  const worker = FakeWorker.all.at(-1); // tests run at the same time, so take it right away
+  assert.deepStrictEqual(await job.result, { rowCount: 30001 });
+  assert.strictEqual(rows, 30001);
+  assert(calls > 5);
+  assert.strictEqual(worker.maxAhead, 1); // the worker never ran ahead of the page
+  assert.strictEqual(worker.terminated, true);
+  assert.deepStrictEqual(progress, [...progress].sort((a, b) => a - b));
+  assert.strictEqual(progress.at(-1), 1);
+  job.cancel(); // after the end: no effect
+  assert.deepStrictEqual(await job.result, { rowCount: 30001 });
+});
+ok("big: importCsv cancel, failures and empty files", async () => {
+  let calls = 0;
+  const job = importCsv(new Blob([bigCsv(30000)]), { onBatch: () => { calls++; job.cancel(); } });
+  const worker = FakeWorker.all.at(-1); // tests run at the same time, so take it right away
+  await assert.rejects(job.result, (e) => e.name === "AbortError");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(worker.terminated, true);
+
+  const early = importCsv(new Blob([bigCsv(1000)]), { onBatch: () => { throw new Error("should not run"); } });
+  early.cancel();
+  await assert.rejects(early.result, (e) => e.name === "AbortError");
+
+  const saveFails = importCsv(new Blob([bigCsv(10)]), { onBatch: async () => { throw new Error("API down"); } });
+  const saveWorker = FakeWorker.all.at(-1);
+  await assert.rejects(saveFails.result, /API down/);
+  assert.strictEqual(saveWorker.terminated, true);
+
+  const notUtf8 = importCsv(new Blob([Uint8Array.from([0x43, 0x61, 0x66, 0xe9])]), { onBatch() {} });
+  await assert.rejects(notUtf8.result, /not valid/);
+
+  let seen = null;
+  const empty = importCsv(new Blob([""]), { onBatch: (r) => { seen = r; }, onProgress: (p) => assert.strictEqual(p, 1) });
+  assert.deepStrictEqual(await empty.result, { rowCount: 0 });
+  assert.deepStrictEqual(seen, []);
+});
+ok("big: the upload form example", async () => {
+  const handlers = {};
+  const els = {
+    "#csv-file": { files: [], value: "C:\\fakepath\\x.csv", addEventListener: (t, f) => (handlers[t] = f) },
+    "#import-status": { textContent: "" },
+    "#cancel-import": {},
+  };
+  const staged = new Map(), live = [], statuses = [];
+  let failDiscard = false;
+  const fakes = {
+    document: { querySelector: (q) => els[q] },
+    crypto,
+    importCsv,
+    async saveRows(id, header, rows, signal) {
+      assert(signal instanceof AbortSignal);
+      assert(Array.isArray(header));
+      staged.set(id, [...(staged.get(id) ?? []), ...rows]);
+      statuses.push(els["#import-status"].textContent);
+      await new Promise((r) => setTimeout(r, 1));
+    },
+    async commitImport(id) { live.push(...staged.get(id)); staged.delete(id); },
+    async discardImport(id) { staged.delete(id); if (failDiscard) throw new Error("network down"); },
+  };
+  new Function(...Object.keys(fakes), "\nconst MAX_PROBLEMS = 100; // a wrong delimiter makes every row a problem\nconst input = document.querySelector(\"#csv-file\");\nconst status = document.querySelector(\"#import-status\");\nconst cancelButton = document.querySelector(\"#cancel-import\");\nlet current = null;\n\ninput.addEventListener(\"change\", async () => {\n  const file = input.files[0];\n  input.value = \"\"; // so that choosing the same file again fires \"change\"\n  if (!file) return;\n  current?.cancel(); // a new file replaces an import that is still running\n  const importId = crypto.randomUUID();\n  const problems = [];\n  let header = null;\n  const show = (text) => {\n    if (current === job) status.textContent = text;\n  };\n  const job = importCsv(file, {\n    async onBatch(rows, errors, signal) {\n      problems.push(...errors);\n      const records = [];\n      for (const row of rows) {\n        if (!header) {\n          header = row.cells; // the first row is the header, not a record\n          continue;\n        }\n        if (row.cells.length !== header.length) {\n          const message = `${row.cells.length} cells, header has ${header.length}`;\n          problems.push({ line: row.line, message });\n        }\n        records.push(row);\n      }\n      if (problems.length > MAX_PROBLEMS) throw new Error(\"too many problems\");\n      await saveRows(importId, header, records, signal); // yours: stage, not live\n    },\n    onProgress: (share) => show(`${Math.round(share * 100)}% read`),\n  });\n  current = job;\n  cancelButton.onclick = job.cancel;\n  try {\n    const { rowCount } = await job.result;\n    if (problems.length) throw new Error(\"problems\");\n    await commitImport(importId); // yours: make the staged rows live\n    show(`Imported ${Math.max(rowCount - 1, 0)} rows`);\n  } catch (error) {\n    // yours: delete the staged rows (your server should also refuse late saves)\n    await discardImport(importId).catch(() => {});\n    if (error.name === \"AbortError\") return show(\"Import cancelled\");\n    const first = problems[0];\n    show(first\n      ? `${problems.length} problems; line ${first.line}: ${first.message}`\n      : `Import failed: ${error.message}`);\n  }\n});")(...Object.values(fakes));
+  const choose = (content) => { els["#csv-file"].files = content === null ? [] : [new Blob([content])]; return handlers.change(); };
+  const status = () => els["#import-status"].textContent;
+
+  await choose(bigCsv(5000));
+  assert.strictEqual(status(), "Imported 5000 rows");
+  assert.strictEqual(live.length, 5000); // the header row is not saved as a record
+  assert.strictEqual(live[0].cells[0], "0");
+  assert.strictEqual(els["#csv-file"].value, "");
+  assert(statuses.some((s) => /^\d+% read$/.test(s)));
+
+  // A ragged row or a parser problem: nothing goes live, staged rows are deleted.
+  await choose("a,b\n1,2\n3\n4,5\n");
+  assert.strictEqual(status(), "1 problems; line 3: 1 cells, header has 2");
+  await choose('a,b\n"x" y,1\n');
+  assert.strictEqual(status(), '1 problems; line 2: text after a closing quote: " "');
+  assert.strictEqual(staged.size, 0);
+  assert.strictEqual(live.length, 5000);
+  // A wrong delimiter: every row is a problem, and the import stops after the first batch.
+  let saves = statuses.length;
+  await choose("a;b;c\n" + "1;2,3\n".repeat(10000));
+  assert.match(status(), /^1999 problems; line 2: 2 cells, header has 1$/);
+  assert.strictEqual(statuses.length, saves); // nothing was saved
+  // Other failures, and a failing discard, still end with a status.
+  failDiscard = true;
+  await choose(new Uint8Array([0x43, 0x61, 0x66, 0xe9]));
+  assert.match(status(), /^Import failed: .*not valid/);
+  failDiscard = false;
+
+  // Cancel during the import.
+  const running = choose(bigCsv(30000));
+  await new Promise((r) => setTimeout(r, 5));
+  els["#cancel-import"].onclick();
+  await running;
+  assert.strictEqual(status(), "Import cancelled");
+  assert.strictEqual(staged.size, 0);
+
+  // A second file replaces the first; the cancelled first import does not overwrite the status.
+  const first = choose(bigCsv(30000));
+  await new Promise((r) => setTimeout(r, 5));
+  const second = choose("a,b\n1,2\n");
+  await Promise.all([first, second]);
+  assert.strictEqual(status(), "Imported 1 rows");
+  assert.strictEqual(staged.size, 0);
+  assert.strictEqual(live.length, 5001);
+
+  await choose(null); // no file chosen: nothing happens
+  assert.strictEqual(status(), "Imported 1 rows");
+});
+ok("big: cancel while onBatch is saving: no progress afterwards, the signal aborts", async () => {
+  const events = [];
+  let signalSeen = null;
+  const job = importCsv(new Blob([bigCsv(30000)]), {
+    async onBatch(rows, errors, signal) {
+      signalSeen = signal;
+      events.push("batch");
+      job.cancel();
+      events.push("aborted " + signal.aborted);
+      await new Promise((r) => setTimeout(r, 5));
+      events.push("save done");
+    },
+    onProgress: () => events.push("progress"),
+  });
+  await assert.rejects(job.result, (e) => e.name === "AbortError");
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepStrictEqual(events, ["batch", "aborted true", "save done"]);
+  assert.strictEqual(signalSeen.aborted, true);
+  // A falsy thrown value still rejects.
+  const odd = importCsv(new Blob(["a\n"]), { onBatch() { throw undefined; } });
+  await assert.rejects(odd.result.then(() => { throw new Error("resolved"); }, () => { throw new Error("rejected"); }), /rejected/);
+  // The worker is started as a module worker.
+  assert.strictEqual(FakeWorker.all.at(-1).type, "module");
+});
+ok("big: failures in onProgress, options and batchSize reject instead of hanging", async () => {
+  const thrower = importCsv(new Blob([bigCsv(5000)]), { onBatch() {}, onProgress() { throw new Error("bad progress bar"); } });
+  const w1 = FakeWorker.all.at(-1);
+  await assert.rejects(thrower.result, /bad progress bar/);
+  assert.strictEqual(w1.terminated, true);
+  const withFunction = importCsv(new Blob(["a\n"]), { onBatch() {}, options: { onError() {} } });
+  const w2 = FakeWorker.all.at(-1);
+  await assert.rejects(withFunction.result, (e) => e.name === "DataCloneError");
+  assert.strictEqual(w2.terminated, true);
+  for (const batchSize of [0, -1, 1.5, "10"]) {
+    await assert.rejects(importCsv(new Blob(["a\n"]), { onBatch() {}, options: { batchSize } }).result, /batchSize must be a whole number/);
+    await assert.rejects(collect(new Blob(["a\n"]), { batchSize }), /batchSize must be a whole number/);
+  }
+  assert.strictEqual((await collect(new Blob(["a\nb\n"]), { batchSize: 1 })).length, 3);
+});
+ok("big: stopping early or failing releases the file stream", async () => {
+  let cancelled = 0;
+  // An endless file: `first`, then `rest` again and again.
+  const file = (first, rest = first) => ({ size: 1, stream: () => { let n = 0; return new ReadableStream({
+    pull(c) { c.enqueue(new TextEncoder().encode(n++ ? rest : first)); }, cancel() { cancelled++; } }); } });
+  for await (const batch of csvBatches(file("a\n".repeat(100)), { batchSize: 10 })) { assert.strictEqual(batch.rows.length, 10); break; }
+  await new Promise((r) => setTimeout(r, 5));
+  assert.strictEqual(cancelled, 1);
+  await assert.rejects(collect(file('a,"', "x".repeat(100)), { maxCellLength: 1000 }), /line 1: a cell is longer than 1000 characters/);
+  await new Promise((r) => setTimeout(r, 5));
+  assert.strictEqual(cancelled, 2);
+});
+ok("big: a quote that is never closed stops at maxCellLength", async () => {
+  const text = 'id,note\n1,ok\n2,"never closed\n' + "3,x\n".repeat(400000);
+  const job = importCsv(new Blob([text]), { onBatch() {}, options: { maxCellLength: 100000 } });
+  await assert.rejects(job.result, /^Error: line 3: a cell is longer than 100000 characters$/);
+  assert.throws(() => parse("a".repeat(11), { maxCellLength: 10 }), /line 1: a cell is longer than 10 characters/);
+  assert.deepStrictEqual(parse("a".repeat(10), { maxCellLength: 10 }).rows, [[1, ["a".repeat(10)]]]);
+});
+ok("big: a delimiter must be one character, not a quote or line break", async () => {
+  for (const d of [",,", "", '"', "\r", "\n"]) assert.throws(() => parse("a", { delimiter: d }), /delimiter must be one character/, JSON.stringify(d));
+  const job = importCsv(new Blob(["a\n"]), { onBatch() {}, options: { delimiter: ";;" } });
+  await assert.rejects(job.result, /delimiter must be one character/);
+});
+ok("big: TextDecoderStream already removes a UTF-8 byte order mark", async () => {
+  const reader = new Blob([Uint8Array.from([0xef, 0xbb, 0xbf, 0x61])]).stream().pipeThrough(new TextDecoderStream()).getReader();
+  assert.strictEqual((await reader.read()).value, "a");
+  assert.deepStrictEqual(parse("\uFEFF\uFEFFa").rows, [[1, ["\uFEFFa"]]]); // only one is removed
+});
+ok("big: no invisible characters in the snippets", () => {
+  for (const s of ["const csv = 'id,note\\n1,\"Line one\\nline two\"\\n2,\"Acme, Inc\"\\n';\nconst rows = csv.trim().split(\"\\n\").map((line) => line.split(\",\"));\nrows.length; // 4\nrows[1].length; // 2\nrows[3].length; // 3", "// csv-stream.js\n// Splits CSV text into rows. The text can arrive in chunks that end anywhere:\n// inside a quoted cell, between the two quotes of \"\", or between \\r and \\n.\nexport function createCsvParser(options) {\n  const { delimiter = \",\", maxCellLength = 1000000, onRow } = options;\n  const onError = options.onError ?? (() => {});\n  if (delimiter.length !== 1 || \"\\\"\\r\\n\".includes(delimiter)) {\n    throw new Error(`delimiter must be one character, not a quote or line break`);\n  }\n  let cell = \"\", row = [];\n  let inQuotes = false;     // inside \"...\"\n  let afterQuote = false;   // just read a closing quote, or the first quote of \"\"\n  let cellQuoted = false;   // the current cell started with a quote\n  let rowQuoted = false;    // some cell in this row started with a quote\n  let afterCR = false;      // the last character was \\r (as in a Windows \\r\\n)\n  let line = 1, rowLine = 1, started = false;\n\n  function endCell() {\n    row.push(cell);\n    cell = \"\";\n    afterQuote = cellQuoted = false;\n  }\n  function endRow() {\n    endCell();\n    // An empty line is skipped. A line with only \"\" is a row with one empty cell.\n    if (row.length > 1 || row[0] !== \"\" || rowQuoted) onRow(row, rowLine);\n    row = [];\n    rowQuoted = false;\n  }\n\n  function push(text) {\n    if (!started && text) {\n      if (text[0] === \"\\uFEFF\") text = text.slice(1); // byte order mark\n      started = true;\n    }\n    for (const ch of text) {\n      const secondHalfOfCRLF = afterCR && ch === \"\\n\";\n      afterCR = ch === \"\\r\";\n      if (inQuotes) {\n        if (ch === '\"') {\n          inQuotes = false;\n          afterQuote = true;\n        } else {\n          cell += ch; // line breaks inside quotes belong to the cell\n          if (ch === \"\\r\" || (ch === \"\\n\" && !secondHalfOfCRLF)) line++;\n        }\n      } else if (secondHalfOfCRLF) {\n        // The row already ended at the \\r.\n      } else if (ch === '\"' && afterQuote) {\n        cell += '\"'; // \"\" inside a quoted cell is one quote\n        inQuotes = true;\n        afterQuote = false;\n      } else if (ch === delimiter) {\n        endCell();\n      } else if (ch === \"\\r\" || ch === \"\\n\") {\n        endRow();\n        rowLine = ++line;\n      } else if (ch === '\"' && cell === \"\" && !cellQuoted) {\n        inQuotes = cellQuoted = rowQuoted = true;\n      } else {\n        if (afterQuote) {\n          const message = `text after a closing quote: ${JSON.stringify(ch)}`;\n          onError({ line, message });\n          afterQuote = false;\n        }\n        cell += ch; // includes a quote in the middle of a cell, as in 5\" screen\n      }\n      if (cell.length > maxCellLength) {\n        // Usually a quote that is never closed: stop, do not read on.\n        const limit = `${maxCellLength} characters`;\n        throw new Error(`line ${rowLine}: a cell is longer than ${limit}`);\n      }\n    }\n  }\n\n  function end() {\n    if (inQuotes) {\n      const message = \"a quote opened on this line is never closed\";\n      onError({ line: rowLine, message });\n    }\n    if (row.length > 0 || cell !== \"\" || cellQuoted) endRow();\n  }\n\n  return { push, end };\n}", "const PIECE = 65536; // characters parsed at a time, however big the chunk\n\n// Reads a File (or Blob) as a stream and yields parsed rows in batches.\nexport async function* csvBatches(file, options = {}) {\n  const { batchSize = 2000, encoding = \"utf-8\", ...parserOptions } = options;\n  if (!Number.isInteger(batchSize) || batchSize < 1) {\n    throw new Error(\"batchSize must be a whole number of at least 1\");\n  }\n  let rows = [], errors = [], bytesRead = 0;\n  const full = []; // batches of exactly batchSize rows, waiting to be yielded\n  const parser = createCsvParser({\n    ...parserOptions,\n    onRow(cells, line) {\n      rows.push({ line, cells });\n      if (rows.length === batchSize) {\n        full.push({ rows, errors });\n        rows = [];\n        errors = [];\n      }\n    },\n    onError: (error) => errors.push(error),\n  });\n  const countBytes = new TransformStream({\n    transform(chunk, controller) {\n      bytesRead += chunk.byteLength;\n      controller.enqueue(chunk);\n    },\n  });\n  // fatal: true turns bytes that are not valid in `encoding` into an error.\n  const reader = file.stream().pipeThrough(countBytes)\n    .pipeThrough(new TextDecoderStream(encoding, { fatal: true })).getReader();\n  try {\n    for (;;) {\n      const { value, done } = await reader.read();\n      if (done) {\n        parser.end();\n        while (full.length) yield { ...full.shift(), bytesRead, done: false };\n        yield { rows, errors, bytesRead, done: true }; // may have no rows\n        return;\n      }\n      for (let i = 0; i < value.length; i += PIECE) {\n        parser.push(value.slice(i, i + PIECE));\n        while (full.length) yield { ...full.shift(), bytesRead, done: false };\n      }\n    }\n  } finally {\n    // Runs on errors and when the caller stops early (break): release the file.\n    reader.cancel().catch(() => {});\n  }\n}", "// csv-worker.js\nimport { csvBatches } from \"./csv-stream.js\";\n\nlet continueReading = null;\n\nself.onmessage = async ({ data }) => {\n  if (data.type === \"next\") return continueReading?.();\n  try {\n    let rowCount = 0;\n    for await (const batch of csvBatches(data.file, data.options)) {\n      rowCount += batch.rows.length;\n      // Wait until the page has handled this batch, so unread rows never pile up.\n      const handled = new Promise((resolve) => (continueReading = resolve));\n      self.postMessage({ type: \"batch\", ...batch, rowCount });\n      await handled;\n    }\n  } catch (error) {\n    const message = String(error?.message ?? error);\n    self.postMessage({ type: \"failed\", message });\n  }\n};", "// import-csv.js\n// Parses a CSV file in a worker. onBatch(rows, errors, signal) may be async:\n// the worker waits for it before sending more, and signal aborts on cancel().\n// options (batchSize, encoding, delimiter, maxCellLength) must be plain data.\nexport function importCsv(file, { onBatch, onProgress, options = {} }) {\n  let worker = new Worker(new URL(\"./csv-worker.js\", import.meta.url), {\n    type: \"module\",\n  });\n  const aborter = new AbortController();\n  let resolveResult, rejectResult;\n  const result = new Promise((resolve, reject) => {\n    resolveResult = resolve;\n    rejectResult = reject;\n  });\n  // Each returns false when the import had already ended.\n  const stop = () => {\n    if (!worker) return false;\n    worker.terminate();\n    worker = null;\n    return true;\n  };\n  const finish = (value) => stop() && (resolveResult(value), true);\n  const fail = (error) => stop() && (rejectResult(error), true);\n\n  worker.onmessage = async ({ data }) => {\n    if (!worker) return; // cancelled while this message was waiting\n    if (data.type === \"failed\") return fail(new Error(data.message));\n    try {\n      await onBatch(data.rows, data.errors, aborter.signal);\n      if (!worker) return; // cancelled while onBatch was running\n      onProgress?.(file.size ? data.bytesRead / file.size : 1);\n      if (data.done) finish({ rowCount: data.rowCount });\n      else worker.postMessage({ type: \"next\" });\n    } catch (error) {\n      fail(error); // from onBatch or onProgress: stop instead of hanging\n    }\n  };\n  worker.onerror = (event) => {\n    fail(new Error(event.message || \"the CSV worker failed\"));\n  };\n  worker.onmessageerror = () => fail(new Error(\"a batch could not be received\"));\n  try {\n    worker.postMessage({ type: \"start\", file, options });\n  } catch (error) {\n    fail(error); // for example a function in options, which cannot be sent\n  }\n\n  const cancel = () => {\n    if (fail(new DOMException(\"Import cancelled\", \"AbortError\"))) aborter.abort();\n  };\n  return { result, cancel };\n}", "import { importCsv } from \"./import-csv.js\";\n\nconst MAX_PROBLEMS = 100; // a wrong delimiter makes every row a problem\nconst input = document.querySelector(\"#csv-file\");\nconst status = document.querySelector(\"#import-status\");\nconst cancelButton = document.querySelector(\"#cancel-import\");\nlet current = null;\n\ninput.addEventListener(\"change\", async () => {\n  const file = input.files[0];\n  input.value = \"\"; // so that choosing the same file again fires \"change\"\n  if (!file) return;\n  current?.cancel(); // a new file replaces an import that is still running\n  const importId = crypto.randomUUID();\n  const problems = [];\n  let header = null;\n  const show = (text) => {\n    if (current === job) status.textContent = text;\n  };\n  const job = importCsv(file, {\n    async onBatch(rows, errors, signal) {\n      problems.push(...errors);\n      const records = [];\n      for (const row of rows) {\n        if (!header) {\n          header = row.cells; // the first row is the header, not a record\n          continue;\n        }\n        if (row.cells.length !== header.length) {\n          const message = `${row.cells.length} cells, header has ${header.length}`;\n          problems.push({ line: row.line, message });\n        }\n        records.push(row);\n      }\n      if (problems.length > MAX_PROBLEMS) throw new Error(\"too many problems\");\n      await saveRows(importId, header, records, signal); // yours: stage, not live\n    },\n    onProgress: (share) => show(`${Math.round(share * 100)}% read`),\n  });\n  current = job;\n  cancelButton.onclick = job.cancel;\n  try {\n    const { rowCount } = await job.result;\n    if (problems.length) throw new Error(\"problems\");\n    await commitImport(importId); // yours: make the staged rows live\n    show(`Imported ${Math.max(rowCount - 1, 0)} rows`);\n  } catch (error) {\n    // yours: delete the staged rows (your server should also refuse late saves)\n    await discardImport(importId).catch(() => {});\n    if (error.name === \"AbortError\") return show(\"Import cancelled\");\n    const first = problems[0];\n    show(first\n      ? `${problems.length} problems; line ${first.line}: ${first.message}`\n      : `Import failed: ${error.message}`);\n  }\n});"]) assert(!/[\u00A0\u200B-\u200F\u2028\u2029\uFEFF]/.test(s));
+});
+}

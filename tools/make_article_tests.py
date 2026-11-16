@@ -903,4 +903,363 @@ MAP_TESTS = MAP_TESTS.replace("%%MAP_PROBLEM_JSON%%", _json.dumps(MAP_PROBLEM))
 MAP_TESTS = MAP_TESTS.replace("%%MAP_TABLE_JSON%%", _json.dumps(MAP_TABLE, ensure_ascii=False))
 MAP_TESTS = MAP_TESTS.replace("%%MAP_ALL_JSON%%", _json.dumps([globals()[k] for k in _map_names + ["MAP_PROBLEM"]]))
 out += MAP_TESTS
+BIG_TESTS = r"""
+// --- blog/parse-large-csv-browser-web-worker ---
+{
+%%BIG_PARSER%%
+
+%%BIG_BATCHES%%
+
+const WORKER_SOURCE = %%WORKER_SOURCE_JSON%%;
+// Runs the worker code in this thread, with messages delivered later and copied, as a browser does.
+class FakeWorker {
+  static all = [];
+  constructor(url, options) {
+    this.url = url;
+    this.type = options?.type;
+    this.terminated = false;
+    this.ahead = 0;    // batches sent but not yet acknowledged by the page
+    this.maxAhead = 0;
+    const self = { postMessage: (data) => {
+      if (this.terminated) return;
+      if (data.type === "batch") this.maxAhead = Math.max(this.maxAhead, ++this.ahead);
+      setTimeout(() => !this.terminated && this.onmessage?.({ data: structuredClone(data) }));
+    } };
+    new Function("self", WORKER_SOURCE)(self);
+    this.inner = self;
+    FakeWorker.all.push(this);
+  }
+  postMessage(data) {
+    const copy = structuredClone(data); // throws DataCloneError for functions, as browsers do
+    if (data.type === "next") this.ahead--;
+    setTimeout(() => !this.terminated && this.inner.onmessage({ data: copy }));
+  }
+  terminate() { this.terminated = true; }
+}
+const importCsv = new Function("Worker", %%MAIN_JSON%%.replace('new URL("./csv-worker.js", import.meta.url)', '"csv-worker.js"') + "\nreturn importCsv;")(FakeWorker);
+
+const parseChunks = (chunks, options = {}) => {
+  const rows = [], errors = [];
+  const parser = createCsvParser({ ...options, onRow: (cells, line) => rows.push([line, cells]), onError: (e) => errors.push([e.line, e.message]) });
+  for (const chunk of chunks) parser.push(chunk);
+  parser.end();
+  return { rows, errors };
+};
+const parse = (text, options) => parseChunks([text], options);
+// A Blob-like object whose stream() returns the given byte chunks, to control where chunks end.
+const chunkedFile = (parts) => {
+  const chunks = parts.map((p) => (typeof p === "string" ? new TextEncoder().encode(p) : Uint8Array.from(p)));
+  return { size: chunks.reduce((n, c) => n + c.length, 0), stream: () => new ReadableStream({
+    start(controller) { for (const c of chunks) controller.enqueue(c); controller.close(); } }) };
+};
+const collect = async (file, options) => {
+  const batches = [];
+  for await (const b of csvBatches(file, options)) batches.push(b);
+  return batches;
+};
+const bigCsv = (n) => "id,name,note,amount\r\n" + Array.from({ length: n }, (_, i) => `${i},"Name ${i}","a, ""b""\nc 日本",${i}.5`).join("\r\n") + "\r\n";
+
+ok("big: the problem lines print what the comments say", async () => assert.strictEqual(await checkCommentedLines(%%PROBLEM_JSON%%), 3));
+ok("big: parser decision table", () => {
+  const table = %%TABLE_JSON%%;
+  for (const [input, options, rows, errors] of table)
+    assert.deepStrictEqual(parse(input, options ?? undefined), { rows, errors }, JSON.stringify(input));
+});
+ok("big: the same rows wherever the chunks end", () => {
+  const text = '\uFEFFName,Note\r\n"Acme, Inc","He said ""hi""\r\nthen left"\r\n\r\nKen,5" screen 😀\r"",x\n"bad" x,1\n"open,1';
+  const whole = JSON.stringify(parse(text));
+  let splits = 0;
+  for (let i = 0; i <= text.length; i++) {
+    assert.strictEqual(JSON.stringify(parseChunks([text.slice(0, i), text.slice(i)])), whole, "split at " + i);
+    for (let j = i; j <= text.length; j += 5) { assert.strictEqual(JSON.stringify(parseChunks([text.slice(0, i), text.slice(i, j), text.slice(j)])), whole); splits++; }
+    splits++;
+  }
+  assert(splits > 1000);
+  assert.strictEqual(JSON.stringify(parseChunks(Array.from(text))), whole); // one character per chunk
+  assert.strictEqual(JSON.stringify(parseChunks(text.split(""))), whole);   // emoji split into its two halves
+});
+ok("big: csvBatches across byte chunks (split characters, BOM, \\r\\n)", async () => {
+  const text = "\uFEFFname,city\r\n山田,東京\r\n\"Ken\",\"Köln\"\r\n";
+  const bytes = [...new TextEncoder().encode(text)];
+  for (let cut = 0; cut <= bytes.length; cut++) {
+    const batches = await collect(chunkedFile([bytes.slice(0, cut), bytes.slice(cut)]));
+    const rows = batches.flatMap((b) => b.rows);
+    assert.deepStrictEqual(rows, [{ line: 1, cells: ["name", "city"] }, { line: 2, cells: ["山田", "東京"] }, { line: 3, cells: ["Ken", "Köln"] }], "cut " + cut);
+    assert.strictEqual(batches.at(-1).bytesRead, bytes.length);
+    assert.strictEqual(batches.at(-1).done, true);
+  }
+  // A TextDecoder without stream: true breaks a character split this way; TextDecoderStream does not.
+  const hi = [...new TextEncoder().encode("日")];
+  assert.strictEqual(new TextDecoder().decode(Uint8Array.from(hi.slice(0, 1))), "�");
+});
+ok("big: batch sizes, row counts and progress", async () => {
+  const text = bigCsv(20000);
+  const batches = await collect(new Blob([text]), { batchSize: 1000 });
+  const rows = batches.flatMap((b) => b.rows);
+  assert.strictEqual(rows.length, 20001);
+  assert.deepStrictEqual(rows[1], { line: 2, cells: ["0", "Name 0", 'a, "b"\nc 日本', "0.5"] });
+  assert.strictEqual(rows.at(-1).line, 40000); // each record takes two lines
+  for (const b of batches.slice(0, -1)) assert(b.rows.length === 1000 && !b.done);
+  assert.strictEqual(batches.at(-1).rows.length, 1);
+  assert(batches.length > 5);
+  const read = batches.map((b) => b.bytesRead);
+  assert.deepStrictEqual(read, [...read].sort((a, b) => a - b));
+  assert.strictEqual(read.at(-1), new Blob([text]).size);
+  assert.deepStrictEqual(batches.flatMap((b) => b.errors), []);
+});
+ok("big: Node 22 gives a whole Blob as one stream chunk", async () => {
+  const reader = new Blob(["x".repeat(11000000)]).stream().getReader();
+  const sizes = [];
+  for (;;) { const { value, done } = await reader.read(); if (done) break; sizes.push(value.length); }
+  assert.deepStrictEqual(sizes, [11000000]); // so csvBatches must cut chunks into pieces itself
+});
+ok("big: without fatal, bad bytes silently become U+FFFD; Node 22 has no global Worker", async () => {
+  const reader = new Blob([Uint8Array.from([0x43, 0x61, 0x66, 0xe9, 0x2c, 0x31])]).stream().pipeThrough(new TextDecoderStream()).getReader();
+  let text = "";
+  for (;;) { const { value, done } = await reader.read(); if (done) break; text += value; }
+  assert.strictEqual(text, "Caf\uFFFD,1");
+  assert.strictEqual(typeof Worker, "undefined");
+  assert.strictEqual(parse("a,b\n1,2").rows[0][1].join(), "a,b"); // the first row is the header row
+});
+ok("big: errors arrive with the batch that contains them", async () => {
+  const batches = await collect(new Blob(['a,b\n"x" y,1\n"never closed,2\n3,4\n']));
+  assert.deepStrictEqual(batches.flatMap((b) => b.errors), [{ line: 2, message: 'text after a closing quote: " "' }, { line: 3, message: "a quote opened on this line is never closed" }]);
+  assert.deepStrictEqual(batches.flatMap((b) => b.rows).at(-1), { line: 3, cells: ["never closed,2\n3,4\n"] });
+});
+ok("big: bytes that are not valid UTF-8 fail instead of turning into �", async () => {
+  await assert.rejects(collect(chunkedFile([[0x43, 0x61, 0x66, 0xe9, 0x0a]])), TypeError);
+  const sjis = [0x8e, 0x52, 0x93, 0x63, 0x2c, 0x93, 0x8c, 0x8b, 0x9e, 0x0a]; // 山田,東京 in Shift_JIS
+  const rows = (await collect(chunkedFile([sjis.slice(0, 3), sjis.slice(3)]), { encoding: "shift_jis" })).flatMap((b) => b.rows);
+  assert.deepStrictEqual(rows, [{ line: 1, cells: ["山田", "東京"] }]);
+  assert.deepStrictEqual((await collect(chunkedFile(["a;b\n1;2"]), { delimiter: ";" })).flatMap((b) => b.rows.map((r) => r.cells)), [["a", "b"], ["1", "2"]]);
+});
+ok("big: importCsv gets every row, one batch at a time", async () => {
+  let rows = 0, calls = 0;
+  const progress = [];
+  const job = importCsv(new Blob([bigCsv(30000)]), {
+    onBatch: async (batch, errors) => { rows += batch.length; calls++; assert.deepStrictEqual(errors, []); await new Promise((r) => setTimeout(r, 2)); },
+    onProgress: (share) => progress.push(share),
+    options: { batchSize: 2000 },
+  });
+  const worker = FakeWorker.all.at(-1); // tests run at the same time, so take it right away
+  assert.deepStrictEqual(await job.result, { rowCount: 30001 });
+  assert.strictEqual(rows, 30001);
+  assert(calls > 5);
+  assert.strictEqual(worker.maxAhead, 1); // the worker never ran ahead of the page
+  assert.strictEqual(worker.terminated, true);
+  assert.deepStrictEqual(progress, [...progress].sort((a, b) => a - b));
+  assert.strictEqual(progress.at(-1), 1);
+  job.cancel(); // after the end: no effect
+  assert.deepStrictEqual(await job.result, { rowCount: 30001 });
+});
+ok("big: importCsv cancel, failures and empty files", async () => {
+  let calls = 0;
+  const job = importCsv(new Blob([bigCsv(30000)]), { onBatch: () => { calls++; job.cancel(); } });
+  const worker = FakeWorker.all.at(-1); // tests run at the same time, so take it right away
+  await assert.rejects(job.result, (e) => e.name === "AbortError");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(worker.terminated, true);
+
+  const early = importCsv(new Blob([bigCsv(1000)]), { onBatch: () => { throw new Error("should not run"); } });
+  early.cancel();
+  await assert.rejects(early.result, (e) => e.name === "AbortError");
+
+  const saveFails = importCsv(new Blob([bigCsv(10)]), { onBatch: async () => { throw new Error("API down"); } });
+  const saveWorker = FakeWorker.all.at(-1);
+  await assert.rejects(saveFails.result, /API down/);
+  assert.strictEqual(saveWorker.terminated, true);
+
+  const notUtf8 = importCsv(new Blob([Uint8Array.from([0x43, 0x61, 0x66, 0xe9])]), { onBatch() {} });
+  await assert.rejects(notUtf8.result, /not valid/);
+
+  let seen = null;
+  const empty = importCsv(new Blob([""]), { onBatch: (r) => { seen = r; }, onProgress: (p) => assert.strictEqual(p, 1) });
+  assert.deepStrictEqual(await empty.result, { rowCount: 0 });
+  assert.deepStrictEqual(seen, []);
+});
+ok("big: the upload form example", async () => {
+  const handlers = {};
+  const els = {
+    "#csv-file": { files: [], value: "C:\\fakepath\\x.csv", addEventListener: (t, f) => (handlers[t] = f) },
+    "#import-status": { textContent: "" },
+    "#cancel-import": {},
+  };
+  const staged = new Map(), live = [], statuses = [];
+  let failDiscard = false;
+  const fakes = {
+    document: { querySelector: (q) => els[q] },
+    crypto,
+    importCsv,
+    async saveRows(id, header, rows, signal) {
+      assert(signal instanceof AbortSignal);
+      assert(Array.isArray(header));
+      staged.set(id, [...(staged.get(id) ?? []), ...rows]);
+      statuses.push(els["#import-status"].textContent);
+      await new Promise((r) => setTimeout(r, 1));
+    },
+    async commitImport(id) { live.push(...staged.get(id)); staged.delete(id); },
+    async discardImport(id) { staged.delete(id); if (failDiscard) throw new Error("network down"); },
+  };
+  new Function(...Object.keys(fakes), %%USE_JSON%%)(...Object.values(fakes));
+  const choose = (content) => { els["#csv-file"].files = content === null ? [] : [new Blob([content])]; return handlers.change(); };
+  const status = () => els["#import-status"].textContent;
+
+  await choose(bigCsv(5000));
+  assert.strictEqual(status(), "Imported 5000 rows");
+  assert.strictEqual(live.length, 5000); // the header row is not saved as a record
+  assert.strictEqual(live[0].cells[0], "0");
+  assert.strictEqual(els["#csv-file"].value, "");
+  assert(statuses.some((s) => /^\d+% read$/.test(s)));
+
+  // A ragged row or a parser problem: nothing goes live, staged rows are deleted.
+  await choose("a,b\n1,2\n3\n4,5\n");
+  assert.strictEqual(status(), "1 problems; line 3: 1 cells, header has 2");
+  await choose('a,b\n"x" y,1\n');
+  assert.strictEqual(status(), '1 problems; line 2: text after a closing quote: " "');
+  assert.strictEqual(staged.size, 0);
+  assert.strictEqual(live.length, 5000);
+  // A wrong delimiter: every row is a problem, and the import stops after the first batch.
+  let saves = statuses.length;
+  await choose("a;b;c\n" + "1;2,3\n".repeat(10000));
+  assert.match(status(), /^1999 problems; line 2: 2 cells, header has 1$/);
+  assert.strictEqual(statuses.length, saves); // nothing was saved
+  // Other failures, and a failing discard, still end with a status.
+  failDiscard = true;
+  await choose(new Uint8Array([0x43, 0x61, 0x66, 0xe9]));
+  assert.match(status(), /^Import failed: .*not valid/);
+  failDiscard = false;
+
+  // Cancel during the import.
+  const running = choose(bigCsv(30000));
+  await new Promise((r) => setTimeout(r, 5));
+  els["#cancel-import"].onclick();
+  await running;
+  assert.strictEqual(status(), "Import cancelled");
+  assert.strictEqual(staged.size, 0);
+
+  // A second file replaces the first; the cancelled first import does not overwrite the status.
+  const first = choose(bigCsv(30000));
+  await new Promise((r) => setTimeout(r, 5));
+  const second = choose("a,b\n1,2\n");
+  await Promise.all([first, second]);
+  assert.strictEqual(status(), "Imported 1 rows");
+  assert.strictEqual(staged.size, 0);
+  assert.strictEqual(live.length, 5001);
+
+  await choose(null); // no file chosen: nothing happens
+  assert.strictEqual(status(), "Imported 1 rows");
+});
+ok("big: cancel while onBatch is saving: no progress afterwards, the signal aborts", async () => {
+  const events = [];
+  let signalSeen = null;
+  const job = importCsv(new Blob([bigCsv(30000)]), {
+    async onBatch(rows, errors, signal) {
+      signalSeen = signal;
+      events.push("batch");
+      job.cancel();
+      events.push("aborted " + signal.aborted);
+      await new Promise((r) => setTimeout(r, 5));
+      events.push("save done");
+    },
+    onProgress: () => events.push("progress"),
+  });
+  await assert.rejects(job.result, (e) => e.name === "AbortError");
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepStrictEqual(events, ["batch", "aborted true", "save done"]);
+  assert.strictEqual(signalSeen.aborted, true);
+  // A falsy thrown value still rejects.
+  const odd = importCsv(new Blob(["a\n"]), { onBatch() { throw undefined; } });
+  await assert.rejects(odd.result.then(() => { throw new Error("resolved"); }, () => { throw new Error("rejected"); }), /rejected/);
+  // The worker is started as a module worker.
+  assert.strictEqual(FakeWorker.all.at(-1).type, "module");
+});
+ok("big: failures in onProgress, options and batchSize reject instead of hanging", async () => {
+  const thrower = importCsv(new Blob([bigCsv(5000)]), { onBatch() {}, onProgress() { throw new Error("bad progress bar"); } });
+  const w1 = FakeWorker.all.at(-1);
+  await assert.rejects(thrower.result, /bad progress bar/);
+  assert.strictEqual(w1.terminated, true);
+  const withFunction = importCsv(new Blob(["a\n"]), { onBatch() {}, options: { onError() {} } });
+  const w2 = FakeWorker.all.at(-1);
+  await assert.rejects(withFunction.result, (e) => e.name === "DataCloneError");
+  assert.strictEqual(w2.terminated, true);
+  for (const batchSize of [0, -1, 1.5, "10"]) {
+    await assert.rejects(importCsv(new Blob(["a\n"]), { onBatch() {}, options: { batchSize } }).result, /batchSize must be a whole number/);
+    await assert.rejects(collect(new Blob(["a\n"]), { batchSize }), /batchSize must be a whole number/);
+  }
+  assert.strictEqual((await collect(new Blob(["a\nb\n"]), { batchSize: 1 })).length, 3);
+});
+ok("big: stopping early or failing releases the file stream", async () => {
+  let cancelled = 0;
+  // An endless file: `first`, then `rest` again and again.
+  const file = (first, rest = first) => ({ size: 1, stream: () => { let n = 0; return new ReadableStream({
+    pull(c) { c.enqueue(new TextEncoder().encode(n++ ? rest : first)); }, cancel() { cancelled++; } }); } });
+  for await (const batch of csvBatches(file("a\n".repeat(100)), { batchSize: 10 })) { assert.strictEqual(batch.rows.length, 10); break; }
+  await new Promise((r) => setTimeout(r, 5));
+  assert.strictEqual(cancelled, 1);
+  await assert.rejects(collect(file('a,"', "x".repeat(100)), { maxCellLength: 1000 }), /line 1: a cell is longer than 1000 characters/);
+  await new Promise((r) => setTimeout(r, 5));
+  assert.strictEqual(cancelled, 2);
+});
+ok("big: a quote that is never closed stops at maxCellLength", async () => {
+  const text = 'id,note\n1,ok\n2,"never closed\n' + "3,x\n".repeat(400000);
+  const job = importCsv(new Blob([text]), { onBatch() {}, options: { maxCellLength: 100000 } });
+  await assert.rejects(job.result, /^Error: line 3: a cell is longer than 100000 characters$/);
+  assert.throws(() => parse("a".repeat(11), { maxCellLength: 10 }), /line 1: a cell is longer than 10 characters/);
+  assert.deepStrictEqual(parse("a".repeat(10), { maxCellLength: 10 }).rows, [[1, ["a".repeat(10)]]]);
+});
+ok("big: a delimiter must be one character, not a quote or line break", async () => {
+  for (const d of [",,", "", '"', "\r", "\n"]) assert.throws(() => parse("a", { delimiter: d }), /delimiter must be one character/, JSON.stringify(d));
+  const job = importCsv(new Blob(["a\n"]), { onBatch() {}, options: { delimiter: ";;" } });
+  await assert.rejects(job.result, /delimiter must be one character/);
+});
+ok("big: TextDecoderStream already removes a UTF-8 byte order mark", async () => {
+  const reader = new Blob([Uint8Array.from([0xef, 0xbb, 0xbf, 0x61])]).stream().pipeThrough(new TextDecoderStream()).getReader();
+  assert.strictEqual((await reader.read()).value, "a");
+  assert.deepStrictEqual(parse("\uFEFF\uFEFFa").rows, [[1, ["\uFEFFa"]]]); // only one is removed
+});
+ok("big: no invisible characters in the snippets", () => {
+  for (const s of %%ALL_JSON%%) assert(!/[\u00A0\u200B-\u200F\u2028\u2029\uFEFF]/.test(s));
+});
+}
+"""
+BIG_TABLE = [
+  ["a,b\r\nc,d\r\n", None, [[1, ["a", "b"]], [2, ["c", "d"]]], []],
+  ["a,b\rc,d", None, [[1, ["a", "b"]], [2, ["c", "d"]]], []],
+  ['id,note\n1,"Acme, Inc"\n', None, [[1, ["id", "note"]], [2, ["1", "Acme, Inc"]]], []],
+  ['id,note\n1,"two\r\nlines"\n2,x\n', None, [[1, ["id", "note"]], [2, ["1", "two\r\nlines"]], [4, ["2", "x"]]], []],
+  ['"He said ""hi"""', None, [[1, ['He said "hi"']]], []],
+  ['Ken,5" screen', None, [[1, ["Ken", '5" screen']]], []],
+  ['"Acme" Inc,1', None, [[1, ["Acme Inc", "1"]]], [[1, 'text after a closing quote: " "']]],
+  ["a\n\n\nb\n", None, [[1, ["a"]], [4, ["b"]]], []],
+  ['a\n""\n', None, [[1, ["a"]], [2, [""]]], []],
+  ["a,\n,\n", None, [[1, ["a", ""]], [2, ["", ""]]], []],
+  ["\uFEFFname", None, [[1, ["name"]]], []],
+  ['a\n"open,1\n2,3\n', None, [[1, ["a"]], [2, ["open,1\n2,3\n"]]], [[2, "a quote opened on this line is never closed"]]],
+  ["a;b\n1,5;2", {"delimiter": ";"}, [[1, ["a", "b"]], [2, ["1,5", "2"]]], []],
+  ["a\tb\n1\t2", {"delimiter": "\t"}, [[1, ["a", "b"]], [2, ["1", "2"]]], []],
+  ["", None, [], []],
+  [" a , b ", None, [[1, [" a ", " b "]]], []],
+]
+_big_names = ["BIG_PROBLEM", "BIG_PARSER", "BIG_BATCHES", "BIG_WORKER", "BIG_MAIN", "BIG_USE"]
+def _script(src):
+    """The article's ES modules as plain script for the Node tests: no import lines, no export keywords."""
+    lines = [l for l in src.split("\n") if not l.startswith("import ")]
+    return "\n".join(l[len("export "):] if l.startswith("export ") else l for l in lines)
+BIG_WORKER_SOURCE = _script(BIG_PARSER + "\n\n" + BIG_BATCHES + "\n\n" + BIG_WORKER)
+for _k in ["BIG_PARSER", "BIG_BATCHES"]:
+    BIG_TESTS = BIG_TESTS.replace("%%" + _k + "%%", _script(globals()[_k]))
+BIG_TESTS = BIG_TESTS.replace("%%WORKER_SOURCE_JSON%%", _json.dumps(BIG_WORKER_SOURCE))
+BIG_TESTS = BIG_TESTS.replace("%%MAIN_JSON%%", _json.dumps(_script(BIG_MAIN)))
+BIG_TESTS = BIG_TESTS.replace("%%USE_JSON%%", _json.dumps(_script(BIG_USE)))
+BIG_TESTS = BIG_TESTS.replace("%%PROBLEM_JSON%%", _json.dumps(BIG_PROBLEM))
+BIG_TESTS = BIG_TESTS.replace("%%TABLE_JSON%%", _json.dumps(BIG_TABLE, ensure_ascii=False))
+BIG_TESTS = BIG_TESTS.replace("%%ALL_JSON%%", _json.dumps([globals()[k] for k in _big_names]))
+out += BIG_TESTS
+# The Chromium test (tests/smoke.cjs) runs the same worker code in a real Worker.
+_out_dir = os.path.dirname(os.path.abspath(sys.argv[1])) if len(sys.argv) > 1 else None
+if _out_dir:
+    open(os.path.join(_out_dir, "article-browser.json"), "w").write(_json.dumps(
+        {"csv-stream.js": BIG_PARSER + "\n\n" + BIG_BATCHES + "\n", "csv-worker.js": BIG_WORKER + "\n",
+         "import-csv.js": BIG_MAIN + "\n"}, indent=1) + "\n")
 open(sys.argv[1] if len(sys.argv) > 1 else "/dev/stdout", "w").write(out)
