@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Show CSV and Excel import errors by cell address in JavaScript | SheetSift</title>
+<meta name="description" content="Report &quot;Signup date is not a real date: C3&quot; instead of rejecting the file. Tested JavaScript that checks every cell and comments the bad ones.">
+<link rel="canonical" href="https://shoheitaro003.github.io/sheetsift/blog/show-import-errors-by-cell-javascript/">
+<meta property="og:title" content="Show CSV and Excel import errors by cell address in JavaScript | SheetSift">
+<meta property="og:description" content="Report &quot;Signup date is not a real date: C3&quot; instead of rejecting the file. Tested JavaScript that checks every cell and comments the bad ones.">
+<meta property="og:url" content="https://shoheitaro003.github.io/sheetsift/blog/show-import-errors-by-cell-javascript/">
+<meta property="og:site_name" content="SheetSift">
+<meta name="twitter:card" content="summary">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400&display=swap">
+<link rel="stylesheet" href="../../blog.css">
+<meta property="og:type" content="article">
+<meta property="article:published_time" content="2026-11-17">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "Show CSV and Excel import errors by cell address in JavaScript", "description": "Report \"Signup date is not a real date: C3\" instead of rejecting the file. Tested JavaScript that checks every cell and comments the bad ones.", "datePublished": "2026-11-17", "dateModified": "2026-11-17", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/show-import-errors-by-cell-javascript/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="logo" href="../../"><svg width="24" height="24" viewBox="0 0 26 26" aria-hidden="true"><rect x="1" y="1" width="24" height="24" rx="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M1 9h24M9 9v16" stroke="currentColor" stroke-width="2"/><rect x="11" y="12" width="12" height="4" fill="var(--mark)"/></svg> SheetSift</a>
+  <nav class="nav"><a href="../../blog/">Blog</a><a class="btn" href="../../#try">Try the demo</a></nav>
+</div></header>
+<main><div class="wrap">
+<article>
+<h1>Show CSV and Excel import errors by cell address in JavaScript</h1>
+<p class="meta"><time datetime="2026-11-17">2026-11-17</time></p>
+<p>A customer uploads 2,000 rows and your importer answers <code>Invalid file</code>, or <code>Row 1418: validation failed</code>. They cannot tell which cell is wrong, so they email support or give up. What they need is a short list they can work through in their spreadsheet:</p>
+<pre><code>Email is not an email address: B3 ("ken@example")
+Signup date is not a real date: C3, C8 (2 cells; C3 is "2026-02-31")
+Name is empty: A4
+Seats must be between 1 and 10000: D4, D8 (2 cells; D4 is "0")</code></pre>
+<p>By the end of this post you will have the code that produces that list: field checks that return a message, <code>validateRows</code> to check every cell and give it its sheet address, <code>summarizeErrors</code> to group the results, a rule for when to import the good rows, and a copy of the user's file with a comment on each bad cell. It has no dependencies except <a href="https://docs.sheetjs.com/">SheetJS</a> for reading Excel files. Every function, and every output quoted here, is run by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22; the HTML example also runs in Chromium.</p>
+
+<h2>Step 1: checks that say what is wrong</h2>
+<p>A check gets the text of one cell, already trimmed, and returns either <code>{ value }</code> (the value to import) or <code>{ error }</code> (a phrase that completes the sentence "Signup date ..."). Returning the message, instead of <code>true</code> or <code>false</code>, is what lets the final list explain itself.</p>
+<pre><code>// Each check gets the trimmed cell text and returns { value } or { error }.
+// An error says what is wrong and what the cell should contain.
+const isEmail = (text) =&gt;
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)
+    ? { value: text.toLowerCase() }
+    : { error: &quot;is not an email address&quot; };
+
+// A time part (2026-01-05T13:30:00, as Excel date-time cells are read in step 4) is dropped.
+const isDate = (text) =&gt; {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(T\d{2}:\d{2}(:\d{2})?)?$/.exec(text);
+  if (!m) return { error: &quot;is not a date in the form 2026-03-31&quot; };
+  const [year, month, day] = [+m[1], +m[2], +m[3]];
+  if (year &lt; 1900) return { error: &quot;has a year before 1900&quot; }; // pick your own limit
+  const date = new Date(Date.UTC(year, month - 1, day));
+  // Date.UTC rolls 2026-02-31 over to March 3, so compare the parts back.
+  const same = date.getUTCFullYear() === year &amp;&amp; date.getUTCMonth() === month - 1
+    &amp;&amp; date.getUTCDate() === day;
+  if (!same) return { error: &quot;is not a real date&quot; };
+  return { value: text.slice(0, 10) };
+};
+
+const isWholeNumber = (min, max) =&gt; (text) =&gt; {
+  if (!/^-?\d+$/.test(text)) return { error: &quot;is not a whole number&quot; };
+  const n = Number(text);
+  if (n &lt; min || n &gt; max) return { error: `must be between ${min} and ${max}` };
+  return { value: n };
+};
+
+const FIELDS = [
+  { key: &quot;name&quot;, label: &quot;Name&quot;, required: true, check: (text) =&gt; ({ value: text }) },
+  { key: &quot;email&quot;, label: &quot;Email&quot;, required: true, unique: true, check: isEmail },
+  { key: &quot;signupDate&quot;, label: &quot;Signup date&quot;, check: isDate },
+  { key: &quot;seats&quot;, label: &quot;Seats&quot;, check: isWholeNumber(1, 10000) },
+];</code></pre>
+<p>Each check is strict on purpose and tells the user what it expected. <code>isDate</code> accepts only <code>2026-03-31</code>, optionally followed by a time such as <code>T13:30:00</code>, which it drops (step 4 reads Excel date-time cells that way); <code>31/03/2026</code> gets "is not a date in the form 2026-03-31", and <code>2026-02-31</code> gets "is not a real date". The second check exists because <code>Date.UTC(2026, 1, 31)</code> does not fail: it gives 3 March, so the code compares year, month and day after the conversion. Years before 1900 get their own message, so a typo like <code>0026-01-01</code> is not called "not a real date"; set the limit your data needs. <code>isWholeNumber</code> rejects <code>1.5</code>, <code>1,000</code> and <code>1e3</code>.</p>
+<p><code>isEmail</code> only checks the shape: it accepts <code>a@b..c</code>, and it lowercases the address so that duplicates match; keep the original text if you need it. <code>trim()</code> removes spaces and no-break spaces at the ends but not a zero-width space (U+200B), so a pasted address that starts with one passes and is not seen as a duplicate. If your files contain such characters, remove them before the checks.</p>
+<p>If your users write dates as <code>31/03/2026</code> or amounts as <code>1.234,50</code>, convert those before checking; our posts on <a href="../read-excel-dates-javascript-sheetjs/">Excel dates</a> and <a href="../parse-european-number-formats-javascript/">European number formats</a> show how, and both return errors in the same <code>{ error }</code> shape.</p>
+<p>A field also says whether it is <code>required</code> and whether its values must be <code>unique</code>. Uniqueness is checked on the converted value, so <code>Ana@Example.com</code> counts as the same email as <code>ana@example.com</code>. The first occurrence wins even when its own row has another error: in the example below, B5 is reported as a duplicate, first seen in B4, although row 4 will not be imported. That keeps the rule simple to explain; if you prefer, check uniqueness in a second pass over the valid rows only.</p>
+
+<h2>Step 2: check every cell and keep its address</h2>
+<p><code>validateRows</code> takes the rows from your parser, the index of the header row, and which column holds each field. It checks every mapped cell instead of stopping at the first error, because a user who fixes one cell per upload will need dozens of uploads.</p>
+<pre><code>// 0 -&gt; &quot;A&quot;, 25 -&gt; &quot;Z&quot;, 26 -&gt; &quot;AA&quot;
+const columnLetter = (i) =&gt;
+  (i &gt;= 26 ? columnLetter(Math.floor(i / 26) - 1) : &quot;&quot;)
+  + String.fromCharCode(65 + (i % 26));
+
+// A cell your reader already rejected arrives as { error: &quot;...&quot; }.
+const isRejected = (cell) =&gt; typeof cell === &quot;object&quot; &amp;&amp; cell !== null &amp;&amp; &quot;error&quot; in cell;
+
+// rows: arrays of cells from your parser. headerIndex: the header row in rows.
+// columns: { fieldKey: column index in rows }, from your mapping step.
+// origin: where rows[0][0] sits in the sheet, 0-based ({ row: 0, col: 0 } for a CSV).
+function validateRows(rows, headerIndex, columns, fields, options = {}) {
+  const { origin = { row: 0, col: 0 }, maxErrors = 1000 } = options;
+  const result = { fileErrors: [], errors: [], moreErrors: 0, valid: [], badRows: [] };
+  for (const field of fields) {
+    if (field.required &amp;&amp; columns[field.key] === undefined) {
+      result.fileErrors.push(`No column for the required field &quot;${field.label}&quot;.`);
+    }
+  }
+  if (result.fileErrors.length) return result;
+
+  const mapped = fields.filter((f) =&gt; columns[f.key] !== undefined);
+  const seen = new Map(mapped.filter((f) =&gt; f.unique).map((f) =&gt; [f.key, new Map()]));
+  for (let i = headerIndex + 1; i &lt; rows.length; i++) {
+    const row = rows[i] ?? [];
+    const cells = mapped.map((f) =&gt; row[columns[f.key]]);
+    const texts = cells.map((c) =&gt; (isRejected(c) ? &quot;&quot; : String(c ?? &quot;&quot;).trim()));
+    if (texts.every((t, f) =&gt; t === &quot;&quot; &amp;&amp; !isRejected(cells[f]))) continue; // a blank row
+
+    const rowNumber = origin.row + i + 1; // the row number a spreadsheet app shows
+    const data = {};
+    let rowHasError = false;
+    mapped.forEach((field, f) =&gt; {
+      const column = origin.col + columns[field.key];
+      const cell = columnLetter(column) + rowNumber;
+      const text = texts[f];
+      const report = (message, note) =&gt; {
+        rowHasError = true;
+        if (result.errors.length &lt; maxErrors) {
+          const { label } = field;
+          result.errors.push({ cell, column, row: rowNumber, label, value: text, message, note });
+        } else {
+          result.moreErrors++;
+        }
+      };
+      if (isRejected(cells[f])) return report(cells[f].error);
+      if (text === &quot;&quot;) {
+        if (field.required) report(&quot;is empty&quot;);
+        else data[field.key] = null;
+        return;
+      }
+      const checked = field.check(text);
+      if (&quot;error&quot; in checked) return report(checked.error);
+      const earlier = seen.get(field.key);
+      if (earlier) {
+        const key = String(checked.value);
+        if (earlier.has(key)) return report(&quot;is a duplicate&quot;, `first seen in ${earlier.get(key)}`);
+        earlier.set(key, cell);
+      }
+      data[field.key] = checked.value;
+    });
+    if (rowHasError) result.badRows.push(rowNumber);
+    else result.valid.push({ row: rowNumber, data });
+  }
+  if (!result.valid.length &amp;&amp; !result.badRows.length) {
+    result.fileErrors.push(&quot;The file has no data rows.&quot;);
+  }
+  return result;
+}</code></pre>
+<p>The address is easy to get wrong. Index 2 in your <code>rows</code> array is not row 2 of the sheet:</p>
+<ul>
+<li>Arrays count from 0 and sheets from 1, so <code>rows[2]</code> is row 3.</li>
+<li>Rows above the header (a title, a blank line) still count. <code>validateRows</code> uses the index in <code>rows</code>, not the position among data rows, and blank rows are skipped without changing the numbers after them.</li>
+<li>An Excel sheet's stored range does not always start at A1; in our test file it starts at B3. The reader in step 4 returns the rows from that corner and passes it back as <code>origin</code>, so the first bad cell is reported as C5, not B3. Our <a href="../detect-header-row-spreadsheet-javascript/">header row post</a> explains where this corner comes from.</li>
+<li>Columns use your mapping, so a file with the columns in another order still gets the right letters, and columns you do not import are never checked.</li>
+</ul>
+<p>The result has five parts: <code>fileErrors</code> (problems with the whole file), <code>errors</code> (one per bad cell), <code>moreErrors</code> (how many errors were not kept), <code>valid</code> (the good rows with their row numbers) and <code>badRows</code>. Each error looks like this:</p>
+<pre><code>{ cell: "B5", column: 1, row: 5, label: "Email", value: "Ana@Example.com",
+  message: "is a duplicate", note: "first seen in B4" }</code></pre>
+<p>The message is the same for every error of one kind, and anything specific to the cell goes in <code>note</code>. That is what lets step 3 group 400 duplicates into one line.</p>
+<p>Three rules decide when the cell checks do not run at all. A missing required column is a file error, and no rows are checked: with the wrong column mapped, every row would fail and bury the real problem. A file with no data rows below the header is a file error too. And after <code>maxErrors</code> (1,000 by default) errors are counted but not stored, so the error list stays short enough to keep and show however bad the file is.</p>
+<p>For the example file, with <code>columns = { name: 0, email: 1, signupDate: 2, seats: 3 }</code>, our test gets these results:</p>
+<table>
+<tr><th>Row</th><th>Name, Email, Signup date, Seats</th><th>Errors</th></tr>
+<tr><td>1</td><td>(header)</td><td></td></tr>
+<tr><td>2</td><td>Yui Tanaka, yui@example.jp, 2026-01-05, 3</td><td>none</td></tr>
+<tr><td>3</td><td>Ken Mori, ken@example, 2026-02-31, 2</td><td>B3, C3</td></tr>
+<tr><td>4</td><td>(empty), ana@example.com, 2026-03-01, 0</td><td>A4, D4</td></tr>
+<tr><td>5</td><td>Ana Silva, Ana@Example.com, 31/03/2026, 1.5</td><td>B5, C5, D5</td></tr>
+<tr><td>6</td><td>(blank row, skipped)</td><td></td></tr>
+<tr><td>7</td><td>Lee Chen, lee@example.com, (empty), (empty)</td><td>none: both are optional</td></tr>
+<tr><td>8</td><td>Bo Berg, bo@example.com, 2026-13-01, 12000</td><td>C8, D8</td></tr>
+<tr><td>9</td><td>Cy Moss, cy@example.com, 2026-1-01, 5</td><td>C9</td></tr>
+</table>
+
+<h2>Step 3: group the errors into lines a person can read</h2>
+<p>Ten errors in a list of ten lines is fine; 400 is not. When a column has the same problem in many cells, the cause is usually one thing, such as a date format, so <code>summarizeErrors</code> writes one line per column and message. Neighbouring rows become a range in spreadsheet notation (<code>C14:C16</code>), at most four ranges are listed, and the first bad value is shown so the user sees what the check saw.</p>
+<pre><code>// Rows [14, 15, 16, 20] -&gt; [{ from: 14, to: 16 }, { from: 20, to: 20 }]
+function rowRanges(rowNumbers) {
+  const ranges = [];
+  for (const n of rowNumbers) {
+    const last = ranges[ranges.length - 1];
+    if (last &amp;&amp; n &lt;= last.to) continue; // the same row twice
+    if (last &amp;&amp; n === last.to + 1) last.to = n;
+    else ranges.push({ from: n, to: n });
+  }
+  return ranges;
+}
+
+// A cell value in quotes, line breaks and quotes escaped, cut at max characters.
+// Graphemes are what a reader sees as one character, so an emoji is never cut in half.
+const graphemes = new Intl.Segmenter(undefined, { granularity: &quot;grapheme&quot; });
+function quoteValue(text, max = 40) {
+  const chars = Array.from(graphemes.segment(text), (part) =&gt; part.segment);
+  const short = chars.length &gt; max ? chars.slice(0, max - 1).join(&quot;&quot;) + &quot;…&quot; : text;
+  return JSON.stringify(short);
+}
+
+// One line per column and problem, in the order they appear in the file:
+// &#x27;Signup date is not a real date: C3, C8 (2 cells; C3 is &quot;2026-02-31&quot;)&#x27;
+function summarizeErrors(errors, { maxRanges = 4 } = {}) {
+  const groups = new Map();
+  // Sorted copy: errors you add after validateRows may come in any order.
+  const sorted = [...errors].sort((a, b) =&gt; a.row - b.row || a.column - b.column);
+  for (const e of sorted) {
+    const key = `${e.column} ${e.message}`;
+    // The group keeps the first error&#x27;s fields: its cell is the example.
+    if (!groups.has(key)) groups.set(key, { ...e, rows: [] });
+    groups.get(key).rows.push(e.row);
+  }
+  return [...groups.values()]
+    .sort((a, b) =&gt; a.row - b.row || a.column - b.column)
+    .map((g) =&gt; {
+      const letter = columnLetter(g.column);
+      const ranges = rowRanges(g.rows);
+      const shown = ranges.slice(0, maxRanges);
+      const address = ({ from, to }) =&gt;
+        from === to ? `${letter}${from}` : `${letter}${from}:${letter}${to}`;
+      let where = shown.map(address).join(&quot;, &quot;);
+      const listed = shown.reduce((sum, { from, to }) =&gt; sum + to - from + 1, 0);
+      if (g.rows.length &gt; listed) where += ` and ${g.rows.length - listed} more`;
+      const details = [];
+      if (g.rows.length &gt; 1) details.push(`${g.rows.length} cells`);
+      if (g.value !== &quot;&quot;) {
+        const example = g.rows.length &gt; 1 ? `${g.cell} is ${quoteValue(g.value)}` : quoteValue(g.value);
+        details.push(g.note ? `${example}, ${g.note}` : example); // note: &quot;first seen in B4&quot;
+      }
+      const extra = details.length ? ` (${details.join(&quot;; &quot;)})` : &quot;&quot;;
+      return `${g.label} ${g.message}: ${where}${extra}`;
+    });
+}</code></pre>
+<p>For the example file it returns the lines at the top of this post, plus three more:</p>
+<pre><code>Email is a duplicate: B5 ("Ana@Example.com", first seen in B4)
+Signup date is not a date in the form 2026-03-31: C5, C9 (2 cells; C5 is "31/03/2026")
+Seats is not a whole number: D5 ("1.5")</code></pre>
+<p>Some details that our tests cover. Lines follow the file: by the row of their first cell, then by column, even if you add your own errors to the list out of order or twice for the same cell. Seven bad cells in <code>AB2, AB3, AB5, AB7, AB9, AB11, AB12</code> give <code>AB2:AB3, AB5, AB7, AB9 and 2 more (7 cells; ...)</code>; the "more" counts cells, not ranges. Values are quoted with <code>JSON.stringify</code>, so a line break shows as <code>\n</code> and a quote as <code>\"</code>, and values longer than 40 characters are cut. The cut counts graphemes (what a reader sees as one character, found with <code>Intl.Segmenter</code>), so an emoji made of several code points, such as a family, is never split. Empty cells have no example.</p>
+
+<h2>Step 4: read an Excel or CSV file with SheetJS</h2>
+<p>This reader returns the rows, the corner of the sheet's range as <code>origin</code>, and the workbook, which step 6 needs. It uses <code>readCell</code>, <code>dateFormatKind</code> and <code>serialToISO</code> from our <a href="../read-excel-dates-javascript-sheetjs/">Excel dates post</a>, so date cells arrive as <code>2026-01-05</code> whatever their display format, and number cells as numbers.</p>
+<pre><code>// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
+import * as XLSX from &quot;xlsx&quot;;
+// readCell, dateFormatKind and serialToISO come from our post on Excel dates.
+async function readRows(file, { maxCells = 2_000_000 } = {}) {
+  const workbook = XLSX.read(await file.arrayBuffer(), { cellNF: true, raw: true });
+  const date1904 = Boolean(workbook.Workbook?.WBProps?.date1904);
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const range = XLSX.utils.decode_range(sheet[&quot;!ref&quot;] ?? &quot;A1&quot;);
+  const cellCount = (range.e.r - range.s.r + 1) * (range.e.c - range.s.c + 1);
+  if (cellCount &gt; maxCells) throw new Error(`The sheet&#x27;s range ${sheet[&quot;!ref&quot;]} is too large.`);
+  const rows = [];
+  for (let r = range.s.r; r &lt;= range.e.r; r++) {
+    const row = [];
+    for (let c = range.s.c; c &lt;= range.e.c; c++) {
+      const address = XLSX.utils.encode_cell({ r, c });
+      const cell = readCell(sheet[address], date1904, address);
+      // &quot;C11: Excel error #N/A&quot; -&gt; { error: &quot;could not be read (Excel error #N/A)&quot; }
+      const why = cell.problem?.replace(/^\w+: /, &quot;&quot;);
+      row.push(why ? { error: `could not be read (${why})` } : cell.value);
+    }
+    rows.push(row);
+  }
+  return { workbook, sheet, rows, origin: { row: range.s.r, col: range.s.c } };
+}</code></pre>
+<p>The dates post defines <code>readCell(cell, date1904, address)</code>, which calls <code>dateFormatKind</code> and <code>serialToISO</code> from the same post. For a cell it can read it returns <code>{ value }</code>: text and numbers as stored, <code>true</code> or <code>false</code>, a date as <code>2026-01-05</code> and a date with a time as <code>2026-01-05T13:30:00</code>. For an empty or missing cell the value is <code>null</code>. When it cannot read a cell it returns <code>{ value: null, problem }</code>, where <code>problem</code> starts with the address, as in <code>C11: Excel error #N/A</code>; <code>readRows</code> removes that address because <code>validateRows</code> adds its own. If you do not need dates converted, this version keeps the same contract, but a date cell then arrives as its serial number (<code>46027</code>) and fails <code>isDate</code>:</p>
+<pre><code>// Only if you do not need Excel dates converted: dates stay serial numbers.
+function readCell(cell, date1904, address) {
+  if (!cell || cell.t === &quot;z&quot;) return { value: null };
+  if (cell.t === &quot;e&quot;) return { value: null, problem: `${address}: Excel error ${cell.w ?? &quot;&quot;}`.trim() };
+  return { value: cell.v };
+}</code></pre>
+<p>Number cells are checked by their stored value, not by what the cell displays. A formula result of <code>2.0000000000000004</code> shown as <code>2</code> fails <code>isWholeNumber</code> with that long value in the message; round such values in your check if your users' files contain formulas.</p>
+<p>A cell that <code>readCell</code> rejects, such as <code>#N/A</code> or the date 1900-02-29 that does not exist, becomes <code>{ error }</code>. <code>validateRows</code> reports it like any other error (<code>Seats could not be read (Excel error #N/A): E5</code>) instead of treating it as an empty cell. CSV files come back as text, with <code>origin</code> at A1; <code>03/04/2026</code> and <code>007</code> are not converted. A line break inside a quoted CSV cell keeps the record on one row, so the addresses still match the sheet; a text editor will show that record over two lines.</p>
+<p><code>readRows</code> builds an array for every cell of the stored range, which can be much larger than the data. Above <code>maxCells</code> (2,000,000 by default) it throws instead, so show the user a message rather than freezing the page. If you parse CSV with another library, pass its rows to <code>validateRows</code> without <code>origin</code>.</p>
+
+<h2>Step 5: decide what to do with the result</h2>
+<p>Errors do not always mean "reject". If 3 rows out of 2,000 are wrong, most users want the 1,997 imported and the 3 fixed later. If half the rows are wrong, the mapping or the file's format is probably wrong, and importing half a file creates a cleanup job.</p>
+<pre><code>// What to do with a validation result. maxBadShare: above this share of bad rows,
+// the mapping or the file&#x27;s format is more likely wrong than a few cells.
+function decideImport(result, { maxBadShare = 0.2 } = {}) {
+  if (result.fileErrors.length) return &quot;reject&quot;;
+  if (!result.badRows.length) return &quot;import&quot;;
+  if (!result.valid.length) return &quot;fix-file&quot;; // nothing to import
+  const share = result.badRows.length / (result.badRows.length + result.valid.length);
+  return share &gt; maxBadShare ? &quot;fix-file&quot; : &quot;ask&quot;;
+}</code></pre>
+<table>
+<tr><th>Result</th><th>When</th><th>What to show</th></tr>
+<tr><td><code>reject</code></td><td>A required column is missing, or there are no data rows</td><td>The file errors, and a way back to the mapping step</td></tr>
+<tr><td><code>import</code></td><td>No bad rows</td><td>Import, then a count</td></tr>
+<tr><td><code>ask</code></td><td>Up to 20% of rows are bad</td><td>The error list, with "Import 1,997 rows and skip 3" and "Fix the file first"</td></tr>
+<tr><td><code>fix-file</code></td><td>More than 20% of rows are bad</td><td>The error list only</td></tr>
+</table>
+<p>20% is our default, not a standard: lower it if a partial import is costly for you, for example when rows refer to each other. Our tests check the edges: 2 of 10 bad rows gives <code>ask</code>, 3 of 10 gives <code>fix-file</code>, and a file with no good rows always gives <code>fix-file</code>, whatever <code>maxBadShare</code> is. If you import part of a file, keep <code>badRows</code> so you can tell the user which rows are not in your app.</p>
+
+<h2>Step 6: give the user their file back with comments</h2>
+<p>A list in your app is gone once the user switches to their spreadsheet. A copy of their file with a comment on each bad cell is easier to work through: they open it and fix the cells where they are.</p>
+<pre><code>// Adds each error as a comment on its cell, so the user can fix the file
+// in their spreadsheet app.
+function addErrorComments(sheet, errors, author = &quot;Import check&quot;) {
+  for (const e of errors) {
+    // &quot;z&quot; is an empty cell, created when the bad cell is blank.
+    const cell = (sheet[e.cell] ??= { t: &quot;z&quot; });
+    const text = `${e.label} ${e.message}`;
+    cell.c ??= [];
+    // Calling this twice (two clicks on &quot;Download&quot;) must not add the comment twice.
+    if (!cell.c.some((c) =&gt; c.a === author &amp;&amp; c.t === text)) cell.c.push({ a: author, t: text });
+  }
+}</code></pre>
+<p>In our test, the downloaded file keeps the values, the number formats (such as <code>dd/mm/yyyy</code> and <code>#,##0</code>) and the range of the original, and every listed cell has its comment, including an empty cell that the code creates for it. A comment the user had already written on a cell is kept next to ours; how the two appear together depends on the SheetJS version and the spreadsheet app, so open a downloaded copy once to see what your users will see. Calling <code>addErrorComments</code> again, for example when the user clicks the download button twice, does not add the same comment twice. The test does not check colours, column widths, charts or formulas, which SheetJS may not write back, so present the copy as a guide and ask users to fix their original file. Only the stored errors get comments, so with more than <code>maxErrors</code> errors some cells have none: say so next to the download.</p>
+
+<h2>Putting it together</h2>
+<pre><code>// The lines contain text from the user&#x27;s file: insert them as text, never as HTML.
+function showErrors(list, lines) {
+  list.replaceChildren(...lines.map((line) =&gt; {
+    const item = document.createElement(&quot;li&quot;);
+    item.textContent = line;
+    return item;
+  }));
+}</code></pre>
+<p>The lines contain text from the user's file, so <code>showErrors</code> sets <code>textContent</code>. Our Chromium test puts the same line, with the cell value <code>&lt;img src=x onerror=window.ran=1&gt;</code>, into a list both ways: with <code>textContent</code> it shows as text, and with <code>innerHTML</code> the image tag is created and its script runs.</p>
+<pre><code>async function checkImport(file) {
+  const { workbook, sheet, rows, origin } = await readRows(file);
+  // 0 is right only when the stored range starts at the header row;
+  // otherwise use the row your header detection found.
+  const headerIndex = 0;
+  // Or the results of your mapping step:
+  const columns = { name: 0, email: 1, signupDate: 2, seats: 3 };
+  const result = validateRows(rows, headerIndex, columns, FIELDS, { origin });
+
+  const lines = [...result.fileErrors, ...summarizeErrors(result.errors)];
+  if (result.moreErrors) {
+    const n = result.moreErrors;
+    lines.push(`${n} more ${n === 1 ? &quot;problem is&quot; : &quot;problems are&quot;} not listed or counted above.`);
+  }
+  showErrors(document.querySelector(&quot;#import-errors&quot;), lines);
+
+  // Called when the user clicks &quot;Download the file with comments&quot;.
+  const downloadWithComments = () =&gt; {
+    addErrorComments(sheet, result.errors);
+    XLSX.writeFile(workbook, &quot;import-errors.xlsx&quot;);
+  };
+  const decision = decideImport(result);
+  return { decision, validRows: result.valid, downloadWithComments };
+}</code></pre>
+<p>When more than <code>maxErrors</code> errors are found, the per-line counts cover only the stored errors, which the last line says. Replace the fixed <code>headerIndex</code> and <code>columns</code> with the results of your own header detection and column mapping; our posts on <a href="../detect-header-row-spreadsheet-javascript/">finding the header row</a> and <a href="../map-spreadsheet-columns-to-fields-javascript/">mapping columns</a> cover both. <code>checkImport</code> does not write anything: what you do with <code>decision</code> and <code>validRows</code> is up to your app.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Checks across rows other than duplicates</strong>, such as an end date before a start date, or a total that must match the sum of other rows. Add them after <code>validateRows</code>, with the same error shape, so they appear in the same list.</li>
+<li><strong>Checks against your database</strong>, such as an email that already belongs to another account. These are usually done on the server; return the cell address with the message so the browser can show it.</li>
+<li><strong>Editing cells in your app.</strong> This post sends the user back to their spreadsheet. An in-app grid where they fix cells and run the checks again is more work, but it saves a round trip.</li>
+<li><strong>Merged cells.</strong> In a merged block only the top-left cell holds the value, so a name merged over three rows gives "Name is empty" on the other two. Fill merged ranges from <code>sheet["!merges"]</code> before validating if your users' files have them.</li>
+<li><strong>More than one sheet.</strong> <code>readRows</code> reads the first sheet; with several sheets, add the sheet name to each address (<code>Customers!C3</code>).</li>
+<li><strong>Translated messages.</strong> The messages are English sentences built from the field label. To translate them, return a code and parameters from each check instead of text.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer. The demo on our homepage finds the header row, reads each column's type, and highlights the cells that need a fix, with the reason when you point at a cell, and lets you correct them in place. It runs in your browser: drop in a file and nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. Error reports by cell address and the download with comments are not in SheetSift yet; you are free to use the functions in this post in your own code.</p>
+
+</article>
+</div></main>
+<footer><div class="wrap"><span>SheetSift · a drop-in importer for messy Excel and CSV files</span><a href="../../#waitlist">Join the waitlist</a></div>
+<div class="wrap"><small>Visits are counted with <a href="https://www.goatcounter.com/">GoatCounter</a>, which does not track you across sites.</small></div></footer>
+<script>
+// Page view counter (GoatCounter). Only on the public site, so local runs and tests are never counted.
+if (location.hostname === "shoheitaro003.github.io") {
+  var gc = document.createElement("script");
+  gc.async = true; gc.src = "https://gc.zgo.at/count.js";
+  gc.setAttribute("data-goatcounter", "https://sheetsift.goatcounter.com/count");
+  document.body.appendChild(gc);
+}
+</script>
+</body>
+</html>

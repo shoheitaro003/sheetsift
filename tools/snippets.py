@@ -948,3 +948,255 @@ function applyMapping(rows, headerRow, byField) {
     .filter((row) => used.some(([, match]) => String(cell(row, match)).trim() !== ""))
     .map(toRecord);
 }'''
+
+
+# --- blog/show-import-errors-by-cell-javascript ---
+ERR_CHECKS = r'''// Each check gets the trimmed cell text and returns { value } or { error }.
+// An error says what is wrong and what the cell should contain.
+const isEmail = (text) =>
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)
+    ? { value: text.toLowerCase() }
+    : { error: "is not an email address" };
+
+// A time part (2026-01-05T13:30:00, as Excel date-time cells are read in step 4) is dropped.
+const isDate = (text) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(T\d{2}:\d{2}(:\d{2})?)?$/.exec(text);
+  if (!m) return { error: "is not a date in the form 2026-03-31" };
+  const [year, month, day] = [+m[1], +m[2], +m[3]];
+  if (year < 1900) return { error: "has a year before 1900" }; // pick your own limit
+  const date = new Date(Date.UTC(year, month - 1, day));
+  // Date.UTC rolls 2026-02-31 over to March 3, so compare the parts back.
+  const same = date.getUTCFullYear() === year && date.getUTCMonth() === month - 1
+    && date.getUTCDate() === day;
+  if (!same) return { error: "is not a real date" };
+  return { value: text.slice(0, 10) };
+};
+
+const isWholeNumber = (min, max) => (text) => {
+  if (!/^-?\d+$/.test(text)) return { error: "is not a whole number" };
+  const n = Number(text);
+  if (n < min || n > max) return { error: `must be between ${min} and ${max}` };
+  return { value: n };
+};
+
+const FIELDS = [
+  { key: "name", label: "Name", required: true, check: (text) => ({ value: text }) },
+  { key: "email", label: "Email", required: true, unique: true, check: isEmail },
+  { key: "signupDate", label: "Signup date", check: isDate },
+  { key: "seats", label: "Seats", check: isWholeNumber(1, 10000) },
+];'''
+
+ERR_VALIDATE = r'''// 0 -> "A", 25 -> "Z", 26 -> "AA"
+const columnLetter = (i) =>
+  (i >= 26 ? columnLetter(Math.floor(i / 26) - 1) : "")
+  + String.fromCharCode(65 + (i % 26));
+
+// A cell your reader already rejected arrives as { error: "..." }.
+const isRejected = (cell) => typeof cell === "object" && cell !== null && "error" in cell;
+
+// rows: arrays of cells from your parser. headerIndex: the header row in rows.
+// columns: { fieldKey: column index in rows }, from your mapping step.
+// origin: where rows[0][0] sits in the sheet, 0-based ({ row: 0, col: 0 } for a CSV).
+function validateRows(rows, headerIndex, columns, fields, options = {}) {
+  const { origin = { row: 0, col: 0 }, maxErrors = 1000 } = options;
+  const result = { fileErrors: [], errors: [], moreErrors: 0, valid: [], badRows: [] };
+  for (const field of fields) {
+    if (field.required && columns[field.key] === undefined) {
+      result.fileErrors.push(`No column for the required field "${field.label}".`);
+    }
+  }
+  if (result.fileErrors.length) return result;
+
+  const mapped = fields.filter((f) => columns[f.key] !== undefined);
+  const seen = new Map(mapped.filter((f) => f.unique).map((f) => [f.key, new Map()]));
+  for (let i = headerIndex + 1; i < rows.length; i++) {
+    const row = rows[i] ?? [];
+    const cells = mapped.map((f) => row[columns[f.key]]);
+    const texts = cells.map((c) => (isRejected(c) ? "" : String(c ?? "").trim()));
+    if (texts.every((t, f) => t === "" && !isRejected(cells[f]))) continue; // a blank row
+
+    const rowNumber = origin.row + i + 1; // the row number a spreadsheet app shows
+    const data = {};
+    let rowHasError = false;
+    mapped.forEach((field, f) => {
+      const column = origin.col + columns[field.key];
+      const cell = columnLetter(column) + rowNumber;
+      const text = texts[f];
+      const report = (message, note) => {
+        rowHasError = true;
+        if (result.errors.length < maxErrors) {
+          const { label } = field;
+          result.errors.push({ cell, column, row: rowNumber, label, value: text, message, note });
+        } else {
+          result.moreErrors++;
+        }
+      };
+      if (isRejected(cells[f])) return report(cells[f].error);
+      if (text === "") {
+        if (field.required) report("is empty");
+        else data[field.key] = null;
+        return;
+      }
+      const checked = field.check(text);
+      if ("error" in checked) return report(checked.error);
+      const earlier = seen.get(field.key);
+      if (earlier) {
+        const key = String(checked.value);
+        if (earlier.has(key)) return report("is a duplicate", `first seen in ${earlier.get(key)}`);
+        earlier.set(key, cell);
+      }
+      data[field.key] = checked.value;
+    });
+    if (rowHasError) result.badRows.push(rowNumber);
+    else result.valid.push({ row: rowNumber, data });
+  }
+  if (!result.valid.length && !result.badRows.length) {
+    result.fileErrors.push("The file has no data rows.");
+  }
+  return result;
+}'''
+
+ERR_SUMMARY = r'''// Rows [14, 15, 16, 20] -> [{ from: 14, to: 16 }, { from: 20, to: 20 }]
+function rowRanges(rowNumbers) {
+  const ranges = [];
+  for (const n of rowNumbers) {
+    const last = ranges[ranges.length - 1];
+    if (last && n <= last.to) continue; // the same row twice
+    if (last && n === last.to + 1) last.to = n;
+    else ranges.push({ from: n, to: n });
+  }
+  return ranges;
+}
+
+// A cell value in quotes, line breaks and quotes escaped, cut at max characters.
+// Graphemes are what a reader sees as one character, so an emoji is never cut in half.
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+function quoteValue(text, max = 40) {
+  const chars = Array.from(graphemes.segment(text), (part) => part.segment);
+  const short = chars.length > max ? chars.slice(0, max - 1).join("") + "…" : text;
+  return JSON.stringify(short);
+}
+
+// One line per column and problem, in the order they appear in the file:
+// 'Signup date is not a real date: C3, C8 (2 cells; C3 is "2026-02-31")'
+function summarizeErrors(errors, { maxRanges = 4 } = {}) {
+  const groups = new Map();
+  // Sorted copy: errors you add after validateRows may come in any order.
+  const sorted = [...errors].sort((a, b) => a.row - b.row || a.column - b.column);
+  for (const e of sorted) {
+    const key = `${e.column} ${e.message}`;
+    // The group keeps the first error's fields: its cell is the example.
+    if (!groups.has(key)) groups.set(key, { ...e, rows: [] });
+    groups.get(key).rows.push(e.row);
+  }
+  return [...groups.values()]
+    .sort((a, b) => a.row - b.row || a.column - b.column)
+    .map((g) => {
+      const letter = columnLetter(g.column);
+      const ranges = rowRanges(g.rows);
+      const shown = ranges.slice(0, maxRanges);
+      const address = ({ from, to }) =>
+        from === to ? `${letter}${from}` : `${letter}${from}:${letter}${to}`;
+      let where = shown.map(address).join(", ");
+      const listed = shown.reduce((sum, { from, to }) => sum + to - from + 1, 0);
+      if (g.rows.length > listed) where += ` and ${g.rows.length - listed} more`;
+      const details = [];
+      if (g.rows.length > 1) details.push(`${g.rows.length} cells`);
+      if (g.value !== "") {
+        const example = g.rows.length > 1 ? `${g.cell} is ${quoteValue(g.value)}` : quoteValue(g.value);
+        details.push(g.note ? `${example}, ${g.note}` : example); // note: "first seen in B4"
+      }
+      const extra = details.length ? ` (${details.join("; ")})` : "";
+      return `${g.label} ${g.message}: ${where}${extra}`;
+    });
+}'''
+
+ERR_DECIDE = r'''// What to do with a validation result. maxBadShare: above this share of bad rows,
+// the mapping or the file's format is more likely wrong than a few cells.
+function decideImport(result, { maxBadShare = 0.2 } = {}) {
+  if (result.fileErrors.length) return "reject";
+  if (!result.badRows.length) return "import";
+  if (!result.valid.length) return "fix-file"; // nothing to import
+  const share = result.badRows.length / (result.badRows.length + result.valid.length);
+  return share > maxBadShare ? "fix-file" : "ask";
+}'''
+
+ERR_READ = r'''// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
+import * as XLSX from "xlsx";
+// readCell, dateFormatKind and serialToISO come from our post on Excel dates.
+async function readRows(file, { maxCells = 2_000_000 } = {}) {
+  const workbook = XLSX.read(await file.arrayBuffer(), { cellNF: true, raw: true });
+  const date1904 = Boolean(workbook.Workbook?.WBProps?.date1904);
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const range = XLSX.utils.decode_range(sheet["!ref"] ?? "A1");
+  const cellCount = (range.e.r - range.s.r + 1) * (range.e.c - range.s.c + 1);
+  if (cellCount > maxCells) throw new Error(`The sheet's range ${sheet["!ref"]} is too large.`);
+  const rows = [];
+  for (let r = range.s.r; r <= range.e.r; r++) {
+    const row = [];
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const address = XLSX.utils.encode_cell({ r, c });
+      const cell = readCell(sheet[address], date1904, address);
+      // "C11: Excel error #N/A" -> { error: "could not be read (Excel error #N/A)" }
+      const why = cell.problem?.replace(/^\w+: /, "");
+      row.push(why ? { error: `could not be read (${why})` } : cell.value);
+    }
+    rows.push(row);
+  }
+  return { workbook, sheet, rows, origin: { row: range.s.r, col: range.s.c } };
+}'''
+
+ERR_READCELL = r'''// Only if you do not need Excel dates converted: dates stay serial numbers.
+function readCell(cell, date1904, address) {
+  if (!cell || cell.t === "z") return { value: null };
+  if (cell.t === "e") return { value: null, problem: `${address}: Excel error ${cell.w ?? ""}`.trim() };
+  return { value: cell.v };
+}'''
+
+ERR_COMMENTS = r'''// Adds each error as a comment on its cell, so the user can fix the file
+// in their spreadsheet app.
+function addErrorComments(sheet, errors, author = "Import check") {
+  for (const e of errors) {
+    // "z" is an empty cell, created when the bad cell is blank.
+    const cell = (sheet[e.cell] ??= { t: "z" });
+    const text = `${e.label} ${e.message}`;
+    cell.c ??= [];
+    // Calling this twice (two clicks on "Download") must not add the comment twice.
+    if (!cell.c.some((c) => c.a === author && c.t === text)) cell.c.push({ a: author, t: text });
+  }
+}'''
+
+ERR_SHOW = r'''// The lines contain text from the user's file: insert them as text, never as HTML.
+function showErrors(list, lines) {
+  list.replaceChildren(...lines.map((line) => {
+    const item = document.createElement("li");
+    item.textContent = line;
+    return item;
+  }));
+}'''
+
+ERR_USE = r'''async function checkImport(file) {
+  const { workbook, sheet, rows, origin } = await readRows(file);
+  // 0 is right only when the stored range starts at the header row;
+  // otherwise use the row your header detection found.
+  const headerIndex = 0;
+  // Or the results of your mapping step:
+  const columns = { name: 0, email: 1, signupDate: 2, seats: 3 };
+  const result = validateRows(rows, headerIndex, columns, FIELDS, { origin });
+
+  const lines = [...result.fileErrors, ...summarizeErrors(result.errors)];
+  if (result.moreErrors) {
+    const n = result.moreErrors;
+    lines.push(`${n} more ${n === 1 ? "problem is" : "problems are"} not listed or counted above.`);
+  }
+  showErrors(document.querySelector("#import-errors"), lines);
+
+  // Called when the user clicks "Download the file with comments".
+  const downloadWithComments = () => {
+    addErrorComments(sheet, result.errors);
+    XLSX.writeFile(workbook, "import-errors.xlsx");
+  };
+  const decision = decideImport(result);
+  return { decision, validRows: result.valid, downloadWithComments };
+}'''
+

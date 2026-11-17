@@ -1647,3 +1647,529 @@ ok("map: no invisible characters in the snippets", () => {
   for (const s of ["function normalizeHeader(text) {\n  return String(text ?? \"\")\n    // \uff25\uff4d\uff41\uff49\uff4c -> Email, \uff92\uff70\uff99 -> \u30e1\u30fc\u30eb, no-break space -> space\n    .normalize(\"NFKC\")\n    // zero-width spaces and byte order marks\n    .replace(/\\p{Cf}/gu, \"\")\n    // signupDate -> signup Date\n    .replace(/(\\p{Ll})(\\p{Lu})/gu, \"$1 $2\")\n    .toLowerCase()\n    // \u00e9 -> e, but the mark in Japanese \u30c9 stays\n    .normalize(\"NFD\")\n    .replace(/(\\p{Script=Latin})\\p{M}+/gu, \"$1\")\n    .normalize(\"NFC\")\n    // punctuation, underscores and runs of spaces -> one space\n    .replace(/[^\\p{L}\\p{N}]+/gu, \" \")\n    .trim();\n}\n\n// Plurals count as the same word. \"address\" is left alone.\nfunction stem(word) {\n  if (/(ss|x|ch|sh)es$/.test(word)) return word.slice(0, -2); // addresses\n  if (word.length > 3 && /[^s]s$/.test(word)) return word.slice(0, -1); // plans\n  return word;\n}\nconst words = (text) => normalizeHeader(text).split(\" \").filter(Boolean).map(stem);\nconst headerKey = (text) => words(text).join(\" \");", "// True when b is a with one letter changed, added or removed,\n// or with two neighbouring letters swapped.\nfunction oneEditApart(a, b) {\n  if (a === b || Math.abs(a.length - b.length) > 1) return false;\n  let i = 0;\n  while (a[i] === b[i]) i++; // length of the common start\n  if (a.length === b.length) {\n    return a.slice(i + 1) === b.slice(i + 1) ||\n      (a[i] === b[i + 1] && a[i + 1] === b[i] && a.slice(i + 2) === b.slice(i + 2));\n  }\n  const [longer, shorter] = a.length > b.length ? [a, b] : [b, a];\n  return longer.slice(i + 1) === shorter.slice(i);\n}\n\nfunction compareNames(header, name) {\n  const h = words(header), n = words(name);\n  if (!h.length || !n.length) return null;\n  const hJoined = h.join(\"\"), nJoined = n.join(\"\");\n  if (hJoined === nJoined) return { score: 1, why: `same as \"${name}\"` };\n  const contained = n.every((w) => h.includes(w));\n  if (contained && h.length === n.length) {\n    return { score: 0.95, why: `same words as \"${name}\"` };\n  }\n  if (contained) {\n    return { score: 0.5 + 0.4 * (n.length / h.length), why: `contains \"${name}\"` };\n  }\n  const longEnough = Math.min(hJoined.length, nJoined.length) >= 5;\n  if (longEnough && oneEditApart(hJoined, nJoined)) {\n    return { score: 0.6, why: `spelled like \"${name}\"` };\n  }\n  return null;\n}", "const looksLikeEmail = (v) => /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(String(v).trim());\nconst looksLikeNumber = (v) =>\n  typeof v === \"number\" || /^[-+(]?[$\u20ac\u00a3\u00a5]?\\s?\\d[\\d.,\\s']*\\)?$/.test(String(v).trim());\n\nconst FIELDS = [\n  { key: \"name\", label: \"Full name\", required: true,\n    aliases: [\"name\", \"customer name\", \"contact name\", \"\u6c0f\u540d\", \"\u540d\u524d\"] },\n  { key: \"email\", label: \"Email\", required: true,\n    looksLike: looksLikeEmail, findByValues: true,\n    aliases: [\"email address\", \"mail\", \"e-mail address\", \"email adresse\",\n              \"\u30e1\u30fc\u30eb\u30a2\u30c9\u30ec\u30b9\", \"\u30e1\u30fc\u30eb\"] },\n  { key: \"company\", label: \"Company\",\n    aliases: [\"company name\", \"organization\", \"organisation\", \"\u4f1a\u793e\u540d\"] },\n  { key: \"phone\", label: \"Phone\",\n    aliases: [\"phone number\", \"telephone\", \"tel\", \"mobile\", \"\u96fb\u8a71\u756a\u53f7\"] },\n  { key: \"mrr\", label: \"MRR\", looksLike: looksLikeNumber,\n    aliases: [\"monthly revenue\", \"monthly recurring revenue\"] },\n];", "const MIN_SCORE = 0.6;   // weaker name matches are ignored\nconst SURE_SCORE = 0.95; // weaker name matches need values to confirm them\nconst CLOSE = 0.1;       // a rival this close makes the choice a guess\n\n// 0 -> \"A\", 27 -> \"AB\"\nfunction columnLetter(i) {\n  const prefix = i >= 26 ? columnLetter(Math.floor(i / 26) - 1) : \"\";\n  return prefix + String.fromCharCode(65 + (i % 26));\n}\n\n// How many sample values pass the field's check (null: nothing to check).\nfunction valueShare(field, values = []) {\n  const filled = values.filter((v) => v != null && String(v).trim() !== \"\");\n  if (!field.looksLike || !filled.length) return null;\n  const pass = filled.filter(field.looksLike).length;\n  const text = `${pass} of ${filled.length} values look like ${field.label}`;\n  return { pass, of: filled.length, text };\n}\n\nfunction bestNameMatch(header, field, remembered) {\n  const key = headerKey(header);\n  if (key && remembered[key] === field.key) {\n    return { score: 1, why: \"chosen by a user before\" };\n  }\n  let best = null;\n  for (const name of [field.key, field.label, ...(field.aliases ?? [])]) {\n    const m = compareNames(header, name);\n    if (m && (!best || m.score > best.score)) best = m;\n  }\n  return best;\n}\n\nfunction mapColumns(headers, fields, { samples = [], remembered = {} } = {}) {\n  // Columns that matched a field but were not used: column -> { key, why, second }.\n  // second: a better column already fills that field.\n  const notUsed = new Map();\n  const note = (column, key, why, second = false) => {\n    if (!notUsed.has(column)) notUsed.set(column, { key, why, second });\n  };\n\n  // 1. Pairs whose names match and whose values do not contradict them.\n  const pairs = [];\n  fields.forEach((field, f) => headers.forEach((header, column) => {\n    const best = bestNameMatch(header, field, remembered);\n    if (!best || best.score < MIN_SCORE) return;\n    const share = valueShare(field, samples[column]);\n    if (share && share.pass / share.of < 0.5) {\n      return note(column, field.key, `matched by name, but only ${share.text}`);\n    }\n    const confirmed = share && share.pass / share.of >= 0.9;\n    const doubt = share && !confirmed && `only ${share.text}`;\n    pairs.push({ f, column, ...best, confirmed, doubt });\n  }));\n\n  // 2. Best pairs first; each field and each column is used once.\n  pairs.sort((a, b) => b.score - a.score || a.column - b.column || a.f - b.f);\n  const byField = Object.fromEntries(fields.map((field) => [field.key, null]));\n  const usedBy = new Map(); // column -> field key\n  for (const p of pairs) {\n    const field = fields[p.f], taken = byField[field.key];\n    if (usedBy.has(p.column)) continue;\n    if (taken) {\n      const where = columnLetter(taken.column);\n      const why = `also matches ${field.label}, which column ${where} already fills`;\n      note(p.column, field.key, why, true);\n      continue;\n    }\n    // A rival scores almost as well and could still be used: another free column\n    // for this field, or another empty field for this column.\n    const rival = pairs.find((q) => q !== p && q.score >= p.score - CLOSE && (\n      (q.f === p.f && !usedBy.has(q.column)) ||\n      (q.column === p.column && !byField[fields[q.f].key])));\n    const doubts = [];\n    if (p.score < SURE_SCORE && !p.confirmed) doubts.push(\"weak name match\");\n    const rivalColumn = rival && columnLetter(rival.column);\n    if (rival?.f === p.f) doubts.push(`column ${rivalColumn} matches too`);\n    else if (rival) doubts.push(`could also be ${fields[rival.f].label}`);\n    if (p.doubt) doubts.push(p.doubt);\n    const header = headers[p.column], sure = !doubts.length;\n    byField[field.key] = { column: p.column, header, why: p.why, sure, doubts };\n    usedBy.set(p.column, field.key);\n  }\n\n  // 3. Fields still empty: the one unused column whose values look right (9 in 10).\n  for (const field of fields) {\n    if (byField[field.key] || !field.findByValues) continue;\n    const fits = headers.map((_, column) => column).filter((column) => {\n      const share = !usedBy.has(column) && valueShare(field, samples[column]);\n      return share && share.pass / share.of >= 0.9;\n    });\n    if (fits.length !== 1) {\n      const why = `values look like ${field.label}, but so do other columns`;\n      fits.forEach((column) => note(column, field.key, why));\n      continue;\n    }\n    const [column] = fits, header = headers[column];\n    const why = `values look like ${field.label}`;\n    const doubts = [\"matched by its values, not its name\"];\n    byField[field.key] = { column, header, why, sure: false, doubts };\n    usedBy.set(column, field.key);\n  }\n\n  const unmatched = headers\n    .map((header, column) => ({ column, header }))\n    .filter(({ column }) => !usedBy.has(column))\n    .map((c) => ({ ...c, why: notUsed.get(c.column)?.why ??\n      (normalizeHeader(c.header) ? \"no field has this name\" : \"empty header\") }));\n  const missing = fields.filter((f) => f.required && !byField[f.key])\n    .map((f) => f.key);\n  // A person should look when a field stayed empty although a column's name\n  // matched it, or when a second column matches a filled field (Email, Email 2).\n  const needsLook = unmatched.some(({ column }) => {\n    const n = notUsed.get(column);\n    return n && (n.second || !byField[n.key]);\n  });\n  const allSure = Object.values(byField).every((m) => !m || m.sure);\n  const sure = !missing.length && !needsLook && allSure;\n  return { byField, unmatched, missing, sure };\n}", "// After the user confirms the mapping screen, store their choices\n// (in your database or in localStorage).\nfunction rememberMapping(remembered, headers, byField) {\n  for (const [key, match] of Object.entries(byField)) {\n    const header = match && headerKey(headers[match.column]);\n    if (header) remembered[header] = key; // blank headers are not remembered\n  }\n  return remembered;\n}", "// rows: arrays of cells from your CSV or Excel parser.\n// headerRow: the index of the header row.\nfunction suggestMapping(rows, headerRow, remembered = {}) {\n  const headers = rows[headerRow] ?? [];\n  // 50 data rows are enough to check the values.\n  const firstRows = rows.slice(headerRow + 1, headerRow + 51);\n  const samples = headers.map((_, column) => firstRows.map((row) => row?.[column]));\n  return mapColumns(headers, FIELDS, { samples, remembered });\n}\n\n// Rows whose mapped cells are all blank are skipped.\nfunction applyMapping(rows, headerRow, byField) {\n  const used = Object.entries(byField).filter(([, match]) => match);\n  const cell = (row, match) => row?.[match.column] ?? \"\";\n  const toRecord = (row) =>\n    Object.fromEntries(used.map(([key, match]) => [key, cell(row, match)]));\n  return rows.slice(headerRow + 1)\n    .filter((row) => used.some(([, match]) => String(cell(row, match)).trim() !== \"\"))\n    .map(toRecord);\n}", "const EMAIL_NAMES = [\"email\", \"e-mail\", \"email address\", \"mail\"];\nconst exactMatch = (header) => EMAIL_NAMES.includes(header.trim().toLowerCase());\nexactMatch(\"E-mail\");             // true\nexactMatch(\"E-Mail-Adresse\");     // false\nexactMatch(\"Email\\u00A0address\");  // false\nexactMatch(\"\uff25\uff4d\uff41\uff49\uff4c\");         // false\n\nconst looseMatch = (header) => header.toLowerCase().includes(\"mail\");\nlooseMatch(\"Mailing address\");    // true\nlooseMatch(\"Email opt-in\");       // true"]) assert(!/[\u00A0\u200B-\u200F\u2028\u2029\uFEFF]/.test(s));
 });
 }
+
+// --- blog/show-import-errors-by-cell-javascript ---
+{
+// Each check gets the trimmed cell text and returns { value } or { error }.
+// An error says what is wrong and what the cell should contain.
+const isEmail = (text) =>
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)
+    ? { value: text.toLowerCase() }
+    : { error: "is not an email address" };
+
+// A time part (2026-01-05T13:30:00, as Excel date-time cells are read in step 4) is dropped.
+const isDate = (text) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(T\d{2}:\d{2}(:\d{2})?)?$/.exec(text);
+  if (!m) return { error: "is not a date in the form 2026-03-31" };
+  const [year, month, day] = [+m[1], +m[2], +m[3]];
+  if (year < 1900) return { error: "has a year before 1900" }; // pick your own limit
+  const date = new Date(Date.UTC(year, month - 1, day));
+  // Date.UTC rolls 2026-02-31 over to March 3, so compare the parts back.
+  const same = date.getUTCFullYear() === year && date.getUTCMonth() === month - 1
+    && date.getUTCDate() === day;
+  if (!same) return { error: "is not a real date" };
+  return { value: text.slice(0, 10) };
+};
+
+const isWholeNumber = (min, max) => (text) => {
+  if (!/^-?\d+$/.test(text)) return { error: "is not a whole number" };
+  const n = Number(text);
+  if (n < min || n > max) return { error: `must be between ${min} and ${max}` };
+  return { value: n };
+};
+
+const FIELDS = [
+  { key: "name", label: "Name", required: true, check: (text) => ({ value: text }) },
+  { key: "email", label: "Email", required: true, unique: true, check: isEmail },
+  { key: "signupDate", label: "Signup date", check: isDate },
+  { key: "seats", label: "Seats", check: isWholeNumber(1, 10000) },
+];
+
+// 0 -> "A", 25 -> "Z", 26 -> "AA"
+const columnLetter = (i) =>
+  (i >= 26 ? columnLetter(Math.floor(i / 26) - 1) : "")
+  + String.fromCharCode(65 + (i % 26));
+
+// A cell your reader already rejected arrives as { error: "..." }.
+const isRejected = (cell) => typeof cell === "object" && cell !== null && "error" in cell;
+
+// rows: arrays of cells from your parser. headerIndex: the header row in rows.
+// columns: { fieldKey: column index in rows }, from your mapping step.
+// origin: where rows[0][0] sits in the sheet, 0-based ({ row: 0, col: 0 } for a CSV).
+function validateRows(rows, headerIndex, columns, fields, options = {}) {
+  const { origin = { row: 0, col: 0 }, maxErrors = 1000 } = options;
+  const result = { fileErrors: [], errors: [], moreErrors: 0, valid: [], badRows: [] };
+  for (const field of fields) {
+    if (field.required && columns[field.key] === undefined) {
+      result.fileErrors.push(`No column for the required field "${field.label}".`);
+    }
+  }
+  if (result.fileErrors.length) return result;
+
+  const mapped = fields.filter((f) => columns[f.key] !== undefined);
+  const seen = new Map(mapped.filter((f) => f.unique).map((f) => [f.key, new Map()]));
+  for (let i = headerIndex + 1; i < rows.length; i++) {
+    const row = rows[i] ?? [];
+    const cells = mapped.map((f) => row[columns[f.key]]);
+    const texts = cells.map((c) => (isRejected(c) ? "" : String(c ?? "").trim()));
+    if (texts.every((t, f) => t === "" && !isRejected(cells[f]))) continue; // a blank row
+
+    const rowNumber = origin.row + i + 1; // the row number a spreadsheet app shows
+    const data = {};
+    let rowHasError = false;
+    mapped.forEach((field, f) => {
+      const column = origin.col + columns[field.key];
+      const cell = columnLetter(column) + rowNumber;
+      const text = texts[f];
+      const report = (message, note) => {
+        rowHasError = true;
+        if (result.errors.length < maxErrors) {
+          const { label } = field;
+          result.errors.push({ cell, column, row: rowNumber, label, value: text, message, note });
+        } else {
+          result.moreErrors++;
+        }
+      };
+      if (isRejected(cells[f])) return report(cells[f].error);
+      if (text === "") {
+        if (field.required) report("is empty");
+        else data[field.key] = null;
+        return;
+      }
+      const checked = field.check(text);
+      if ("error" in checked) return report(checked.error);
+      const earlier = seen.get(field.key);
+      if (earlier) {
+        const key = String(checked.value);
+        if (earlier.has(key)) return report("is a duplicate", `first seen in ${earlier.get(key)}`);
+        earlier.set(key, cell);
+      }
+      data[field.key] = checked.value;
+    });
+    if (rowHasError) result.badRows.push(rowNumber);
+    else result.valid.push({ row: rowNumber, data });
+  }
+  if (!result.valid.length && !result.badRows.length) {
+    result.fileErrors.push("The file has no data rows.");
+  }
+  return result;
+}
+
+// Rows [14, 15, 16, 20] -> [{ from: 14, to: 16 }, { from: 20, to: 20 }]
+function rowRanges(rowNumbers) {
+  const ranges = [];
+  for (const n of rowNumbers) {
+    const last = ranges[ranges.length - 1];
+    if (last && n <= last.to) continue; // the same row twice
+    if (last && n === last.to + 1) last.to = n;
+    else ranges.push({ from: n, to: n });
+  }
+  return ranges;
+}
+
+// A cell value in quotes, line breaks and quotes escaped, cut at max characters.
+// Graphemes are what a reader sees as one character, so an emoji is never cut in half.
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+function quoteValue(text, max = 40) {
+  const chars = Array.from(graphemes.segment(text), (part) => part.segment);
+  const short = chars.length > max ? chars.slice(0, max - 1).join("") + "…" : text;
+  return JSON.stringify(short);
+}
+
+// One line per column and problem, in the order they appear in the file:
+// 'Signup date is not a real date: C3, C8 (2 cells; C3 is "2026-02-31")'
+function summarizeErrors(errors, { maxRanges = 4 } = {}) {
+  const groups = new Map();
+  // Sorted copy: errors you add after validateRows may come in any order.
+  const sorted = [...errors].sort((a, b) => a.row - b.row || a.column - b.column);
+  for (const e of sorted) {
+    const key = `${e.column} ${e.message}`;
+    // The group keeps the first error's fields: its cell is the example.
+    if (!groups.has(key)) groups.set(key, { ...e, rows: [] });
+    groups.get(key).rows.push(e.row);
+  }
+  return [...groups.values()]
+    .sort((a, b) => a.row - b.row || a.column - b.column)
+    .map((g) => {
+      const letter = columnLetter(g.column);
+      const ranges = rowRanges(g.rows);
+      const shown = ranges.slice(0, maxRanges);
+      const address = ({ from, to }) =>
+        from === to ? `${letter}${from}` : `${letter}${from}:${letter}${to}`;
+      let where = shown.map(address).join(", ");
+      const listed = shown.reduce((sum, { from, to }) => sum + to - from + 1, 0);
+      if (g.rows.length > listed) where += ` and ${g.rows.length - listed} more`;
+      const details = [];
+      if (g.rows.length > 1) details.push(`${g.rows.length} cells`);
+      if (g.value !== "") {
+        const example = g.rows.length > 1 ? `${g.cell} is ${quoteValue(g.value)}` : quoteValue(g.value);
+        details.push(g.note ? `${example}, ${g.note}` : example); // note: "first seen in B4"
+      }
+      const extra = details.length ? ` (${details.join("; ")})` : "";
+      return `${g.label} ${g.message}: ${where}${extra}`;
+    });
+}
+
+// What to do with a validation result. maxBadShare: above this share of bad rows,
+// the mapping or the file's format is more likely wrong than a few cells.
+function decideImport(result, { maxBadShare = 0.2 } = {}) {
+  if (result.fileErrors.length) return "reject";
+  if (!result.badRows.length) return "import";
+  if (!result.valid.length) return "fix-file"; // nothing to import
+  const share = result.badRows.length / (result.badRows.length + result.valid.length);
+  return share > maxBadShare ? "fix-file" : "ask";
+}
+
+// readCell, dateFormatKind and serialToISO come from our post on Excel dates.
+async function readRows(file, { maxCells = 2_000_000 } = {}) {
+  const workbook = XLSX.read(await file.arrayBuffer(), { cellNF: true, raw: true });
+  const date1904 = Boolean(workbook.Workbook?.WBProps?.date1904);
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const range = XLSX.utils.decode_range(sheet["!ref"] ?? "A1");
+  const cellCount = (range.e.r - range.s.r + 1) * (range.e.c - range.s.c + 1);
+  if (cellCount > maxCells) throw new Error(`The sheet's range ${sheet["!ref"]} is too large.`);
+  const rows = [];
+  for (let r = range.s.r; r <= range.e.r; r++) {
+    const row = [];
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const address = XLSX.utils.encode_cell({ r, c });
+      const cell = readCell(sheet[address], date1904, address);
+      // "C11: Excel error #N/A" -> { error: "could not be read (Excel error #N/A)" }
+      const why = cell.problem?.replace(/^\w+: /, "");
+      row.push(why ? { error: `could not be read (${why})` } : cell.value);
+    }
+    rows.push(row);
+  }
+  return { workbook, sheet, rows, origin: { row: range.s.r, col: range.s.c } };
+}
+
+// Adds each error as a comment on its cell, so the user can fix the file
+// in their spreadsheet app.
+function addErrorComments(sheet, errors, author = "Import check") {
+  for (const e of errors) {
+    // "z" is an empty cell, created when the bad cell is blank.
+    const cell = (sheet[e.cell] ??= { t: "z" });
+    const text = `${e.label} ${e.message}`;
+    cell.c ??= [];
+    // Calling this twice (two clicks on "Download") must not add the comment twice.
+    if (!cell.c.some((c) => c.a === author && c.t === text)) cell.c.push({ a: author, t: text });
+  }
+}
+
+// The lines contain text from the user's file: insert them as text, never as HTML.
+function showErrors(list, lines) {
+  list.replaceChildren(...lines.map((line) => {
+    const item = document.createElement("li");
+    item.textContent = line;
+    return item;
+  }));
+}
+
+async function checkImport(file) {
+  const { workbook, sheet, rows, origin } = await readRows(file);
+  // 0 is right only when the stored range starts at the header row;
+  // otherwise use the row your header detection found.
+  const headerIndex = 0;
+  // Or the results of your mapping step:
+  const columns = { name: 0, email: 1, signupDate: 2, seats: 3 };
+  const result = validateRows(rows, headerIndex, columns, FIELDS, { origin });
+
+  const lines = [...result.fileErrors, ...summarizeErrors(result.errors)];
+  if (result.moreErrors) {
+    const n = result.moreErrors;
+    lines.push(`${n} more ${n === 1 ? "problem is" : "problems are"} not listed or counted above.`);
+  }
+  showErrors(document.querySelector("#import-errors"), lines);
+
+  // Called when the user clicks "Download the file with comments".
+  const downloadWithComments = () => {
+    addErrorComments(sheet, result.errors);
+    XLSX.writeFile(workbook, "import-errors.xlsx");
+  };
+  const decision = decideImport(result);
+  return { decision, validRows: result.valid, downloadWithComments };
+}
+
+const ERR_ROWS = [
+  ["Name", "Email", "Signup date", "Seats"],
+  ["Yui Tanaka", "yui@example.jp", "2026-01-05", "3"],
+  ["Ken Mori", "ken@example", "2026-02-31", "2"],
+  ["", "ana@example.com", "2026-03-01", "0"],
+  ["Ana Silva", "Ana@Example.com", "31/03/2026", "1.5"],
+  [],
+  ["Lee Chen", "lee@example.com", "", ""],
+  ["Bo Berg", "bo@example.com", "2026-13-01", "12000"],
+  ["Cy Moss", "cy@example.com", "2026-1-01", "5"],
+];
+const ERR_COLUMNS = { name: 0, email: 1, signupDate: 2, seats: 3 };
+const ERR_SUMMARY_LINES = [
+  'Email is not an email address: B3 ("ken@example")',
+  'Signup date is not a real date: C3, C8 (2 cells; C3 is "2026-02-31")',
+  "Name is empty: A4",
+  'Seats must be between 1 and 10000: D4, D8 (2 cells; D4 is "0")',
+  'Email is a duplicate: B5 ("Ana@Example.com", first seen in B4)',
+  'Signup date is not a date in the form 2026-03-31: C5, C9 (2 cells; C5 is "31/03/2026")',
+  'Seats is not a whole number: D5 ("1.5")',
+];
+
+ok("err: checks accept good values and reject bad ones", () => {
+  assert.strictEqual(new Date(Date.UTC(2026, 1, 31)).toISOString().slice(0, 10), "2026-03-03"); // why isDate compares back
+  assert.deepStrictEqual(isEmail("Yui@Example.jp"), { value: "yui@example.jp" });
+  for (const bad of ["ken@example", "yui example.jp", "@example.com", "a b@example.com"]) assert("error" in isEmail(bad), bad);
+  assert.deepStrictEqual(isDate("2024-02-29"), { value: "2024-02-29" });
+  assert.deepStrictEqual(isDate("2026-02-29"), { error: "is not a real date" });
+  assert.deepStrictEqual(isDate("2026-02-31"), { error: "is not a real date" });
+  assert.deepStrictEqual(isDate("2026-13-01"), { error: "is not a real date" });
+  assert.deepStrictEqual(isDate("2026-00-10"), { error: "is not a real date" });
+  assert.deepStrictEqual(isDate("0026-01-01"), { error: "has a year before 1900" });
+  assert.deepStrictEqual(isDate("1900-01-01"), { value: "1900-01-01" });
+  assert.deepStrictEqual(isEmail("a@b..c"), { value: "a@b..c" }); // a shape check only
+  assert.deepStrictEqual(isEmail("\u200bken@example.com".trim()), { value: "\u200bken@example.com" }); // trim() keeps U+200B
+  assert.deepStrictEqual(isDate("2026-01-05T13:30:00"), { value: "2026-01-05" });
+  assert.deepStrictEqual(isDate("2026-02-31T10:00"), { error: "is not a real date" });
+  for (const bad of ["31/03/2026", "2026-1-01", "2026-01-05 10:00", "2026-01-05T", "20260105", "5 Jan 2026"]) assert.deepStrictEqual(isDate(bad), { error: "is not a date in the form 2026-03-31" }, bad);
+  const seats = isWholeNumber(1, 10000);
+  assert.deepStrictEqual(seats("3"), { value: 3 });
+  assert.deepStrictEqual(seats(String(0.1 * 3 * 10 - 1)), { error: "is not a whole number" }); // stored 2.0000000000000004
+  assert.strictEqual(String(0.1 * 3 * 10 - 1), "2.0000000000000004");
+  assert.deepStrictEqual(isDate(String(46027)), { error: "is not a date in the form 2026-03-31" });
+  assert.deepStrictEqual(seats("10000"), { value: 10000 });
+  assert.deepStrictEqual(seats("0"), { error: "must be between 1 and 10000" });
+  assert.deepStrictEqual(seats("-3"), { error: "must be between 1 and 10000" });
+  for (const bad of ["1.5", "1,000", "1e3", "three", "3 seats"]) assert.deepStrictEqual(seats(bad), { error: "is not a whole number" }, bad);
+});
+ok("err: columnLetter", () => {
+  assert.deepStrictEqual([0, 25, 26, 27, 51, 52, 701, 702, 16383].map(columnLetter), ["A", "Z", "AA", "AB", "AZ", "BA", "ZZ", "AAA", "XFD"]);
+});
+ok("err: validateRows on the example file", () => {
+  const r = validateRows(ERR_ROWS, 0, ERR_COLUMNS, FIELDS);
+  assert.deepStrictEqual(r.fileErrors, []);
+  assert.deepStrictEqual(r.errors.map((e) => e.cell), ["B3", "C3", "A4", "D4", "B5", "C5", "D5", "C8", "D8", "C9"]);
+  assert.deepStrictEqual(r.badRows, [3, 4, 5, 8, 9]);
+  assert.deepStrictEqual(r.valid, [
+    { row: 2, data: { name: "Yui Tanaka", email: "yui@example.jp", signupDate: "2026-01-05", seats: 3 } },
+    { row: 7, data: { name: "Lee Chen", email: "lee@example.com", signupDate: null, seats: null } },
+  ]);
+  assert.deepStrictEqual(r.errors[4], { cell: "B5", column: 1, row: 5, label: "Email", value: "Ana@Example.com", message: "is a duplicate", note: "first seen in B4" });
+  assert.deepStrictEqual(summarizeErrors(r.errors), ERR_SUMMARY_LINES);
+  assert.strictEqual(decideImport(r), "fix-file"); // 5 of 7 rows are bad
+});
+ok("err: addresses follow the sheet, not the array", () => {
+  // The same table stored from B3: rows[0][0] is cell B3.
+  const r = validateRows(ERR_ROWS, 0, ERR_COLUMNS, FIELDS, { origin: { row: 2, col: 1 } });
+  assert.deepStrictEqual(r.errors.slice(0, 3).map((e) => e.cell), ["C5", "D5", "B6"]);
+  assert.deepStrictEqual(r.valid.map((v) => v.row), [4, 9]);
+  // A title row above the header: header index 2, data from row 4.
+  const titled = [["Customer export"], [], ...ERR_ROWS.slice(0, 3)];
+  assert.deepStrictEqual(validateRows(titled, 2, ERR_COLUMNS, FIELDS).errors.map((e) => e.cell), ["B5", "C5"]);
+  // Columns in another order, with an unmapped column in between.
+  const moved = [["Seats", "Notes", "Email", "Name"], ["0", "<b>vip</b>", "x", "Yui"]];
+  const m = validateRows(moved, 0, { seats: 0, email: 2, name: 3 }, FIELDS);
+  assert.deepStrictEqual(m.errors.map((e) => e.cell), ["C2", "A2"]);
+});
+ok("err: file-level errors stop row checks", () => {
+  const r = validateRows(ERR_ROWS, 0, { name: 0, seats: 3 }, FIELDS);
+  assert.deepStrictEqual(r.fileErrors, ['No column for the required field "Email".']);
+  assert.deepStrictEqual([r.errors.length, r.valid.length], [0, 0]);
+  assert.strictEqual(decideImport(r), "reject");
+  const empty = validateRows([ERR_ROWS[0], [], ["", " ", null]], 0, ERR_COLUMNS, FIELDS);
+  assert.deepStrictEqual(empty.fileErrors, ["The file has no data rows."]);
+  assert.strictEqual(decideImport(empty), "reject");
+  assert.deepStrictEqual(validateRows([ERR_ROWS[0]], 0, ERR_COLUMNS, FIELDS).fileErrors, ["The file has no data rows."]);
+  // Optional fields may be left unmapped.
+  const r2 = validateRows([["Name", "Email"], ["Yui", "yui@example.jp"]], 0, { name: 0, email: 1 }, FIELDS);
+  assert.deepStrictEqual(r2.valid, [{ row: 2, data: { name: "Yui", email: "yui@example.jp" } }]);
+  assert.strictEqual(decideImport(r2), "import");
+});
+ok("err: blank cells, spaces, numbers and rejected cells", () => {
+  const rows = [ERR_ROWS[0],
+    ["  Yui  ", "\u00a0yui@example.jp ", 46027, 3],
+    ["Ken", "ken@example.com", { error: "could not be read (Excel error #N/A)" }, 2.5],
+    ["", "", "", "4"],
+    [null, undefined],
+    ["Ana", "ana@example.com", "2026-03-01", 1e21]];
+  const r = validateRows(rows, 0, ERR_COLUMNS, FIELDS);
+  assert.deepStrictEqual(r.valid, []);
+  assert.deepStrictEqual(r.errors.map((e) => `${e.cell} ${e.message}`), [
+    "C2 is not a date in the form 2026-03-31", "C3 could not be read (Excel error #N/A)", "D3 is not a whole number",
+    "A4 is empty", "B4 is empty", "D6 is not a whole number"]);
+  assert.strictEqual(r.errors[0].value, "46027");
+  const ok1 = validateRows([ERR_ROWS[0], ["  Yui  ", "\u00a0yui@example.jp ", "2026-01-05", 3]], 0, ERR_COLUMNS, FIELDS);
+  assert.deepStrictEqual(ok1.valid[0].data, { name: "Yui", email: "yui@example.jp", signupDate: "2026-01-05", seats: 3 });
+});
+ok("err: duplicates and the error limit", () => {
+  const rows = [["Name", "Email"], ...Array.from({ length: 6 }, (_, i) => [`P${i}`, "same@example.com"])];
+  const r = validateRows(rows, 0, { name: 0, email: 1 }, FIELDS, { maxErrors: 3 });
+  assert.deepStrictEqual(r.errors.map((e) => `${e.cell} ${e.message}`), ["B3 is a duplicate", "B4 is a duplicate", "B5 is a duplicate"]);
+  assert.strictEqual(r.moreErrors, 2);
+  assert.deepStrictEqual(r.badRows, [3, 4, 5, 6, 7]);
+  assert.deepStrictEqual(summarizeErrors(r.errors), ["Email is a duplicate: B3:B5 (3 cells; B3 is \"same@example.com\", first seen in B2)"]);
+  assert.strictEqual(decideImport(r), "fix-file");
+});
+ok("err: summary ranges, limits and quoting", () => {
+  assert.deepStrictEqual(rowRanges([14, 15, 16, 20, 22, 23]), [{ from: 14, to: 16 }, { from: 20, to: 20 }, { from: 22, to: 23 }]);
+  const many = [2, 3, 5, 7, 9, 11, 12].map((row) => ({ cell: "AB" + row, column: 27, row, label: "Seats", value: "x", message: "is not a whole number" }));
+  assert.deepStrictEqual(summarizeErrors(many), ['Seats is not a whole number: AB2:AB3, AB5, AB7, AB9 and 2 more (7 cells; AB2 is "x")']);
+  assert.deepStrictEqual(summarizeErrors(many, { maxRanges: 10 }), ['Seats is not a whole number: AB2:AB3, AB5, AB7, AB9, AB11:AB12 (7 cells; AB2 is "x")']);
+  assert.deepStrictEqual(summarizeErrors([]), []);
+  assert.strictEqual(quoteValue('say "hi"\nnow'), '"say \\"hi\\"\\nnow"');
+  assert.strictEqual(quoteValue("x".repeat(45)), JSON.stringify("x".repeat(39) + "…"));
+  assert.strictEqual(quoteValue("\u{1F600}".repeat(41)), JSON.stringify("\u{1F600}".repeat(39) + "…"));
+  const family = "\u{1F468}\u200d\u{1F469}\u200d\u{1F467}";
+  assert.strictEqual(quoteValue("x".repeat(38) + family + "yz"), JSON.stringify("x".repeat(38) + family + "\u2026"));
+  // Errors added out of order (for example by your own cross-row checks) are sorted first.
+  const late = [9, 3, 4].map((row) => ({ cell: "C" + row, column: 2, row, label: "End", value: String(row), message: "is before Start" }));
+  assert.deepStrictEqual(summarizeErrors(late), ['End is before Start: C3:C4, C9 (3 cells; C3 is "3")']);
+  assert.deepStrictEqual(rowRanges([2, 2, 3]), [{ from: 2, to: 3 }]);
+  // Duplicates of different first cells share one line.
+  const dups = [["Name", "Email"], ["A", "a@x.io"], ["B", "b@x.io"], ["C", "a@x.io"], ["D", "b@x.io"]];
+  assert.deepStrictEqual(summarizeErrors(validateRows(dups, 0, { name: 0, email: 1 }, FIELDS).errors),
+    ['Email is a duplicate: B4:B5 (2 cells; B4 is "a@x.io", first seen in B2)']);
+  // Same problem in two columns: two lines, ordered by first row, then by column.
+  const two = [
+    { cell: "D2", column: 3, row: 2, label: "Seats", value: "", message: "is empty" },
+    { cell: "A2", column: 0, row: 2, label: "Name", value: "", message: "is empty" },
+    { cell: "A9", column: 0, row: 9, label: "Name", value: "", message: "is empty" },
+  ];
+  assert.deepStrictEqual(summarizeErrors(two), ["Name is empty: A2, A9 (2 cells)", "Seats is empty: D2"]);
+});
+ok("err: decideImport thresholds", () => {
+  const res = (bad, good) => ({ fileErrors: [], badRows: Array(bad).fill(1), valid: Array(good).fill({}) });
+  assert.strictEqual(decideImport(res(0, 10)), "import");
+  assert.strictEqual(decideImport(res(2, 8)), "ask");
+  assert.strictEqual(decideImport(res(3, 7)), "fix-file");
+  assert.strictEqual(decideImport(res(3, 7), { maxBadShare: 0.5 }), "ask");
+  assert.strictEqual(decideImport(res(1, 0)), "fix-file");
+  assert.strictEqual(decideImport(res(1, 0), { maxBadShare: 1 }), "fix-file");
+});
+const errWorkbook = () => {
+  // Data stored from B3, as in an export with a title above it; dates as serial numbers.
+  const sheet = {
+    "!ref": "B3:E7",
+    B3: { t: "s", v: "Name" }, C3: { t: "s", v: "Email" }, D3: { t: "s", v: "Signup date" }, E3: { t: "s", v: "Seats" },
+    B4: { t: "s", v: "Yui Tanaka" }, C4: { t: "s", v: "yui@example.jp" }, D4: { t: "n", v: 46027, z: "dd/mm/yyyy" }, E4: { t: "n", v: 3, z: "0" },
+    C5: { t: "s", v: "ken@example" }, D5: { t: "n", v: 60, z: "m/d/yy" }, E5: { t: "e", v: 42, w: "#N/A" },
+    B6: { t: "s", v: "Ana Silva" }, C6: { t: "s", v: "ana@example.com" }, D6: { t: "s", v: "05.01.2026" }, E6: { t: "n", v: 1000, z: "#,##0" },
+    B7: { t: "s", v: "Bo Berg" }, C7: { t: "s", v: "bo@example.com", c: [{ a: "Bo", t: "check this" }] }, E7: { t: "n", v: 2 },
+  };
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, sheet, "Customers");
+  return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+};
+const errFile = (buf) => ({ arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) });
+ok("err: readRows gives values and the sheet origin", async () => {
+  const { rows, origin } = await readRows(errFile(errWorkbook()));
+  assert.deepStrictEqual(origin, { row: 2, col: 1 });
+  assert.deepStrictEqual(rows[1], ["Yui Tanaka", "yui@example.jp", "2026-01-05", 3]);
+  assert.deepStrictEqual(rows[2], [null, "ken@example", { error: "could not be read (1900-02-29 does not exist (Excel's 1900 leap-year bug))" }, { error: "could not be read (Excel error #N/A)" }]);
+  const r = validateRows(rows, 0, ERR_COLUMNS, FIELDS, { origin });
+  assert.deepStrictEqual(r.errors.map((e) => `${e.cell} ${e.message}`), [
+    "B5 is empty", "C5 is not an email address", "D5 could not be read (1900-02-29 does not exist (Excel's 1900 leap-year bug))",
+    "E5 could not be read (Excel error #N/A)", "D6 is not a date in the form 2026-03-31"]);
+  assert.deepStrictEqual(r.valid, [
+    { row: 4, data: { name: "Yui Tanaka", email: "yui@example.jp", signupDate: "2026-01-05", seats: 3 } },
+    { row: 7, data: { name: "Bo Berg", email: "bo@example.com", signupDate: null, seats: 2 } },
+  ]);
+  await assert.rejects(readRows(errFile(errWorkbook()), { maxCells: 19 }), /range B3:E7 is too large/);
+  assert.strictEqual((await readRows(errFile(errWorkbook()), { maxCells: 20 })).rows.length, 5);
+  // A CSV file: every cell stays text, the origin is A1.
+  const csv = await readRows(errFile(Buffer.from("Name,Email,Signup date,Seats\nYui,yui@example.jp,03/04/2026,007\n")));
+  assert.deepStrictEqual(csv.origin, { row: 0, col: 0 });
+  assert.deepStrictEqual(csv.rows[1], ["Yui", "yui@example.jp", "03/04/2026", "007"]);
+  // A line break inside a quoted CSV cell does not shift the row numbers.
+  const quoted = await readRows(errFile(Buffer.from('Name,Email\n"Yui\nTanaka",yui@example.jp\nKen,bad\n')));
+  assert.deepStrictEqual(validateRows(quoted.rows, 0, { name: 0, email: 1 }, FIELDS, { origin: quoted.origin }).errors.map((e) => e.cell), ["B3"]);
+});
+ok("err: merged cells leave the other rows empty", async () => {
+  const sheet = XLSX.utils.aoa_to_sheet([["Name", "Email"], ["Yui", "a@x.io"], ["", "b@x.io"], ["", "c@x.io"]]);
+  sheet["!merges"] = [XLSX.utils.decode_range("A2:A4")];
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, sheet, "S");
+  const { rows, origin } = await readRows(errFile(XLSX.write(wb, { type: "buffer", bookType: "xlsx" })));
+  assert.deepStrictEqual(validateRows(rows, 0, { name: 0, email: 1 }, FIELDS, { origin }).errors.map((e) => `${e.cell} ${e.message}`), ["A3 is empty", "A4 is empty"]);
+});
+ok("err: comments survive a download and keep the file's values", async () => {
+  const { workbook, sheet, rows, origin } = await readRows(errFile(errWorkbook()));
+  const r = validateRows(rows, 0, ERR_COLUMNS, FIELDS, { origin });
+  addErrorComments(sheet, [...r.errors, { cell: "C7", label: "Email", message: "is a test" }]);
+  addErrorComments(sheet, r.errors); // a second click on Download
+  assert.strictEqual(sheet.C5.c.length, 1);
+  const back = XLSX.read(XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }), { cellNF: true }).Sheets.Customers;
+  const comments = (a) => (back[a]?.c ?? []).map((c) => `${c.a}: ${c.t}`);
+  const commentText = (a) => (back[a]?.c ?? []).map((c) => c.t).join(" | ");
+  assert.deepStrictEqual(comments("B5"), ["Import check: Name is empty"]); // created for the comment
+  assert.deepStrictEqual(comments("C5"), ["Import check: Email is not an email address"]);
+  assert.deepStrictEqual(comments("E5"), ["Import check: Seats could not be read (Excel error #N/A)"]);
+  // The user's own comment is kept; how two comments on one cell are stored depends on the SheetJS version.
+  assert(commentText("C7").includes("check this") && commentText("C7").includes("Email is a test"), commentText("C7"));
+  assert.deepStrictEqual(comments("B4"), []);
+  assert.deepStrictEqual([back.D4.v, back.D4.z, back.E6.v, back.E6.z, back.C5.v, back.E5.w], [46027, "dd/mm/yyyy", 1000, "#,##0", "ken@example", "#N/A"]);
+  assert.strictEqual(back["!ref"], "B3:E7");
+});
+ok("err: checkImport wires it together", async () => {
+  const shown = [];
+  const saved = [];
+  const realWrite = XLSX.writeFile;
+  globalThis.document = {
+    querySelector: (sel) => ({ replaceChildren: (...items) => shown.push(sel, ...items.map((i) => i.textContent)) }),
+    createElement: () => ({}),
+  };
+  XLSX.writeFile = (wb, name) => saved.push([name, wb.Sheets[wb.SheetNames[0]].C5.c[0].t]);
+  try {
+    const out = await checkImport(errFile(errWorkbook()));
+    assert.strictEqual(shown[0], "#import-errors");
+    assert.deepStrictEqual(shown.slice(1), [
+      "Name is empty: B5", 'Email is not an email address: C5 ("ken@example")',
+      "Signup date could not be read (1900-02-29 does not exist (Excel's 1900 leap-year bug)): D5",
+      "Seats could not be read (Excel error #N/A): E5", 'Signup date is not a date in the form 2026-03-31: D6 ("05.01.2026")']);
+    assert.strictEqual(out.decision, "fix-file"); // 2 of 4 rows are bad
+    assert.deepStrictEqual(out.validRows.map((v) => v.row), [4, 7]);
+    assert.deepStrictEqual(saved, []);
+    out.downloadWithComments();
+    assert.deepStrictEqual(saved, [["import-errors.xlsx", "Email is not an email address"]]);
+  } finally {
+    XLSX.writeFile = realWrite;
+    delete globalThis.document;
+  }
+});
+ok("err: showErrors inserts text, innerHTML would run it (Chromium)", async () => {
+  const { chromium } = require("playwright");
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage();
+    await page.setContent("<ul id=a></ul><ul id=b></ul>");
+    const line = 'Name is empty: A4 ("<img src=x onerror=window.ran=1>")';
+    const result = await page.evaluate(([code, text]) => {
+      eval(code + "; window.showErrors = showErrors;");
+      window.showErrors(document.querySelector("#a"), [text]);
+      return { text: document.querySelector("#a li").textContent, images: document.querySelectorAll("#a img").length };
+    }, ["// The lines contain text from the user's file: insert them as text, never as HTML.\nfunction showErrors(list, lines) {\n  list.replaceChildren(...lines.map((line) => {\n    const item = document.createElement(\"li\");\n    item.textContent = line;\n    return item;\n  }));\n}", line]);
+    assert.deepStrictEqual(result, { text: line, images: 0 });
+    await page.evaluate((text) => { document.querySelector("#b").innerHTML = "<li>" + text + "</li>"; }, line);
+    await page.waitForFunction(() => window.ran === 1, null, { timeout: 2000 });
+    assert.strictEqual(await page.evaluate(() => window.ran), 1);
+  } finally {
+    await browser.close();
+  }
+});
+{
+const simpleReadCell = (() => {
+// Only if you do not need Excel dates converted: dates stay serial numbers.
+function readCell(cell, date1904, address) {
+  if (!cell || cell.t === "z") return { value: null };
+  if (cell.t === "e") return { value: null, problem: `${address}: Excel error ${cell.w ?? ""}`.trim() };
+  return { value: cell.v };
+}
+return readCell;
+})();
+ok("err: the simple readCell", async () => {
+  const readCell = simpleReadCell;
+  const sheet = { "!ref": "A1:C1", A1: { t: "n", v: 46027, z: "yyyy-mm-dd" }, B1: { t: "e", v: 42, w: "#N/A" } };
+  assert.deepStrictEqual(readCell(sheet.A1, false, "A1"), { value: 46027 });
+  assert.deepStrictEqual(readCell(sheet.B1, false, "B1"), { value: null, problem: "B1: Excel error #N/A" });
+  assert.deepStrictEqual(readCell(undefined, false, "C1"), { value: null });
+});
+}
+ok("err: no invisible characters in the snippets", () => {
+  for (const code of ["// Only if you do not need Excel dates converted: dates stay serial numbers.\nfunction readCell(cell, date1904, address) {\n  if (!cell || cell.t === \"z\") return { value: null };\n  if (cell.t === \"e\") return { value: null, problem: `${address}: Excel error ${cell.w ?? \"\"}`.trim() };\n  return { value: cell.v };\n}", "// Each check gets the trimmed cell text and returns { value } or { error }.\n// An error says what is wrong and what the cell should contain.\nconst isEmail = (text) =>\n  /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(text)\n    ? { value: text.toLowerCase() }\n    : { error: \"is not an email address\" };\n\n// A time part (2026-01-05T13:30:00, as Excel date-time cells are read in step 4) is dropped.\nconst isDate = (text) => {\n  const m = /^(\\d{4})-(\\d{2})-(\\d{2})(T\\d{2}:\\d{2}(:\\d{2})?)?$/.exec(text);\n  if (!m) return { error: \"is not a date in the form 2026-03-31\" };\n  const [year, month, day] = [+m[1], +m[2], +m[3]];\n  if (year < 1900) return { error: \"has a year before 1900\" }; // pick your own limit\n  const date = new Date(Date.UTC(year, month - 1, day));\n  // Date.UTC rolls 2026-02-31 over to March 3, so compare the parts back.\n  const same = date.getUTCFullYear() === year && date.getUTCMonth() === month - 1\n    && date.getUTCDate() === day;\n  if (!same) return { error: \"is not a real date\" };\n  return { value: text.slice(0, 10) };\n};\n\nconst isWholeNumber = (min, max) => (text) => {\n  if (!/^-?\\d+$/.test(text)) return { error: \"is not a whole number\" };\n  const n = Number(text);\n  if (n < min || n > max) return { error: `must be between ${min} and ${max}` };\n  return { value: n };\n};\n\nconst FIELDS = [\n  { key: \"name\", label: \"Name\", required: true, check: (text) => ({ value: text }) },\n  { key: \"email\", label: \"Email\", required: true, unique: true, check: isEmail },\n  { key: \"signupDate\", label: \"Signup date\", check: isDate },\n  { key: \"seats\", label: \"Seats\", check: isWholeNumber(1, 10000) },\n];", "// 0 -> \"A\", 25 -> \"Z\", 26 -> \"AA\"\nconst columnLetter = (i) =>\n  (i >= 26 ? columnLetter(Math.floor(i / 26) - 1) : \"\")\n  + String.fromCharCode(65 + (i % 26));\n\n// A cell your reader already rejected arrives as { error: \"...\" }.\nconst isRejected = (cell) => typeof cell === \"object\" && cell !== null && \"error\" in cell;\n\n// rows: arrays of cells from your parser. headerIndex: the header row in rows.\n// columns: { fieldKey: column index in rows }, from your mapping step.\n// origin: where rows[0][0] sits in the sheet, 0-based ({ row: 0, col: 0 } for a CSV).\nfunction validateRows(rows, headerIndex, columns, fields, options = {}) {\n  const { origin = { row: 0, col: 0 }, maxErrors = 1000 } = options;\n  const result = { fileErrors: [], errors: [], moreErrors: 0, valid: [], badRows: [] };\n  for (const field of fields) {\n    if (field.required && columns[field.key] === undefined) {\n      result.fileErrors.push(`No column for the required field \"${field.label}\".`);\n    }\n  }\n  if (result.fileErrors.length) return result;\n\n  const mapped = fields.filter((f) => columns[f.key] !== undefined);\n  const seen = new Map(mapped.filter((f) => f.unique).map((f) => [f.key, new Map()]));\n  for (let i = headerIndex + 1; i < rows.length; i++) {\n    const row = rows[i] ?? [];\n    const cells = mapped.map((f) => row[columns[f.key]]);\n    const texts = cells.map((c) => (isRejected(c) ? \"\" : String(c ?? \"\").trim()));\n    if (texts.every((t, f) => t === \"\" && !isRejected(cells[f]))) continue; // a blank row\n\n    const rowNumber = origin.row + i + 1; // the row number a spreadsheet app shows\n    const data = {};\n    let rowHasError = false;\n    mapped.forEach((field, f) => {\n      const column = origin.col + columns[field.key];\n      const cell = columnLetter(column) + rowNumber;\n      const text = texts[f];\n      const report = (message, note) => {\n        rowHasError = true;\n        if (result.errors.length < maxErrors) {\n          const { label } = field;\n          result.errors.push({ cell, column, row: rowNumber, label, value: text, message, note });\n        } else {\n          result.moreErrors++;\n        }\n      };\n      if (isRejected(cells[f])) return report(cells[f].error);\n      if (text === \"\") {\n        if (field.required) report(\"is empty\");\n        else data[field.key] = null;\n        return;\n      }\n      const checked = field.check(text);\n      if (\"error\" in checked) return report(checked.error);\n      const earlier = seen.get(field.key);\n      if (earlier) {\n        const key = String(checked.value);\n        if (earlier.has(key)) return report(\"is a duplicate\", `first seen in ${earlier.get(key)}`);\n        earlier.set(key, cell);\n      }\n      data[field.key] = checked.value;\n    });\n    if (rowHasError) result.badRows.push(rowNumber);\n    else result.valid.push({ row: rowNumber, data });\n  }\n  if (!result.valid.length && !result.badRows.length) {\n    result.fileErrors.push(\"The file has no data rows.\");\n  }\n  return result;\n}", "// Rows [14, 15, 16, 20] -> [{ from: 14, to: 16 }, { from: 20, to: 20 }]\nfunction rowRanges(rowNumbers) {\n  const ranges = [];\n  for (const n of rowNumbers) {\n    const last = ranges[ranges.length - 1];\n    if (last && n <= last.to) continue; // the same row twice\n    if (last && n === last.to + 1) last.to = n;\n    else ranges.push({ from: n, to: n });\n  }\n  return ranges;\n}\n\n// A cell value in quotes, line breaks and quotes escaped, cut at max characters.\n// Graphemes are what a reader sees as one character, so an emoji is never cut in half.\nconst graphemes = new Intl.Segmenter(undefined, { granularity: \"grapheme\" });\nfunction quoteValue(text, max = 40) {\n  const chars = Array.from(graphemes.segment(text), (part) => part.segment);\n  const short = chars.length > max ? chars.slice(0, max - 1).join(\"\") + \"\u2026\" : text;\n  return JSON.stringify(short);\n}\n\n// One line per column and problem, in the order they appear in the file:\n// 'Signup date is not a real date: C3, C8 (2 cells; C3 is \"2026-02-31\")'\nfunction summarizeErrors(errors, { maxRanges = 4 } = {}) {\n  const groups = new Map();\n  // Sorted copy: errors you add after validateRows may come in any order.\n  const sorted = [...errors].sort((a, b) => a.row - b.row || a.column - b.column);\n  for (const e of sorted) {\n    const key = `${e.column} ${e.message}`;\n    // The group keeps the first error's fields: its cell is the example.\n    if (!groups.has(key)) groups.set(key, { ...e, rows: [] });\n    groups.get(key).rows.push(e.row);\n  }\n  return [...groups.values()]\n    .sort((a, b) => a.row - b.row || a.column - b.column)\n    .map((g) => {\n      const letter = columnLetter(g.column);\n      const ranges = rowRanges(g.rows);\n      const shown = ranges.slice(0, maxRanges);\n      const address = ({ from, to }) =>\n        from === to ? `${letter}${from}` : `${letter}${from}:${letter}${to}`;\n      let where = shown.map(address).join(\", \");\n      const listed = shown.reduce((sum, { from, to }) => sum + to - from + 1, 0);\n      if (g.rows.length > listed) where += ` and ${g.rows.length - listed} more`;\n      const details = [];\n      if (g.rows.length > 1) details.push(`${g.rows.length} cells`);\n      if (g.value !== \"\") {\n        const example = g.rows.length > 1 ? `${g.cell} is ${quoteValue(g.value)}` : quoteValue(g.value);\n        details.push(g.note ? `${example}, ${g.note}` : example); // note: \"first seen in B4\"\n      }\n      const extra = details.length ? ` (${details.join(\"; \")})` : \"\";\n      return `${g.label} ${g.message}: ${where}${extra}`;\n    });\n}", "// What to do with a validation result. maxBadShare: above this share of bad rows,\n// the mapping or the file's format is more likely wrong than a few cells.\nfunction decideImport(result, { maxBadShare = 0.2 } = {}) {\n  if (result.fileErrors.length) return \"reject\";\n  if (!result.badRows.length) return \"import\";\n  if (!result.valid.length) return \"fix-file\"; // nothing to import\n  const share = result.badRows.length / (result.badRows.length + result.valid.length);\n  return share > maxBadShare ? \"fix-file\" : \"ask\";\n}", "// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz\nimport * as XLSX from \"xlsx\";\n// readCell, dateFormatKind and serialToISO come from our post on Excel dates.\nasync function readRows(file, { maxCells = 2_000_000 } = {}) {\n  const workbook = XLSX.read(await file.arrayBuffer(), { cellNF: true, raw: true });\n  const date1904 = Boolean(workbook.Workbook?.WBProps?.date1904);\n  const sheet = workbook.Sheets[workbook.SheetNames[0]];\n  const range = XLSX.utils.decode_range(sheet[\"!ref\"] ?? \"A1\");\n  const cellCount = (range.e.r - range.s.r + 1) * (range.e.c - range.s.c + 1);\n  if (cellCount > maxCells) throw new Error(`The sheet's range ${sheet[\"!ref\"]} is too large.`);\n  const rows = [];\n  for (let r = range.s.r; r <= range.e.r; r++) {\n    const row = [];\n    for (let c = range.s.c; c <= range.e.c; c++) {\n      const address = XLSX.utils.encode_cell({ r, c });\n      const cell = readCell(sheet[address], date1904, address);\n      // \"C11: Excel error #N/A\" -> { error: \"could not be read (Excel error #N/A)\" }\n      const why = cell.problem?.replace(/^\\w+: /, \"\");\n      row.push(why ? { error: `could not be read (${why})` } : cell.value);\n    }\n    rows.push(row);\n  }\n  return { workbook, sheet, rows, origin: { row: range.s.r, col: range.s.c } };\n}", "// Adds each error as a comment on its cell, so the user can fix the file\n// in their spreadsheet app.\nfunction addErrorComments(sheet, errors, author = \"Import check\") {\n  for (const e of errors) {\n    // \"z\" is an empty cell, created when the bad cell is blank.\n    const cell = (sheet[e.cell] ??= { t: \"z\" });\n    const text = `${e.label} ${e.message}`;\n    cell.c ??= [];\n    // Calling this twice (two clicks on \"Download\") must not add the comment twice.\n    if (!cell.c.some((c) => c.a === author && c.t === text)) cell.c.push({ a: author, t: text });\n  }\n}", "// The lines contain text from the user's file: insert them as text, never as HTML.\nfunction showErrors(list, lines) {\n  list.replaceChildren(...lines.map((line) => {\n    const item = document.createElement(\"li\");\n    item.textContent = line;\n    return item;\n  }));\n}", "async function checkImport(file) {\n  const { workbook, sheet, rows, origin } = await readRows(file);\n  // 0 is right only when the stored range starts at the header row;\n  // otherwise use the row your header detection found.\n  const headerIndex = 0;\n  // Or the results of your mapping step:\n  const columns = { name: 0, email: 1, signupDate: 2, seats: 3 };\n  const result = validateRows(rows, headerIndex, columns, FIELDS, { origin });\n\n  const lines = [...result.fileErrors, ...summarizeErrors(result.errors)];\n  if (result.moreErrors) {\n    const n = result.moreErrors;\n    lines.push(`${n} more ${n === 1 ? \"problem is\" : \"problems are\"} not listed or counted above.`);\n  }\n  showErrors(document.querySelector(\"#import-errors\"), lines);\n\n  // Called when the user clicks \"Download the file with comments\".\n  const downloadWithComments = () => {\n    addErrorComments(sheet, result.errors);\n    XLSX.writeFile(workbook, \"import-errors.xlsx\");\n  };\n  const decision = decideImport(result);\n  return { decision, validRows: result.valid, downloadWithComments };\n}"]) assert(!/[\u00a0\u200b-\u200f\u2028\u2029\ufeff]/.test(code));
+});
+}

@@ -903,4 +903,311 @@ MAP_TESTS = MAP_TESTS.replace("%%MAP_PROBLEM_JSON%%", _json.dumps(MAP_PROBLEM))
 MAP_TESTS = MAP_TESTS.replace("%%MAP_TABLE_JSON%%", _json.dumps(MAP_TABLE, ensure_ascii=False))
 MAP_TESTS = MAP_TESTS.replace("%%MAP_ALL_JSON%%", _json.dumps([globals()[k] for k in _map_names + ["MAP_PROBLEM"]]))
 out += MAP_TESTS
+
+# --- blog/show-import-errors-by-cell-javascript ---
+_err_read_cjs = ERR_READ.replace('// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz\nimport * as XLSX from "xlsx";\n', '')
+ERR_TESTS = r"""
+// --- blog/show-import-errors-by-cell-javascript ---
+{
+%%ERR_CHECKS%%
+
+%%ERR_VALIDATE%%
+
+%%ERR_SUMMARY%%
+
+%%ERR_DECIDE%%
+
+%%ERR_READ%%
+
+%%ERR_COMMENTS%%
+
+%%ERR_SHOW%%
+
+%%ERR_USE%%
+
+const ERR_ROWS = [
+  ["Name", "Email", "Signup date", "Seats"],
+  ["Yui Tanaka", "yui@example.jp", "2026-01-05", "3"],
+  ["Ken Mori", "ken@example", "2026-02-31", "2"],
+  ["", "ana@example.com", "2026-03-01", "0"],
+  ["Ana Silva", "Ana@Example.com", "31/03/2026", "1.5"],
+  [],
+  ["Lee Chen", "lee@example.com", "", ""],
+  ["Bo Berg", "bo@example.com", "2026-13-01", "12000"],
+  ["Cy Moss", "cy@example.com", "2026-1-01", "5"],
+];
+const ERR_COLUMNS = { name: 0, email: 1, signupDate: 2, seats: 3 };
+const ERR_SUMMARY_LINES = [
+  'Email is not an email address: B3 ("ken@example")',
+  'Signup date is not a real date: C3, C8 (2 cells; C3 is "2026-02-31")',
+  "Name is empty: A4",
+  'Seats must be between 1 and 10000: D4, D8 (2 cells; D4 is "0")',
+  'Email is a duplicate: B5 ("Ana@Example.com", first seen in B4)',
+  'Signup date is not a date in the form 2026-03-31: C5, C9 (2 cells; C5 is "31/03/2026")',
+  'Seats is not a whole number: D5 ("1.5")',
+];
+
+ok("err: checks accept good values and reject bad ones", () => {
+  assert.strictEqual(new Date(Date.UTC(2026, 1, 31)).toISOString().slice(0, 10), "2026-03-03"); // why isDate compares back
+  assert.deepStrictEqual(isEmail("Yui@Example.jp"), { value: "yui@example.jp" });
+  for (const bad of ["ken@example", "yui example.jp", "@example.com", "a b@example.com"]) assert("error" in isEmail(bad), bad);
+  assert.deepStrictEqual(isDate("2024-02-29"), { value: "2024-02-29" });
+  assert.deepStrictEqual(isDate("2026-02-29"), { error: "is not a real date" });
+  assert.deepStrictEqual(isDate("2026-02-31"), { error: "is not a real date" });
+  assert.deepStrictEqual(isDate("2026-13-01"), { error: "is not a real date" });
+  assert.deepStrictEqual(isDate("2026-00-10"), { error: "is not a real date" });
+  assert.deepStrictEqual(isDate("0026-01-01"), { error: "has a year before 1900" });
+  assert.deepStrictEqual(isDate("1900-01-01"), { value: "1900-01-01" });
+  assert.deepStrictEqual(isEmail("a@b..c"), { value: "a@b..c" }); // a shape check only
+  assert.deepStrictEqual(isEmail("\u200bken@example.com".trim()), { value: "\u200bken@example.com" }); // trim() keeps U+200B
+  assert.deepStrictEqual(isDate("2026-01-05T13:30:00"), { value: "2026-01-05" });
+  assert.deepStrictEqual(isDate("2026-02-31T10:00"), { error: "is not a real date" });
+  for (const bad of ["31/03/2026", "2026-1-01", "2026-01-05 10:00", "2026-01-05T", "20260105", "5 Jan 2026"]) assert.deepStrictEqual(isDate(bad), { error: "is not a date in the form 2026-03-31" }, bad);
+  const seats = isWholeNumber(1, 10000);
+  assert.deepStrictEqual(seats("3"), { value: 3 });
+  assert.deepStrictEqual(seats(String(0.1 * 3 * 10 - 1)), { error: "is not a whole number" }); // stored 2.0000000000000004
+  assert.strictEqual(String(0.1 * 3 * 10 - 1), "2.0000000000000004");
+  assert.deepStrictEqual(isDate(String(46027)), { error: "is not a date in the form 2026-03-31" });
+  assert.deepStrictEqual(seats("10000"), { value: 10000 });
+  assert.deepStrictEqual(seats("0"), { error: "must be between 1 and 10000" });
+  assert.deepStrictEqual(seats("-3"), { error: "must be between 1 and 10000" });
+  for (const bad of ["1.5", "1,000", "1e3", "three", "3 seats"]) assert.deepStrictEqual(seats(bad), { error: "is not a whole number" }, bad);
+});
+ok("err: columnLetter", () => {
+  assert.deepStrictEqual([0, 25, 26, 27, 51, 52, 701, 702, 16383].map(columnLetter), ["A", "Z", "AA", "AB", "AZ", "BA", "ZZ", "AAA", "XFD"]);
+});
+ok("err: validateRows on the example file", () => {
+  const r = validateRows(ERR_ROWS, 0, ERR_COLUMNS, FIELDS);
+  assert.deepStrictEqual(r.fileErrors, []);
+  assert.deepStrictEqual(r.errors.map((e) => e.cell), ["B3", "C3", "A4", "D4", "B5", "C5", "D5", "C8", "D8", "C9"]);
+  assert.deepStrictEqual(r.badRows, [3, 4, 5, 8, 9]);
+  assert.deepStrictEqual(r.valid, [
+    { row: 2, data: { name: "Yui Tanaka", email: "yui@example.jp", signupDate: "2026-01-05", seats: 3 } },
+    { row: 7, data: { name: "Lee Chen", email: "lee@example.com", signupDate: null, seats: null } },
+  ]);
+  assert.deepStrictEqual(r.errors[4], { cell: "B5", column: 1, row: 5, label: "Email", value: "Ana@Example.com", message: "is a duplicate", note: "first seen in B4" });
+  assert.deepStrictEqual(summarizeErrors(r.errors), ERR_SUMMARY_LINES);
+  assert.strictEqual(decideImport(r), "fix-file"); // 5 of 7 rows are bad
+});
+ok("err: addresses follow the sheet, not the array", () => {
+  // The same table stored from B3: rows[0][0] is cell B3.
+  const r = validateRows(ERR_ROWS, 0, ERR_COLUMNS, FIELDS, { origin: { row: 2, col: 1 } });
+  assert.deepStrictEqual(r.errors.slice(0, 3).map((e) => e.cell), ["C5", "D5", "B6"]);
+  assert.deepStrictEqual(r.valid.map((v) => v.row), [4, 9]);
+  // A title row above the header: header index 2, data from row 4.
+  const titled = [["Customer export"], [], ...ERR_ROWS.slice(0, 3)];
+  assert.deepStrictEqual(validateRows(titled, 2, ERR_COLUMNS, FIELDS).errors.map((e) => e.cell), ["B5", "C5"]);
+  // Columns in another order, with an unmapped column in between.
+  const moved = [["Seats", "Notes", "Email", "Name"], ["0", "<b>vip</b>", "x", "Yui"]];
+  const m = validateRows(moved, 0, { seats: 0, email: 2, name: 3 }, FIELDS);
+  assert.deepStrictEqual(m.errors.map((e) => e.cell), ["C2", "A2"]);
+});
+ok("err: file-level errors stop row checks", () => {
+  const r = validateRows(ERR_ROWS, 0, { name: 0, seats: 3 }, FIELDS);
+  assert.deepStrictEqual(r.fileErrors, ['No column for the required field "Email".']);
+  assert.deepStrictEqual([r.errors.length, r.valid.length], [0, 0]);
+  assert.strictEqual(decideImport(r), "reject");
+  const empty = validateRows([ERR_ROWS[0], [], ["", " ", null]], 0, ERR_COLUMNS, FIELDS);
+  assert.deepStrictEqual(empty.fileErrors, ["The file has no data rows."]);
+  assert.strictEqual(decideImport(empty), "reject");
+  assert.deepStrictEqual(validateRows([ERR_ROWS[0]], 0, ERR_COLUMNS, FIELDS).fileErrors, ["The file has no data rows."]);
+  // Optional fields may be left unmapped.
+  const r2 = validateRows([["Name", "Email"], ["Yui", "yui@example.jp"]], 0, { name: 0, email: 1 }, FIELDS);
+  assert.deepStrictEqual(r2.valid, [{ row: 2, data: { name: "Yui", email: "yui@example.jp" } }]);
+  assert.strictEqual(decideImport(r2), "import");
+});
+ok("err: blank cells, spaces, numbers and rejected cells", () => {
+  const rows = [ERR_ROWS[0],
+    ["  Yui  ", "\u00a0yui@example.jp ", 46027, 3],
+    ["Ken", "ken@example.com", { error: "could not be read (Excel error #N/A)" }, 2.5],
+    ["", "", "", "4"],
+    [null, undefined],
+    ["Ana", "ana@example.com", "2026-03-01", 1e21]];
+  const r = validateRows(rows, 0, ERR_COLUMNS, FIELDS);
+  assert.deepStrictEqual(r.valid, []);
+  assert.deepStrictEqual(r.errors.map((e) => `${e.cell} ${e.message}`), [
+    "C2 is not a date in the form 2026-03-31", "C3 could not be read (Excel error #N/A)", "D3 is not a whole number",
+    "A4 is empty", "B4 is empty", "D6 is not a whole number"]);
+  assert.strictEqual(r.errors[0].value, "46027");
+  const ok1 = validateRows([ERR_ROWS[0], ["  Yui  ", "\u00a0yui@example.jp ", "2026-01-05", 3]], 0, ERR_COLUMNS, FIELDS);
+  assert.deepStrictEqual(ok1.valid[0].data, { name: "Yui", email: "yui@example.jp", signupDate: "2026-01-05", seats: 3 });
+});
+ok("err: duplicates and the error limit", () => {
+  const rows = [["Name", "Email"], ...Array.from({ length: 6 }, (_, i) => [`P${i}`, "same@example.com"])];
+  const r = validateRows(rows, 0, { name: 0, email: 1 }, FIELDS, { maxErrors: 3 });
+  assert.deepStrictEqual(r.errors.map((e) => `${e.cell} ${e.message}`), ["B3 is a duplicate", "B4 is a duplicate", "B5 is a duplicate"]);
+  assert.strictEqual(r.moreErrors, 2);
+  assert.deepStrictEqual(r.badRows, [3, 4, 5, 6, 7]);
+  assert.deepStrictEqual(summarizeErrors(r.errors), ["Email is a duplicate: B3:B5 (3 cells; B3 is \"same@example.com\", first seen in B2)"]);
+  assert.strictEqual(decideImport(r), "fix-file");
+});
+ok("err: summary ranges, limits and quoting", () => {
+  assert.deepStrictEqual(rowRanges([14, 15, 16, 20, 22, 23]), [{ from: 14, to: 16 }, { from: 20, to: 20 }, { from: 22, to: 23 }]);
+  const many = [2, 3, 5, 7, 9, 11, 12].map((row) => ({ cell: "AB" + row, column: 27, row, label: "Seats", value: "x", message: "is not a whole number" }));
+  assert.deepStrictEqual(summarizeErrors(many), ['Seats is not a whole number: AB2:AB3, AB5, AB7, AB9 and 2 more (7 cells; AB2 is "x")']);
+  assert.deepStrictEqual(summarizeErrors(many, { maxRanges: 10 }), ['Seats is not a whole number: AB2:AB3, AB5, AB7, AB9, AB11:AB12 (7 cells; AB2 is "x")']);
+  assert.deepStrictEqual(summarizeErrors([]), []);
+  assert.strictEqual(quoteValue('say "hi"\nnow'), '"say \\"hi\\"\\nnow"');
+  assert.strictEqual(quoteValue("x".repeat(45)), JSON.stringify("x".repeat(39) + "…"));
+  assert.strictEqual(quoteValue("\u{1F600}".repeat(41)), JSON.stringify("\u{1F600}".repeat(39) + "…"));
+  const family = "\u{1F468}\u200d\u{1F469}\u200d\u{1F467}";
+  assert.strictEqual(quoteValue("x".repeat(38) + family + "yz"), JSON.stringify("x".repeat(38) + family + "\u2026"));
+  // Errors added out of order (for example by your own cross-row checks) are sorted first.
+  const late = [9, 3, 4].map((row) => ({ cell: "C" + row, column: 2, row, label: "End", value: String(row), message: "is before Start" }));
+  assert.deepStrictEqual(summarizeErrors(late), ['End is before Start: C3:C4, C9 (3 cells; C3 is "3")']);
+  assert.deepStrictEqual(rowRanges([2, 2, 3]), [{ from: 2, to: 3 }]);
+  // Duplicates of different first cells share one line.
+  const dups = [["Name", "Email"], ["A", "a@x.io"], ["B", "b@x.io"], ["C", "a@x.io"], ["D", "b@x.io"]];
+  assert.deepStrictEqual(summarizeErrors(validateRows(dups, 0, { name: 0, email: 1 }, FIELDS).errors),
+    ['Email is a duplicate: B4:B5 (2 cells; B4 is "a@x.io", first seen in B2)']);
+  // Same problem in two columns: two lines, ordered by first row, then by column.
+  const two = [
+    { cell: "D2", column: 3, row: 2, label: "Seats", value: "", message: "is empty" },
+    { cell: "A2", column: 0, row: 2, label: "Name", value: "", message: "is empty" },
+    { cell: "A9", column: 0, row: 9, label: "Name", value: "", message: "is empty" },
+  ];
+  assert.deepStrictEqual(summarizeErrors(two), ["Name is empty: A2, A9 (2 cells)", "Seats is empty: D2"]);
+});
+ok("err: decideImport thresholds", () => {
+  const res = (bad, good) => ({ fileErrors: [], badRows: Array(bad).fill(1), valid: Array(good).fill({}) });
+  assert.strictEqual(decideImport(res(0, 10)), "import");
+  assert.strictEqual(decideImport(res(2, 8)), "ask");
+  assert.strictEqual(decideImport(res(3, 7)), "fix-file");
+  assert.strictEqual(decideImport(res(3, 7), { maxBadShare: 0.5 }), "ask");
+  assert.strictEqual(decideImport(res(1, 0)), "fix-file");
+  assert.strictEqual(decideImport(res(1, 0), { maxBadShare: 1 }), "fix-file");
+});
+const errWorkbook = () => {
+  // Data stored from B3, as in an export with a title above it; dates as serial numbers.
+  const sheet = {
+    "!ref": "B3:E7",
+    B3: { t: "s", v: "Name" }, C3: { t: "s", v: "Email" }, D3: { t: "s", v: "Signup date" }, E3: { t: "s", v: "Seats" },
+    B4: { t: "s", v: "Yui Tanaka" }, C4: { t: "s", v: "yui@example.jp" }, D4: { t: "n", v: 46027, z: "dd/mm/yyyy" }, E4: { t: "n", v: 3, z: "0" },
+    C5: { t: "s", v: "ken@example" }, D5: { t: "n", v: 60, z: "m/d/yy" }, E5: { t: "e", v: 42, w: "#N/A" },
+    B6: { t: "s", v: "Ana Silva" }, C6: { t: "s", v: "ana@example.com" }, D6: { t: "s", v: "05.01.2026" }, E6: { t: "n", v: 1000, z: "#,##0" },
+    B7: { t: "s", v: "Bo Berg" }, C7: { t: "s", v: "bo@example.com", c: [{ a: "Bo", t: "check this" }] }, E7: { t: "n", v: 2 },
+  };
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, sheet, "Customers");
+  return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+};
+const errFile = (buf) => ({ arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) });
+ok("err: readRows gives values and the sheet origin", async () => {
+  const { rows, origin } = await readRows(errFile(errWorkbook()));
+  assert.deepStrictEqual(origin, { row: 2, col: 1 });
+  assert.deepStrictEqual(rows[1], ["Yui Tanaka", "yui@example.jp", "2026-01-05", 3]);
+  assert.deepStrictEqual(rows[2], [null, "ken@example", { error: "could not be read (1900-02-29 does not exist (Excel's 1900 leap-year bug))" }, { error: "could not be read (Excel error #N/A)" }]);
+  const r = validateRows(rows, 0, ERR_COLUMNS, FIELDS, { origin });
+  assert.deepStrictEqual(r.errors.map((e) => `${e.cell} ${e.message}`), [
+    "B5 is empty", "C5 is not an email address", "D5 could not be read (1900-02-29 does not exist (Excel's 1900 leap-year bug))",
+    "E5 could not be read (Excel error #N/A)", "D6 is not a date in the form 2026-03-31"]);
+  assert.deepStrictEqual(r.valid, [
+    { row: 4, data: { name: "Yui Tanaka", email: "yui@example.jp", signupDate: "2026-01-05", seats: 3 } },
+    { row: 7, data: { name: "Bo Berg", email: "bo@example.com", signupDate: null, seats: 2 } },
+  ]);
+  await assert.rejects(readRows(errFile(errWorkbook()), { maxCells: 19 }), /range B3:E7 is too large/);
+  assert.strictEqual((await readRows(errFile(errWorkbook()), { maxCells: 20 })).rows.length, 5);
+  // A CSV file: every cell stays text, the origin is A1.
+  const csv = await readRows(errFile(Buffer.from("Name,Email,Signup date,Seats\nYui,yui@example.jp,03/04/2026,007\n")));
+  assert.deepStrictEqual(csv.origin, { row: 0, col: 0 });
+  assert.deepStrictEqual(csv.rows[1], ["Yui", "yui@example.jp", "03/04/2026", "007"]);
+  // A line break inside a quoted CSV cell does not shift the row numbers.
+  const quoted = await readRows(errFile(Buffer.from('Name,Email\n"Yui\nTanaka",yui@example.jp\nKen,bad\n')));
+  assert.deepStrictEqual(validateRows(quoted.rows, 0, { name: 0, email: 1 }, FIELDS, { origin: quoted.origin }).errors.map((e) => e.cell), ["B3"]);
+});
+ok("err: merged cells leave the other rows empty", async () => {
+  const sheet = XLSX.utils.aoa_to_sheet([["Name", "Email"], ["Yui", "a@x.io"], ["", "b@x.io"], ["", "c@x.io"]]);
+  sheet["!merges"] = [XLSX.utils.decode_range("A2:A4")];
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, sheet, "S");
+  const { rows, origin } = await readRows(errFile(XLSX.write(wb, { type: "buffer", bookType: "xlsx" })));
+  assert.deepStrictEqual(validateRows(rows, 0, { name: 0, email: 1 }, FIELDS, { origin }).errors.map((e) => `${e.cell} ${e.message}`), ["A3 is empty", "A4 is empty"]);
+});
+ok("err: comments survive a download and keep the file's values", async () => {
+  const { workbook, sheet, rows, origin } = await readRows(errFile(errWorkbook()));
+  const r = validateRows(rows, 0, ERR_COLUMNS, FIELDS, { origin });
+  addErrorComments(sheet, [...r.errors, { cell: "C7", label: "Email", message: "is a test" }]);
+  addErrorComments(sheet, r.errors); // a second click on Download
+  assert.strictEqual(sheet.C5.c.length, 1);
+  const back = XLSX.read(XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }), { cellNF: true }).Sheets.Customers;
+  const comments = (a) => (back[a]?.c ?? []).map((c) => `${c.a}: ${c.t}`);
+  const commentText = (a) => (back[a]?.c ?? []).map((c) => c.t).join(" | ");
+  assert.deepStrictEqual(comments("B5"), ["Import check: Name is empty"]); // created for the comment
+  assert.deepStrictEqual(comments("C5"), ["Import check: Email is not an email address"]);
+  assert.deepStrictEqual(comments("E5"), ["Import check: Seats could not be read (Excel error #N/A)"]);
+  // The user's own comment is kept; how two comments on one cell are stored depends on the SheetJS version.
+  assert(commentText("C7").includes("check this") && commentText("C7").includes("Email is a test"), commentText("C7"));
+  assert.deepStrictEqual(comments("B4"), []);
+  assert.deepStrictEqual([back.D4.v, back.D4.z, back.E6.v, back.E6.z, back.C5.v, back.E5.w], [46027, "dd/mm/yyyy", 1000, "#,##0", "ken@example", "#N/A"]);
+  assert.strictEqual(back["!ref"], "B3:E7");
+});
+ok("err: checkImport wires it together", async () => {
+  const shown = [];
+  const saved = [];
+  const realWrite = XLSX.writeFile;
+  globalThis.document = {
+    querySelector: (sel) => ({ replaceChildren: (...items) => shown.push(sel, ...items.map((i) => i.textContent)) }),
+    createElement: () => ({}),
+  };
+  XLSX.writeFile = (wb, name) => saved.push([name, wb.Sheets[wb.SheetNames[0]].C5.c[0].t]);
+  try {
+    const out = await checkImport(errFile(errWorkbook()));
+    assert.strictEqual(shown[0], "#import-errors");
+    assert.deepStrictEqual(shown.slice(1), [
+      "Name is empty: B5", 'Email is not an email address: C5 ("ken@example")',
+      "Signup date could not be read (1900-02-29 does not exist (Excel's 1900 leap-year bug)): D5",
+      "Seats could not be read (Excel error #N/A): E5", 'Signup date is not a date in the form 2026-03-31: D6 ("05.01.2026")']);
+    assert.strictEqual(out.decision, "fix-file"); // 2 of 4 rows are bad
+    assert.deepStrictEqual(out.validRows.map((v) => v.row), [4, 7]);
+    assert.deepStrictEqual(saved, []);
+    out.downloadWithComments();
+    assert.deepStrictEqual(saved, [["import-errors.xlsx", "Email is not an email address"]]);
+  } finally {
+    XLSX.writeFile = realWrite;
+    delete globalThis.document;
+  }
+});
+ok("err: showErrors inserts text, innerHTML would run it (Chromium)", async () => {
+  const { chromium } = require("playwright");
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage();
+    await page.setContent("<ul id=a></ul><ul id=b></ul>");
+    const line = 'Name is empty: A4 ("<img src=x onerror=window.ran=1>")';
+    const result = await page.evaluate(([code, text]) => {
+      eval(code + "; window.showErrors = showErrors;");
+      window.showErrors(document.querySelector("#a"), [text]);
+      return { text: document.querySelector("#a li").textContent, images: document.querySelectorAll("#a img").length };
+    }, [%%ERR_SHOW_JSON%%, line]);
+    assert.deepStrictEqual(result, { text: line, images: 0 });
+    await page.evaluate((text) => { document.querySelector("#b").innerHTML = "<li>" + text + "</li>"; }, line);
+    await page.waitForFunction(() => window.ran === 1, null, { timeout: 2000 });
+    assert.strictEqual(await page.evaluate(() => window.ran), 1);
+  } finally {
+    await browser.close();
+  }
+});
+{
+const simpleReadCell = (() => {
+%%ERR_READCELL%%
+return readCell;
+})();
+ok("err: the simple readCell", async () => {
+  const readCell = simpleReadCell;
+  const sheet = { "!ref": "A1:C1", A1: { t: "n", v: 46027, z: "yyyy-mm-dd" }, B1: { t: "e", v: 42, w: "#N/A" } };
+  assert.deepStrictEqual(readCell(sheet.A1, false, "A1"), { value: 46027 });
+  assert.deepStrictEqual(readCell(sheet.B1, false, "B1"), { value: null, problem: "B1: Excel error #N/A" });
+  assert.deepStrictEqual(readCell(undefined, false, "C1"), { value: null });
+});
+}
+ok("err: no invisible characters in the snippets", () => {
+  for (const code of %%ERR_ALL_JSON%%) assert(!/[\u00a0\u200b-\u200f\u2028\u2029\ufeff]/.test(code));
+});
+}
+"""
+for _k in ["ERR_READCELL", "ERR_CHECKS", "ERR_VALIDATE", "ERR_SUMMARY", "ERR_DECIDE", "ERR_COMMENTS", "ERR_SHOW", "ERR_USE"]:
+    ERR_TESTS = ERR_TESTS.replace("%%" + _k + "%%", globals()[_k])
+ERR_TESTS = ERR_TESTS.replace("%%ERR_READ%%", _err_read_cjs)
+ERR_TESTS = ERR_TESTS.replace("%%ERR_SHOW_JSON%%", _json.dumps(ERR_SHOW))
+ERR_TESTS = ERR_TESTS.replace("%%ERR_ALL_JSON%%", _json.dumps([ERR_READCELL, ERR_CHECKS, ERR_VALIDATE, ERR_SUMMARY, ERR_DECIDE, ERR_READ, ERR_COMMENTS, ERR_SHOW, ERR_USE]))
+out += ERR_TESTS
 open(sys.argv[1] if len(sys.argv) > 1 else "/dev/stdout", "w").write(out)
