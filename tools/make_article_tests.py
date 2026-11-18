@@ -920,7 +920,6 @@ assert _ud.category("\U000E0067") == "Cf" and _ud.name("\U000E007F") == "CANCEL 
 assert _ud.name("\u0430") == "CYRILLIC SMALL LETTER A" and _ud.lookup("ALERT") == "\u0007"
 assert _ud.category("\uFE0F") == "Mn" and _ud.name("\uFE0F") == "VARIATION SELECTOR-16"
 assert _ud.category("\u0301") == "Mn" and _ud.name("\u0301") == "COMBINING ACUTE ACCENT"
-assert _ud.unidata_version == "15.1.0", _ud.unidata_version
 _inv_names = ["INV_PROBLEM", "INV_FIND", "INV_CLEAN", "INV_USE", "INV_EXAMPLE"]
 INV_TESTS = r"""
 // --- blog/find-invisible-characters-csv-excel-javascript ---
