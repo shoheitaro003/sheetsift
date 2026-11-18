@@ -2,6 +2,8 @@
 
 Take the top unchecked item. Add new ideas from questions people send.
 
+- [ ] Placeholder values in required columns: empty, whitespace-only, "N/A", "-", "null" and "TBD" cells, and how to flag them before import (gap found in the review of the invisible characters post, 2026-11-18)
+- [ ] Lookalike letters in imported emails and IDs: detect Cyrillic or Greek letters mixed into Latin text with Unicode script properties (left out of the invisible characters post, 2026-11-18)
 - [x] Why CSV importers break on real Excel files (published 2026-11-05)
 - [x] Flatfile is now Obvious: what should importer users do? (published 2026-11-05)
 - [x] How to parse European number formats in JavaScript without a library (published 2026-11-07)
@@ -11,7 +13,7 @@ Take the top unchecked item. Add new ideas from questions people send.
 - [x] Column mapping without AI: matching "E-mail", "Email address" and "mail" to one field (published 2026-11-12)
 - [ ] Security checklist for spreadsheet uploads (prototype pollution, formula injection, HTML in cells). Needs sources (OWASP, SheetJS advisories): skipped on 2026-11-17 because web pages could not be opened in the scheduled run.
 - [ ] CSV injection: what =HYPERLINK in a cell can do, and how to export safely. Needs sources too (skipped 2026-11-17 for the same reason).
-- [ ] Invisible characters in spreadsheet cells: no-break spaces, zero-width spaces and stray BOMs that break matching (seen in our own snippets and demo)
+- [x] Invisible characters in spreadsheet cells: no-break spaces, zero-width spaces and stray BOMs that break matching (published 2026-11-18)
 - [ ] (Parked 2026-11-17, review 8/7/7 after three rounds) Show import errors by cell address. Draft with tested code on branch `claude/import-errors-post` (16 test groups incl. Chromium). Before trying again, fix with tests: a repeated cell is counted twice in summarizeErrors; a grouped duplicate line shows only the first "first seen in" note; isDate accepts T99:99:99; check a UTF-8 CSV without BOM in SheetJS 0.20.3; say that the fallback readCell fails every Excel date; state the example's decision; split dense paragraphs.
 - [ ] Self-hosted vs hosted CSV importers: a decision checklist for SaaS teams
 - [ ] (Parked 2026-11-15, after three days of reviews) Find CSV rows broken by unquoted commas. Draft with tested code on branch `claude/unquoted-commas-post` (parser split into helpers, 32 test groups). Last review 8/8/7. Before trying again, fix the round-3 gaps with tests: rows with the right count are not checked against column kinds (`Ken,Acme, Inc` with Amount missing is imported), `guessDelimiter` ignores `headerIndex`, a quoted `" Inc"` counts as a comma inside a sentence; show the import line for `examples/check-csv.js`; use one example file throughout.

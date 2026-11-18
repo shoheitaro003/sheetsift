@@ -948,3 +948,135 @@ function applyMapping(rows, headerRow, byField) {
     .filter((row) => used.some(([, match]) => String(cell(row, match)).trim() !== ""))
     .map(toRecord);
 }'''
+
+
+
+# --- blog/find-invisible-characters-csv-excel-javascript ---
+INV_PROBLEM = r'''const typed = "ana@example.com";
+const imported = "ana@example.com\u200B"; // a zero width space at the end
+
+typed === imported;                // false
+imported.length;                   // 16
+imported.trim() === typed;         // false: trim() keeps U+200B
+"\u00A0ana@example.com".trim() === typed; // true: trim() removes U+00A0'''
+INV_FIND = r'''// Control (Cc), format (Cf) and separator (Z) characters, plus three blank
+// characters that Unicode files as letters or symbols. The plain space is a
+// separator too, so the code below always lets " " through.
+const HIDDEN = /^[\p{Cc}\p{Cf}\p{Z}\u2800\u3164\uFFA0]$/u;
+
+const NAMES = {
+  "\t": "tab",
+  "\n": "line feed",
+  "\r": "carriage return",
+  "\u00A0": "no-break space",
+  "\u00AD": "soft hyphen",
+  "\u200B": "zero width space",
+  "\u200C": "zero width non-joiner",
+  "\u200D": "zero width joiner",
+  "\u200E": "left-to-right mark",
+  "\u200F": "right-to-left mark",
+  "\u2028": "line separator",
+  "\u202F": "narrow no-break space",
+  "\u2060": "word joiner",
+  "\u2800": "braille pattern blank",
+  "\u3000": "ideographic space",
+  "\u3164": "hangul filler",
+  "\uFEFF": "byte order mark",
+  "\uFFA0": "halfwidth hangul filler",
+};
+
+const codeOf = (ch) =>
+  "U+" + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0");
+const nameOf = (ch) => NAMES[ch] ?? (/\p{Zs}/u.test(ch) ? "space" : "invisible character");
+const isHidden = (ch) => ch !== " " && HIDDEN.test(ch);
+
+// For logs and previews: "ana@example.com<U+200B>"
+const showHidden = (text) =>
+  [...String(text ?? "")].map((ch) => (isHidden(ch) ? `<${codeOf(ch)}>` : ch)).join("");'''
+INV_CLEAN = r'''// Invisible on purpose: the non-joiner and joiner (U+200C, U+200D), the
+// left-to-right and right-to-left marks (U+200E, U+200F), and the tag
+// characters that some flag emoji are built from. Keep them in text.
+const KEEP_IN_TEXT = /^[\u200C-\u200F\u{E0020}-\u{E007F}]$/u;
+
+function cleanCell(value, kind) {
+  if (kind !== "id" && kind !== "text") {
+    throw new TypeError(`kind must be "id" or "text", got ${kind}`);
+  }
+  const chars = [...String(value ?? "")]; // one entry per code point
+  const changes = [];
+  let out = "";
+  for (let position = 0; position < chars.length; position++) {
+    const ch = chars[position];
+    if (!isHidden(ch)) {
+      out += ch;
+      continue;
+    }
+    if (ch === "\r" && chars[position + 1] === "\n") continue; // Windows line end
+    let to = ""; // drop it, unless a rule below says otherwise
+    if (/[\n\r\v\f\u0085\u2028\u2029]/.test(ch)) to = "\n";
+    else if (ch === "\t" || /\p{Zs}/u.test(ch)) to = " ";
+    else if (kind === "text" && KEEP_IN_TEXT.test(ch)) to = ch;
+    if (to !== ch) changes.push({ position, code: codeOf(ch), name: nameOf(ch), to });
+    out += to;
+  }
+  out = out.trim();
+  let error = null;
+  if (kind === "id") {
+    if (/\s/.test(out)) error = "contains a space or line break";
+    if (!out && changes.length) error = "contains only invisible characters";
+    // NFKC turns full-width letters and digits into ASCII: "ＡＢ１２" -> "AB12".
+    const normalized = out.normalize("NFKC").trim();
+    if (normalized !== out) {
+      changes.push({ position: null, code: "NFKC", name: "NFKC normalization", to: normalized });
+      out = normalized;
+      if (!error && /\s/.test(out)) error = "contains a character that NFKC turns into a space";
+    }
+  }
+  return { value: out, changes, error };
+}'''
+INV_USE = r'''const COLUMN_KINDS = { email: "id", sku: "id", name: "text", note: "text" };
+
+function describe(change) {
+  if (change.code === "NFKC") return `normalized to "${change.to}" (NFKC)`;
+  // Positions are counted from 1 for people; cleanCell counts from 0.
+  const what = `${change.name} (${change.code}) at position ${change.position + 1}`;
+  if (change.to === "") return `removed ${what}`;
+  return `${what} became ${change.to === " " ? "a space" : "a line break"}`;
+}
+
+// rows: objects keyed by column. firstRowNumber: the file row of rows[0]
+// (2 when row 1 holds the headers), so messages match what the user sees.
+function cleanRows(rows, firstRowNumber = 2) {
+  const clean = [], notes = [], errors = [];
+  const firstRowOfEmail = new Map();
+  rows.forEach((row, i) => {
+    const rowNumber = firstRowNumber + i;
+    const out = { ...row }; // columns not in COLUMN_KINDS are kept as they are
+    for (const [column, kind] of Object.entries(COLUMN_KINDS)) {
+      const { value, changes, error } = cleanCell(row[column], kind);
+      out[column] = value;
+      for (const c of changes) notes.push(`Row ${rowNumber}, ${column}: ${describe(c)}`);
+      if (error) errors.push(`Row ${rowNumber}, ${column}: ${error}`);
+    }
+    // Compare emails only after cleaning; add .toLowerCase() if your app ignores case.
+    const seen = firstRowOfEmail.get(out.email);
+    if (out.email && seen) errors.push(`Row ${rowNumber}, email: same as row ${seen}`);
+    else if (out.email) firstRowOfEmail.set(out.email, rowNumber);
+    clean.push(out);
+  });
+  return { clean, notes, errors };
+}'''
+INV_EXAMPLE = r'''const { clean, notes, errors } = cleanRows([
+  { email: "ana@example.com", sku: "ＡＢ－１２３", name: "Ana Lima", note: "" },
+  { email: "ana@example.com\u200B", sku: "AB-124", name: "Ana\u00A0Lima", note: "Call\r\nafter 5" },
+  { email: "ken@example.com", sku: "AB 125", name: "Ken", note: "" },
+]);
+clean[0].sku; // "AB-123"
+clean[1].note; // "Call\nafter 5"
+notes;
+// ["Row 2, sku: normalized to \"AB-123\" (NFKC)",
+//  "Row 3, email: removed zero width space (U+200B) at position 16",
+//  "Row 3, name: no-break space (U+00A0) at position 4 became a space"]
+errors;
+// ["Row 3, email: same as row 2",
+//  "Row 4, sku: contains a space or line break"]'''

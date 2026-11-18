@@ -11,7 +11,7 @@ DEC_SAMPLES_TEXT = {
     "kanjiOnly": "東京都,大阪府\n",
     "halfKana": "ﾌﾘｶﾞﾅ,金額\nｶﾌﾞｼｷｶﾞｲｼｬ ﾔﾏﾀﾞ,500\n",
     "eucjp": "氏名,住所\n山田太郎,東京都です\n",
-    "cyrillic": "Имя,Город\nИван,Москва\n",
+    "cyrillic": "Имя,Город\nИв\u0430н,Москв\u0430\n",
     "yen": "Item,Price\nPen,100円\nBook,1200円\n",
     "kanjiDate": "Date,Qty\n2024年1月5日,3\n",
     "quotes": "Note\nl’été, José’s café, “Zoë”, „Grüße“, Škoda, Œuvre\n",
@@ -903,4 +903,213 @@ MAP_TESTS = MAP_TESTS.replace("%%MAP_PROBLEM_JSON%%", _json.dumps(MAP_PROBLEM))
 MAP_TESTS = MAP_TESTS.replace("%%MAP_TABLE_JSON%%", _json.dumps(MAP_TABLE, ensure_ascii=False))
 MAP_TESTS = MAP_TESTS.replace("%%MAP_ALL_JSON%%", _json.dumps([globals()[k] for k in _map_names + ["MAP_PROBLEM"]]))
 out += MAP_TESTS
+
+# --- blog/find-invisible-characters-csv-excel-javascript ---
+import re as _re, unicodedata as _ud
+# The names in NAMES must be the Unicode name or a formal alias of each character.
+for _key, _name in _re.findall(r'^  "(\\[a-z]|\\u[0-9A-F]{4})": "([^"]+)",$', INV_FIND, _re.M):
+    _ch = {"\\t": "\t", "\\n": "\n", "\\r": "\r"}.get(_key) or chr(int(_key[2:], 16))
+    assert _ud.lookup(_name.upper()) == _ch, (_key, _name)
+assert len(_re.findall(r'^  "(\\[a-z]|\\u[0-9A-F]{4})": "([^"]+)",$', INV_FIND, _re.M)) == 18
+# Facts about categories and names that the post states.
+assert all(_ud.category(_c) in ("Cc", "Cf", "Zs", "Zl", "Zp") for _c in "\t\n\r\u00A0\u00AD\u200B\u200C\u200D\u200E\u200F\u2028\u202F\u2060\u3000\uFEFF\u0007")
+assert [_ud.category(chr(_c)) for _c in [*range(0x202A, 0x202F), *range(0x2066, 0x206A)]] == ["Cf"] * 9
+assert all(_re.search("EMBEDDING|OVERRIDE|ISOLATE|POP DIRECTIONAL", _ud.name(chr(_c))) for _c in [*range(0x202A, 0x202F), *range(0x2066, 0x206A)])
+assert [_ud.category(_c) for _c in "\u2800\u3164\uffa0"] == ["So", "Lo", "Lo"]
+assert _ud.category("\U000E0067") == "Cf" and _ud.name("\U000E007F") == "CANCEL TAG"
+assert _ud.name("\u0430") == "CYRILLIC SMALL LETTER A" and _ud.lookup("ALERT") == "\u0007"
+assert _ud.category("\uFE0F") == "Mn" and _ud.name("\uFE0F") == "VARIATION SELECTOR-16"
+assert _ud.category("\u0301") == "Mn" and _ud.name("\u0301") == "COMBINING ACUTE ACCENT"
+assert _ud.unidata_version == "15.1.0", _ud.unidata_version
+_inv_names = ["INV_PROBLEM", "INV_FIND", "INV_CLEAN", "INV_USE", "INV_EXAMPLE"]
+INV_TESTS = r"""
+// --- blog/find-invisible-characters-csv-excel-javascript ---
+{
+%%INV_FIND%%
+
+%%INV_CLEAN%%
+
+%%INV_USE%%
+
+const runLines = (src) => new Function(src.split("\n").filter((l) => /^\S.*;\s*\/\/ /.test(l)).map((l) => "")[0] ?? "");
+ok("inv: the problem lines print what the comments say", () => {
+  const src = %%INV_PROBLEM_JSON%%;
+  const lines = src.split("\n");
+  const setup = lines.filter((l) => l.startsWith("const ")).join("\n");
+  let checked = 0;
+  for (const line of lines) {
+    const m = /^(.*?);\s*\/\/ (true|false|\d+)\b/.exec(line);
+    if (!m || line.startsWith("const ")) continue;
+    const got = new Function(setup + "\nreturn (" + m[1] + ");")();
+    assert.strictEqual(String(got), m[2], line);
+    checked++;
+  }
+  assert.strictEqual(checked, 4);
+});
+ok("inv: HIDDEN finds the named characters and nothing visible", () => {
+  for (const ch of Object.keys(NAMES)) assert(isHidden(ch), codeOf(ch));
+  for (const ch of ["\u0007", "\u202E", "\u2029", "\u2066", "᠎", "\u0085"]) assert(isHidden(ch), codeOf(ch));
+  for (const ch of [" ", "a", "é", "\u0301", "\uFE0F", "\u{1F600}", "あ", "\u0430", "-", "‐"]) assert(!isHidden(ch), codeOf(ch));
+  assert.strictEqual(codeOf("\u{1F600}"), "U+1F600");
+  assert.strictEqual(nameOf("\u202E"), "invisible character");
+  assert.strictEqual(nameOf("\u2003"), "space");
+  assert.strictEqual(showHidden("ana@example.com\u200B"), "ana@example.com<U+200B>");
+  assert.strictEqual(showHidden("a b\u00A0c"), "a b<U+00A0>c");
+  assert.strictEqual(showHidden(null), "");
+});
+const cc = (value, kind) => { const r = cleanCell(value, kind); return [r.value, r.changes.map((c) => `${c.position}:${c.code}>${JSON.stringify(c.to)}`), r.error]; };
+ok("inv: cleanCell ids", () => {
+  const E = "contains a space or line break";
+  assert.deepStrictEqual(cc("ana@example.com\u200B", "id"), ["ana@example.com", ['15:U+200B>""'], null]);
+  assert.deepStrictEqual(cc("\uFEFFana@example.com", "id"), ["ana@example.com", ['0:U+FEFF>""'], null]);
+  assert.deepStrictEqual(cc("\u00A0ana@example.com ", "id"), ["ana@example.com", ['0:U+00A0>" "'], null]);
+  assert.deepStrictEqual(cc("ana\u00A0@example.com", "id"), ["ana @example.com", ['3:U+00A0>" "'], E]);
+  assert.deepStrictEqual(cc("AB\n12", "id"), ["AB\n12", [], E]);
+  assert.deepStrictEqual(cc("AB\u202812", "id"), ["AB\n12", ['2:U+2028>"\\n"'], E]);
+  assert.deepStrictEqual(cc("AB 125", "id"), ["AB 125", [], E]);
+  assert.deepStrictEqual(cc("exam\u00ADple.com", "id"), ["example.com", ['4:U+00AD>""'], null]);
+  assert.deepStrictEqual(cc("\uFF21\uFF22\uFF0D\uFF11\uFF12\uFF13", "id"), ["AB-123", ['null:NFKC>"AB-123"'], null]);
+  assert.deepStrictEqual(cc("AB\u00B4", "id"), ["AB \u0301", ['null:NFKC>"AB \u0301"'], "contains a character that NFKC turns into a space"]);
+  assert.deepStrictEqual(cc("\u3164abc\u2800\uFFA0", "id"), ["abc", ['0:U+3164>""', '4:U+2800>""', '5:U+FFA0>""'], null]);
+  assert.deepStrictEqual(cc("\u0661\u0662", "id"), ["\u0661\u0662", [], null]); // NFKC keeps Arabic-Indic digits
+  assert.deepStrictEqual(cc("AB‐123", "id"), ["AB‐123", [], null]); // NFKC keeps U+2010
+  assert.deepStrictEqual(cc("①", "id"), ["1", ['null:NFKC>"1"'], null]);
+  assert.deepStrictEqual(cc("\u200D\u200E\u2060x\u0007", "id"), ["x", ['0:U+200D>""', '1:U+200E>""', '2:U+2060>""', '4:U+0007>""'], null]);
+  assert.deepStrictEqual(cc("\u{1F600}\u200B", "id"), ["\u{1F600}", ['1:U+200B>""'], null]); // positions count code points
+  assert.deepStrictEqual(cc("\u3000\t", "id"), ["", ['0:U+3000>" "', '1:U+0009>" "'], "contains only invisible characters"]);
+  assert.deepStrictEqual(cc("\u200B", "id"), ["", ['0:U+200B>""'], "contains only invisible characters"]);
+  assert.deepStrictEqual(cc("   ", "id"), ["", [], null]);
+  assert.deepStrictEqual(cc(null, "id"), ["", [], null]);
+  assert.deepStrictEqual(cc(undefined, "id"), ["", [], null]);
+  assert.deepStrictEqual(cc(12345, "id"), ["12345", [], null]);
+});
+ok("inv: cleanCell text", () => {
+  const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}";
+  assert.deepStrictEqual(cc("Ana\u00A0Lima", "text"), ["Ana Lima", ['3:U+00A0>" "'], null]);
+  assert.deepStrictEqual(cc(family, "text"), [family, [], null]);
+  const scotland = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}";
+  assert.deepStrictEqual(cc(scotland, "text"), [scotland, [], null]);
+  assert.strictEqual([...new Intl.Segmenter().segment(scotland)].length, 1);
+  assert.deepStrictEqual(cleanCell(scotland, "id").value, "\u{1F3F4}");
+  assert.deepStrictEqual(cc("שלום\u200F 123", "text"), ["שלום\u200F 123", [], null]);
+  assert.deepStrictEqual(cc("Line 1\r\nLine 2", "text"), ["Line 1\nLine 2", [], null]);
+  assert.deepStrictEqual(cc("Line 1\rLine 2", "text"), ["Line 1\nLine 2", ['6:U+000D>"\\n"'], null]);
+  assert.deepStrictEqual(cc("a\tb", "text"), ["a b", ['1:U+0009>" "'], null]);
+  assert.deepStrictEqual(cc("  \u3000Yui\u3000 ", "text"), ["Yui", ['2:U+3000>" "', '6:U+3000>" "'], null]);
+  assert.deepStrictEqual(cc("x\u0007y\u202Ez", "text"), ["xyz", ['1:U+0007>""', '3:U+202E>""'], null]);
+  assert.deepStrictEqual(cc("Ａ① x² ﬁ", "text"), ["Ａ① x² ﬁ", [], null]); // text is not normalized
+  assert.deepStrictEqual(cc("Ana  Lima", "text"), ["Ana  Lima", [], null]);
+  assert.deepStrictEqual(cc("", "text"), ["", [], null]);
+  assert.deepStrictEqual(cc("a\u2028b\u2029c\u0085d", "text"), ["a\nb\nc\nd", ['1:U+2028>"\\n"', '3:U+2029>"\\n"', '5:U+0085>"\\n"'], null]);
+  assert.deepStrictEqual(cc("a\vb\fc", "text"), ["a\nb\nc", ['1:U+000B>"\\n"', '3:U+000C>"\\n"'], null]);
+  for (const ch of ["\t", "\n", "\r", "\v", "\f", "\u0085", "\u0007"]) assert(/\p{Cc}/u.test(ch));
+  for (const ch of ["\u00AD", "\u200B", "\u200C", "\u200D", "\u200E", "\u200F", "\u2060", "\uFEFF", "\u202E", "\u{E0067}"]) assert(/\p{Cf}/u.test(ch));
+  for (const ch of ["\u00A0", "\u202F", "\u3000"]) assert(/\p{Zs}/u.test(ch));
+  assert(/\p{Zl}/u.test("\u2028") && /\p{Zp}/u.test("\u2029") && /\p{So}/u.test("\u2800") && /\p{Lo}/u.test("\u3164\uFFA0".slice(0, 1)) && /\p{Lo}/u.test("\uFFA0") && /\p{Mn}/u.test("\uFE0F\u0301".slice(0, 1)) && /\p{Mn}/u.test("\u0301"));
+  assert.throws(() => cleanCell("x", "email"), /kind must be "id" or "text", got email/);
+  assert.throws(() => cleanCell("x"), TypeError);
+});
+ok("inv: \\s matches exactly what trim() removes, U+0000 to U+FFFF", () => {
+  for (let c = 0; c <= 0xFFFF; c++) {
+    const ch = String.fromCharCode(c);
+    assert.strictEqual(/\s/.test(ch), (ch + "a" + ch).trim() === "a", codeOf(ch));
+  }
+});
+ok("inv: direction controls are removed from text", () => {
+  for (const c of [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069]) {
+    assert.strictEqual(cleanCell("a" + String.fromCharCode(c) + "b", "text").value, "ab");
+  }
+});
+ok("inv: what the post says about joiners and NFKC", () => {
+  const seg = new Intl.Segmenter();
+  const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}";
+  assert.strictEqual([...seg.segment(family)].length, 1);
+  assert.strictEqual([...seg.segment(cleanCell(family, "id").value)].length, 3);
+  assert.strictEqual("ＡＢ－１２３".normalize("NFKC"), "AB-123");
+  assert.strictEqual("①".normalize("NFKC"), "1");
+  assert.strictEqual("x²".normalize("NFKC"), "x2");
+  assert.strictEqual("ﬁ".normalize("NFKC"), "fi");
+  assert.strictEqual("‐".normalize("NFKC"), "‐");
+  assert.strictEqual("\u0430" === "a", false);
+  assert.strictEqual(cleanCell("\u0430na@example.com", "id").value, "\u0430na@example.com");
+  assert.strictEqual(cleanCell("\uFE0F", "text").value, "\uFE0F");
+  assert.notStrictEqual(cleanCell("e\u0301", "text").value, "é");
+  assert.strictEqual(cleanCell("e\u0301", "text").value.normalize("NFC"), "é");
+});
+ok("inv: what passes through an ID, and the ASCII check from the post", () => {
+  for (const v of ["a\uFE0Fb", "a\uE000b", "a\uD800b"]) {
+    const r = cleanCell(v, "id");
+    assert.deepStrictEqual([r.value, r.changes, r.error], [v, [], null]);
+    assert(!/^[\x21-\x7E]+$/.test(r.value));
+  }
+  assert(/^[\x21-\x7E]+$/.test(cleanCell("\uFF21\uFF22\uFF0D\uFF11\uFF12\uFF13\u200B", "id").value));
+  const end = cleanCell("ab\u00A0", "text");
+  assert.deepStrictEqual([end.value, end.changes.map((c) => c.to)], ["ab", [" "]]);
+});
+ok("inv: the table in the post matches the code", () => {
+  const html = require("fs").readFileSync(require("path").join(__dirname, "..", "content", "posts", "find-invisible-characters-csv-excel-javascript.html"), "utf8");
+  const rows = [...html.matchAll(/<tr><td>U\+([0-9A-F]{4}) [^<]*<\/td><td>(yes|no)<\/td><td>(yes|no)<\/td><td>(\w+)<\/td><td>([\w ]+)<\/td><td>([\w ]+)<\/td><\/tr>/g)];
+  assert.strictEqual(rows.length, 12);
+  const effect = (ch, kind) => {
+    const r = cleanCell("x" + ch + "x", kind);
+    if (r.value === "xx") return "removed";
+    if (r.value === "x x") return "space";
+    if (r.value === "x\nx") return "line break";
+    if (r.value === "x" + ch + "x") return "kept";
+    return "?";
+  };
+  for (const [, hex, trims, ws, nfkc, id, text] of rows) {
+    const ch = String.fromCodePoint(parseInt(hex, 16));
+    assert.strictEqual(("a" + ch).trim() === "a" && (ch + "a").trim() === "a" ? "yes" : "no", trims, hex);
+    assert.strictEqual(/\s/.test(ch) ? "yes" : "no", ws, hex);
+    const n = ch.normalize("NFKC");
+    assert.strictEqual(n === ch ? "unchanged" : n === " " ? "space" : "?", nfkc, hex);
+    assert.strictEqual(effect(ch, "id"), id, hex);
+    assert.strictEqual(effect(ch, "text"), text, hex);
+  }
+});
+ok("inv: cleanRows example", () => {
+  const got = new Function("cleanRows", %%INV_EXAMPLE_JSON%% + "\nreturn { clean, notes, errors };")(cleanRows);
+  const src = %%INV_EXAMPLE_JSON%%;
+  assert.strictEqual(got.clean[0].sku, "AB-123");
+  assert.strictEqual(got.clean[1].note, "Call\nafter 5");
+  assert.deepStrictEqual(got.notes, ["Row 2, sku: normalized to \"AB-123\" (NFKC)", "Row 3, email: removed zero width space (U+200B) at position 16", "Row 3, name: no-break space (U+00A0) at position 4 became a space"]);
+  assert.deepStrictEqual(got.errors, ["Row 3, email: same as row 2", "Row 4, sku: contains a space or line break"]);
+  // The comments in the post show the same values.
+  for (const s of [...got.notes, ...got.errors, "AB-123"]) assert(src.includes(JSON.stringify(s)), s);
+  assert(src.includes('// "Call\\nafter 5"'));
+  assert.deepStrictEqual(got.clean.map((r) => r.email), ["ana@example.com", "ana@example.com", "ken@example.com"]);
+});
+ok("inv: cleanRows edge cases", () => {
+  const r = cleanRows([{ email: "", sku: "A" }, { email: "", sku: "B" }, {}, { email: "x@y.z\u200B" }, { email: "x@y.z" }], 10);
+  assert.deepStrictEqual(r.errors, ["Row 14, email: same as row 13"]);
+  assert.deepStrictEqual(r.notes, ["Row 13, email: removed zero width space (U+200B) at position 6"]);
+  assert.deepStrictEqual(r.clean[2], { email: "", sku: "", name: "", note: "" });
+  assert.deepStrictEqual(cleanRows([{ email: "a@b.c", plan: " Pro\u200B" }]).clean[0], { email: "a@b.c", plan: " Pro\u200B", sku: "", name: "", note: "" });
+  assert.deepStrictEqual(cleanRows([]), { clean: [], notes: [], errors: [] });
+  assert.strictEqual(describe({ position: 0, code: "U+2028", name: "line separator", to: "\n" }), "line separator (U+2028) at position 1 became a line break");
+  // An ID with an internal break is reported as an error and as a note.
+  const b = cleanRows([{ email: "a\u2028b@c.d" }]);
+  assert.deepStrictEqual([b.notes.length, b.errors], [1, ["Row 2, email: contains a space or line break"]]);
+});
+ok("inv: SheetJS keeps hidden characters in .xlsx and CSV values", () => {
+  const X = require(process.env.XLSX_MODULE || "xlsx");
+  const values = ["ana@example.com\u200B", "Ana\u00A0Lima"];
+  const wb = X.utils.book_new();
+  X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet([["email", "name"], values]), "S");
+  const back = X.read(X.write(wb, { type: "buffer", bookType: "xlsx" }), { type: "buffer" });
+  assert.deepStrictEqual(X.utils.sheet_to_json(back.Sheets.S, { header: 1 })[1], values);
+  const csv = X.read("email,name\n" + values.join(",") + "\n", { type: "string" });
+  assert.deepStrictEqual(X.utils.sheet_to_json(csv.Sheets[csv.SheetNames[0]], { header: 1, raw: false })[1], values);
+});
+ok("inv: no invisible characters in the snippets", () => {
+  for (const s of %%INV_ALL_JSON%%) assert(!/[\u00A0\u00AD\u200B-\u200F\u2028\u2029\u202F\u2060\u3000\uFEFF]/.test(s));
+});
+}
+"""
+for _k in _inv_names:
+    INV_TESTS = INV_TESTS.replace("%%" + _k + "%%", globals()[_k])
+    INV_TESTS = INV_TESTS.replace("%%" + _k + "_JSON%%", _json.dumps(globals()[_k]))
+INV_TESTS = INV_TESTS.replace("%%INV_ALL_JSON%%", _json.dumps([globals()[k] for k in _inv_names]))
+out += INV_TESTS
 open(sys.argv[1] if len(sys.argv) > 1 else "/dev/stdout", "w").write(out)

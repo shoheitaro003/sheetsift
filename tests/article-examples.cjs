@@ -1647,3 +1647,291 @@ ok("map: no invisible characters in the snippets", () => {
   for (const s of ["function normalizeHeader(text) {\n  return String(text ?? \"\")\n    // \uff25\uff4d\uff41\uff49\uff4c -> Email, \uff92\uff70\uff99 -> \u30e1\u30fc\u30eb, no-break space -> space\n    .normalize(\"NFKC\")\n    // zero-width spaces and byte order marks\n    .replace(/\\p{Cf}/gu, \"\")\n    // signupDate -> signup Date\n    .replace(/(\\p{Ll})(\\p{Lu})/gu, \"$1 $2\")\n    .toLowerCase()\n    // \u00e9 -> e, but the mark in Japanese \u30c9 stays\n    .normalize(\"NFD\")\n    .replace(/(\\p{Script=Latin})\\p{M}+/gu, \"$1\")\n    .normalize(\"NFC\")\n    // punctuation, underscores and runs of spaces -> one space\n    .replace(/[^\\p{L}\\p{N}]+/gu, \" \")\n    .trim();\n}\n\n// Plurals count as the same word. \"address\" is left alone.\nfunction stem(word) {\n  if (/(ss|x|ch|sh)es$/.test(word)) return word.slice(0, -2); // addresses\n  if (word.length > 3 && /[^s]s$/.test(word)) return word.slice(0, -1); // plans\n  return word;\n}\nconst words = (text) => normalizeHeader(text).split(\" \").filter(Boolean).map(stem);\nconst headerKey = (text) => words(text).join(\" \");", "// True when b is a with one letter changed, added or removed,\n// or with two neighbouring letters swapped.\nfunction oneEditApart(a, b) {\n  if (a === b || Math.abs(a.length - b.length) > 1) return false;\n  let i = 0;\n  while (a[i] === b[i]) i++; // length of the common start\n  if (a.length === b.length) {\n    return a.slice(i + 1) === b.slice(i + 1) ||\n      (a[i] === b[i + 1] && a[i + 1] === b[i] && a.slice(i + 2) === b.slice(i + 2));\n  }\n  const [longer, shorter] = a.length > b.length ? [a, b] : [b, a];\n  return longer.slice(i + 1) === shorter.slice(i);\n}\n\nfunction compareNames(header, name) {\n  const h = words(header), n = words(name);\n  if (!h.length || !n.length) return null;\n  const hJoined = h.join(\"\"), nJoined = n.join(\"\");\n  if (hJoined === nJoined) return { score: 1, why: `same as \"${name}\"` };\n  const contained = n.every((w) => h.includes(w));\n  if (contained && h.length === n.length) {\n    return { score: 0.95, why: `same words as \"${name}\"` };\n  }\n  if (contained) {\n    return { score: 0.5 + 0.4 * (n.length / h.length), why: `contains \"${name}\"` };\n  }\n  const longEnough = Math.min(hJoined.length, nJoined.length) >= 5;\n  if (longEnough && oneEditApart(hJoined, nJoined)) {\n    return { score: 0.6, why: `spelled like \"${name}\"` };\n  }\n  return null;\n}", "const looksLikeEmail = (v) => /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(String(v).trim());\nconst looksLikeNumber = (v) =>\n  typeof v === \"number\" || /^[-+(]?[$\u20ac\u00a3\u00a5]?\\s?\\d[\\d.,\\s']*\\)?$/.test(String(v).trim());\n\nconst FIELDS = [\n  { key: \"name\", label: \"Full name\", required: true,\n    aliases: [\"name\", \"customer name\", \"contact name\", \"\u6c0f\u540d\", \"\u540d\u524d\"] },\n  { key: \"email\", label: \"Email\", required: true,\n    looksLike: looksLikeEmail, findByValues: true,\n    aliases: [\"email address\", \"mail\", \"e-mail address\", \"email adresse\",\n              \"\u30e1\u30fc\u30eb\u30a2\u30c9\u30ec\u30b9\", \"\u30e1\u30fc\u30eb\"] },\n  { key: \"company\", label: \"Company\",\n    aliases: [\"company name\", \"organization\", \"organisation\", \"\u4f1a\u793e\u540d\"] },\n  { key: \"phone\", label: \"Phone\",\n    aliases: [\"phone number\", \"telephone\", \"tel\", \"mobile\", \"\u96fb\u8a71\u756a\u53f7\"] },\n  { key: \"mrr\", label: \"MRR\", looksLike: looksLikeNumber,\n    aliases: [\"monthly revenue\", \"monthly recurring revenue\"] },\n];", "const MIN_SCORE = 0.6;   // weaker name matches are ignored\nconst SURE_SCORE = 0.95; // weaker name matches need values to confirm them\nconst CLOSE = 0.1;       // a rival this close makes the choice a guess\n\n// 0 -> \"A\", 27 -> \"AB\"\nfunction columnLetter(i) {\n  const prefix = i >= 26 ? columnLetter(Math.floor(i / 26) - 1) : \"\";\n  return prefix + String.fromCharCode(65 + (i % 26));\n}\n\n// How many sample values pass the field's check (null: nothing to check).\nfunction valueShare(field, values = []) {\n  const filled = values.filter((v) => v != null && String(v).trim() !== \"\");\n  if (!field.looksLike || !filled.length) return null;\n  const pass = filled.filter(field.looksLike).length;\n  const text = `${pass} of ${filled.length} values look like ${field.label}`;\n  return { pass, of: filled.length, text };\n}\n\nfunction bestNameMatch(header, field, remembered) {\n  const key = headerKey(header);\n  if (key && remembered[key] === field.key) {\n    return { score: 1, why: \"chosen by a user before\" };\n  }\n  let best = null;\n  for (const name of [field.key, field.label, ...(field.aliases ?? [])]) {\n    const m = compareNames(header, name);\n    if (m && (!best || m.score > best.score)) best = m;\n  }\n  return best;\n}\n\nfunction mapColumns(headers, fields, { samples = [], remembered = {} } = {}) {\n  // Columns that matched a field but were not used: column -> { key, why, second }.\n  // second: a better column already fills that field.\n  const notUsed = new Map();\n  const note = (column, key, why, second = false) => {\n    if (!notUsed.has(column)) notUsed.set(column, { key, why, second });\n  };\n\n  // 1. Pairs whose names match and whose values do not contradict them.\n  const pairs = [];\n  fields.forEach((field, f) => headers.forEach((header, column) => {\n    const best = bestNameMatch(header, field, remembered);\n    if (!best || best.score < MIN_SCORE) return;\n    const share = valueShare(field, samples[column]);\n    if (share && share.pass / share.of < 0.5) {\n      return note(column, field.key, `matched by name, but only ${share.text}`);\n    }\n    const confirmed = share && share.pass / share.of >= 0.9;\n    const doubt = share && !confirmed && `only ${share.text}`;\n    pairs.push({ f, column, ...best, confirmed, doubt });\n  }));\n\n  // 2. Best pairs first; each field and each column is used once.\n  pairs.sort((a, b) => b.score - a.score || a.column - b.column || a.f - b.f);\n  const byField = Object.fromEntries(fields.map((field) => [field.key, null]));\n  const usedBy = new Map(); // column -> field key\n  for (const p of pairs) {\n    const field = fields[p.f], taken = byField[field.key];\n    if (usedBy.has(p.column)) continue;\n    if (taken) {\n      const where = columnLetter(taken.column);\n      const why = `also matches ${field.label}, which column ${where} already fills`;\n      note(p.column, field.key, why, true);\n      continue;\n    }\n    // A rival scores almost as well and could still be used: another free column\n    // for this field, or another empty field for this column.\n    const rival = pairs.find((q) => q !== p && q.score >= p.score - CLOSE && (\n      (q.f === p.f && !usedBy.has(q.column)) ||\n      (q.column === p.column && !byField[fields[q.f].key])));\n    const doubts = [];\n    if (p.score < SURE_SCORE && !p.confirmed) doubts.push(\"weak name match\");\n    const rivalColumn = rival && columnLetter(rival.column);\n    if (rival?.f === p.f) doubts.push(`column ${rivalColumn} matches too`);\n    else if (rival) doubts.push(`could also be ${fields[rival.f].label}`);\n    if (p.doubt) doubts.push(p.doubt);\n    const header = headers[p.column], sure = !doubts.length;\n    byField[field.key] = { column: p.column, header, why: p.why, sure, doubts };\n    usedBy.set(p.column, field.key);\n  }\n\n  // 3. Fields still empty: the one unused column whose values look right (9 in 10).\n  for (const field of fields) {\n    if (byField[field.key] || !field.findByValues) continue;\n    const fits = headers.map((_, column) => column).filter((column) => {\n      const share = !usedBy.has(column) && valueShare(field, samples[column]);\n      return share && share.pass / share.of >= 0.9;\n    });\n    if (fits.length !== 1) {\n      const why = `values look like ${field.label}, but so do other columns`;\n      fits.forEach((column) => note(column, field.key, why));\n      continue;\n    }\n    const [column] = fits, header = headers[column];\n    const why = `values look like ${field.label}`;\n    const doubts = [\"matched by its values, not its name\"];\n    byField[field.key] = { column, header, why, sure: false, doubts };\n    usedBy.set(column, field.key);\n  }\n\n  const unmatched = headers\n    .map((header, column) => ({ column, header }))\n    .filter(({ column }) => !usedBy.has(column))\n    .map((c) => ({ ...c, why: notUsed.get(c.column)?.why ??\n      (normalizeHeader(c.header) ? \"no field has this name\" : \"empty header\") }));\n  const missing = fields.filter((f) => f.required && !byField[f.key])\n    .map((f) => f.key);\n  // A person should look when a field stayed empty although a column's name\n  // matched it, or when a second column matches a filled field (Email, Email 2).\n  const needsLook = unmatched.some(({ column }) => {\n    const n = notUsed.get(column);\n    return n && (n.second || !byField[n.key]);\n  });\n  const allSure = Object.values(byField).every((m) => !m || m.sure);\n  const sure = !missing.length && !needsLook && allSure;\n  return { byField, unmatched, missing, sure };\n}", "// After the user confirms the mapping screen, store their choices\n// (in your database or in localStorage).\nfunction rememberMapping(remembered, headers, byField) {\n  for (const [key, match] of Object.entries(byField)) {\n    const header = match && headerKey(headers[match.column]);\n    if (header) remembered[header] = key; // blank headers are not remembered\n  }\n  return remembered;\n}", "// rows: arrays of cells from your CSV or Excel parser.\n// headerRow: the index of the header row.\nfunction suggestMapping(rows, headerRow, remembered = {}) {\n  const headers = rows[headerRow] ?? [];\n  // 50 data rows are enough to check the values.\n  const firstRows = rows.slice(headerRow + 1, headerRow + 51);\n  const samples = headers.map((_, column) => firstRows.map((row) => row?.[column]));\n  return mapColumns(headers, FIELDS, { samples, remembered });\n}\n\n// Rows whose mapped cells are all blank are skipped.\nfunction applyMapping(rows, headerRow, byField) {\n  const used = Object.entries(byField).filter(([, match]) => match);\n  const cell = (row, match) => row?.[match.column] ?? \"\";\n  const toRecord = (row) =>\n    Object.fromEntries(used.map(([key, match]) => [key, cell(row, match)]));\n  return rows.slice(headerRow + 1)\n    .filter((row) => used.some(([, match]) => String(cell(row, match)).trim() !== \"\"))\n    .map(toRecord);\n}", "const EMAIL_NAMES = [\"email\", \"e-mail\", \"email address\", \"mail\"];\nconst exactMatch = (header) => EMAIL_NAMES.includes(header.trim().toLowerCase());\nexactMatch(\"E-mail\");             // true\nexactMatch(\"E-Mail-Adresse\");     // false\nexactMatch(\"Email\\u00A0address\");  // false\nexactMatch(\"\uff25\uff4d\uff41\uff49\uff4c\");         // false\n\nconst looseMatch = (header) => header.toLowerCase().includes(\"mail\");\nlooseMatch(\"Mailing address\");    // true\nlooseMatch(\"Email opt-in\");       // true"]) assert(!/[\u00A0\u200B-\u200F\u2028\u2029\uFEFF]/.test(s));
 });
 }
+
+// --- blog/find-invisible-characters-csv-excel-javascript ---
+{
+// Control (Cc), format (Cf) and separator (Z) characters, plus three blank
+// characters that Unicode files as letters or symbols. The plain space is a
+// separator too, so the code below always lets " " through.
+const HIDDEN = /^[\p{Cc}\p{Cf}\p{Z}\u2800\u3164\uFFA0]$/u;
+
+const NAMES = {
+  "\t": "tab",
+  "\n": "line feed",
+  "\r": "carriage return",
+  "\u00A0": "no-break space",
+  "\u00AD": "soft hyphen",
+  "\u200B": "zero width space",
+  "\u200C": "zero width non-joiner",
+  "\u200D": "zero width joiner",
+  "\u200E": "left-to-right mark",
+  "\u200F": "right-to-left mark",
+  "\u2028": "line separator",
+  "\u202F": "narrow no-break space",
+  "\u2060": "word joiner",
+  "\u2800": "braille pattern blank",
+  "\u3000": "ideographic space",
+  "\u3164": "hangul filler",
+  "\uFEFF": "byte order mark",
+  "\uFFA0": "halfwidth hangul filler",
+};
+
+const codeOf = (ch) =>
+  "U+" + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0");
+const nameOf = (ch) => NAMES[ch] ?? (/\p{Zs}/u.test(ch) ? "space" : "invisible character");
+const isHidden = (ch) => ch !== " " && HIDDEN.test(ch);
+
+// For logs and previews: "ana@example.com<U+200B>"
+const showHidden = (text) =>
+  [...String(text ?? "")].map((ch) => (isHidden(ch) ? `<${codeOf(ch)}>` : ch)).join("");
+
+// Invisible on purpose: the non-joiner and joiner (U+200C, U+200D), the
+// left-to-right and right-to-left marks (U+200E, U+200F), and the tag
+// characters that some flag emoji are built from. Keep them in text.
+const KEEP_IN_TEXT = /^[\u200C-\u200F\u{E0020}-\u{E007F}]$/u;
+
+function cleanCell(value, kind) {
+  if (kind !== "id" && kind !== "text") {
+    throw new TypeError(`kind must be "id" or "text", got ${kind}`);
+  }
+  const chars = [...String(value ?? "")]; // one entry per code point
+  const changes = [];
+  let out = "";
+  for (let position = 0; position < chars.length; position++) {
+    const ch = chars[position];
+    if (!isHidden(ch)) {
+      out += ch;
+      continue;
+    }
+    if (ch === "\r" && chars[position + 1] === "\n") continue; // Windows line end
+    let to = ""; // drop it, unless a rule below says otherwise
+    if (/[\n\r\v\f\u0085\u2028\u2029]/.test(ch)) to = "\n";
+    else if (ch === "\t" || /\p{Zs}/u.test(ch)) to = " ";
+    else if (kind === "text" && KEEP_IN_TEXT.test(ch)) to = ch;
+    if (to !== ch) changes.push({ position, code: codeOf(ch), name: nameOf(ch), to });
+    out += to;
+  }
+  out = out.trim();
+  let error = null;
+  if (kind === "id") {
+    if (/\s/.test(out)) error = "contains a space or line break";
+    if (!out && changes.length) error = "contains only invisible characters";
+    // NFKC turns full-width letters and digits into ASCII: "ＡＢ１２" -> "AB12".
+    const normalized = out.normalize("NFKC").trim();
+    if (normalized !== out) {
+      changes.push({ position: null, code: "NFKC", name: "NFKC normalization", to: normalized });
+      out = normalized;
+      if (!error && /\s/.test(out)) error = "contains a character that NFKC turns into a space";
+    }
+  }
+  return { value: out, changes, error };
+}
+
+const COLUMN_KINDS = { email: "id", sku: "id", name: "text", note: "text" };
+
+function describe(change) {
+  if (change.code === "NFKC") return `normalized to "${change.to}" (NFKC)`;
+  // Positions are counted from 1 for people; cleanCell counts from 0.
+  const what = `${change.name} (${change.code}) at position ${change.position + 1}`;
+  if (change.to === "") return `removed ${what}`;
+  return `${what} became ${change.to === " " ? "a space" : "a line break"}`;
+}
+
+// rows: objects keyed by column. firstRowNumber: the file row of rows[0]
+// (2 when row 1 holds the headers), so messages match what the user sees.
+function cleanRows(rows, firstRowNumber = 2) {
+  const clean = [], notes = [], errors = [];
+  const firstRowOfEmail = new Map();
+  rows.forEach((row, i) => {
+    const rowNumber = firstRowNumber + i;
+    const out = { ...row }; // columns not in COLUMN_KINDS are kept as they are
+    for (const [column, kind] of Object.entries(COLUMN_KINDS)) {
+      const { value, changes, error } = cleanCell(row[column], kind);
+      out[column] = value;
+      for (const c of changes) notes.push(`Row ${rowNumber}, ${column}: ${describe(c)}`);
+      if (error) errors.push(`Row ${rowNumber}, ${column}: ${error}`);
+    }
+    // Compare emails only after cleaning; add .toLowerCase() if your app ignores case.
+    const seen = firstRowOfEmail.get(out.email);
+    if (out.email && seen) errors.push(`Row ${rowNumber}, email: same as row ${seen}`);
+    else if (out.email) firstRowOfEmail.set(out.email, rowNumber);
+    clean.push(out);
+  });
+  return { clean, notes, errors };
+}
+
+const runLines = (src) => new Function(src.split("\n").filter((l) => /^\S.*;\s*\/\/ /.test(l)).map((l) => "")[0] ?? "");
+ok("inv: the problem lines print what the comments say", () => {
+  const src = "const typed = \"ana@example.com\";\nconst imported = \"ana@example.com\\u200B\"; // a zero width space at the end\n\ntyped === imported;                // false\nimported.length;                   // 16\nimported.trim() === typed;         // false: trim() keeps U+200B\n\"\\u00A0ana@example.com\".trim() === typed; // true: trim() removes U+00A0";
+  const lines = src.split("\n");
+  const setup = lines.filter((l) => l.startsWith("const ")).join("\n");
+  let checked = 0;
+  for (const line of lines) {
+    const m = /^(.*?);\s*\/\/ (true|false|\d+)\b/.exec(line);
+    if (!m || line.startsWith("const ")) continue;
+    const got = new Function(setup + "\nreturn (" + m[1] + ");")();
+    assert.strictEqual(String(got), m[2], line);
+    checked++;
+  }
+  assert.strictEqual(checked, 4);
+});
+ok("inv: HIDDEN finds the named characters and nothing visible", () => {
+  for (const ch of Object.keys(NAMES)) assert(isHidden(ch), codeOf(ch));
+  for (const ch of ["\u0007", "\u202E", "\u2029", "\u2066", "᠎", "\u0085"]) assert(isHidden(ch), codeOf(ch));
+  for (const ch of [" ", "a", "é", "\u0301", "\uFE0F", "\u{1F600}", "あ", "\u0430", "-", "‐"]) assert(!isHidden(ch), codeOf(ch));
+  assert.strictEqual(codeOf("\u{1F600}"), "U+1F600");
+  assert.strictEqual(nameOf("\u202E"), "invisible character");
+  assert.strictEqual(nameOf("\u2003"), "space");
+  assert.strictEqual(showHidden("ana@example.com\u200B"), "ana@example.com<U+200B>");
+  assert.strictEqual(showHidden("a b\u00A0c"), "a b<U+00A0>c");
+  assert.strictEqual(showHidden(null), "");
+});
+const cc = (value, kind) => { const r = cleanCell(value, kind); return [r.value, r.changes.map((c) => `${c.position}:${c.code}>${JSON.stringify(c.to)}`), r.error]; };
+ok("inv: cleanCell ids", () => {
+  const E = "contains a space or line break";
+  assert.deepStrictEqual(cc("ana@example.com\u200B", "id"), ["ana@example.com", ['15:U+200B>""'], null]);
+  assert.deepStrictEqual(cc("\uFEFFana@example.com", "id"), ["ana@example.com", ['0:U+FEFF>""'], null]);
+  assert.deepStrictEqual(cc("\u00A0ana@example.com ", "id"), ["ana@example.com", ['0:U+00A0>" "'], null]);
+  assert.deepStrictEqual(cc("ana\u00A0@example.com", "id"), ["ana @example.com", ['3:U+00A0>" "'], E]);
+  assert.deepStrictEqual(cc("AB\n12", "id"), ["AB\n12", [], E]);
+  assert.deepStrictEqual(cc("AB\u202812", "id"), ["AB\n12", ['2:U+2028>"\\n"'], E]);
+  assert.deepStrictEqual(cc("AB 125", "id"), ["AB 125", [], E]);
+  assert.deepStrictEqual(cc("exam\u00ADple.com", "id"), ["example.com", ['4:U+00AD>""'], null]);
+  assert.deepStrictEqual(cc("\uFF21\uFF22\uFF0D\uFF11\uFF12\uFF13", "id"), ["AB-123", ['null:NFKC>"AB-123"'], null]);
+  assert.deepStrictEqual(cc("AB\u00B4", "id"), ["AB \u0301", ['null:NFKC>"AB \u0301"'], "contains a character that NFKC turns into a space"]);
+  assert.deepStrictEqual(cc("\u3164abc\u2800\uFFA0", "id"), ["abc", ['0:U+3164>""', '4:U+2800>""', '5:U+FFA0>""'], null]);
+  assert.deepStrictEqual(cc("\u0661\u0662", "id"), ["\u0661\u0662", [], null]); // NFKC keeps Arabic-Indic digits
+  assert.deepStrictEqual(cc("AB‐123", "id"), ["AB‐123", [], null]); // NFKC keeps U+2010
+  assert.deepStrictEqual(cc("①", "id"), ["1", ['null:NFKC>"1"'], null]);
+  assert.deepStrictEqual(cc("\u200D\u200E\u2060x\u0007", "id"), ["x", ['0:U+200D>""', '1:U+200E>""', '2:U+2060>""', '4:U+0007>""'], null]);
+  assert.deepStrictEqual(cc("\u{1F600}\u200B", "id"), ["\u{1F600}", ['1:U+200B>""'], null]); // positions count code points
+  assert.deepStrictEqual(cc("\u3000\t", "id"), ["", ['0:U+3000>" "', '1:U+0009>" "'], "contains only invisible characters"]);
+  assert.deepStrictEqual(cc("\u200B", "id"), ["", ['0:U+200B>""'], "contains only invisible characters"]);
+  assert.deepStrictEqual(cc("   ", "id"), ["", [], null]);
+  assert.deepStrictEqual(cc(null, "id"), ["", [], null]);
+  assert.deepStrictEqual(cc(undefined, "id"), ["", [], null]);
+  assert.deepStrictEqual(cc(12345, "id"), ["12345", [], null]);
+});
+ok("inv: cleanCell text", () => {
+  const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}";
+  assert.deepStrictEqual(cc("Ana\u00A0Lima", "text"), ["Ana Lima", ['3:U+00A0>" "'], null]);
+  assert.deepStrictEqual(cc(family, "text"), [family, [], null]);
+  const scotland = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}";
+  assert.deepStrictEqual(cc(scotland, "text"), [scotland, [], null]);
+  assert.strictEqual([...new Intl.Segmenter().segment(scotland)].length, 1);
+  assert.deepStrictEqual(cleanCell(scotland, "id").value, "\u{1F3F4}");
+  assert.deepStrictEqual(cc("שלום\u200F 123", "text"), ["שלום\u200F 123", [], null]);
+  assert.deepStrictEqual(cc("Line 1\r\nLine 2", "text"), ["Line 1\nLine 2", [], null]);
+  assert.deepStrictEqual(cc("Line 1\rLine 2", "text"), ["Line 1\nLine 2", ['6:U+000D>"\\n"'], null]);
+  assert.deepStrictEqual(cc("a\tb", "text"), ["a b", ['1:U+0009>" "'], null]);
+  assert.deepStrictEqual(cc("  \u3000Yui\u3000 ", "text"), ["Yui", ['2:U+3000>" "', '6:U+3000>" "'], null]);
+  assert.deepStrictEqual(cc("x\u0007y\u202Ez", "text"), ["xyz", ['1:U+0007>""', '3:U+202E>""'], null]);
+  assert.deepStrictEqual(cc("Ａ① x² ﬁ", "text"), ["Ａ① x² ﬁ", [], null]); // text is not normalized
+  assert.deepStrictEqual(cc("Ana  Lima", "text"), ["Ana  Lima", [], null]);
+  assert.deepStrictEqual(cc("", "text"), ["", [], null]);
+  assert.deepStrictEqual(cc("a\u2028b\u2029c\u0085d", "text"), ["a\nb\nc\nd", ['1:U+2028>"\\n"', '3:U+2029>"\\n"', '5:U+0085>"\\n"'], null]);
+  assert.deepStrictEqual(cc("a\vb\fc", "text"), ["a\nb\nc", ['1:U+000B>"\\n"', '3:U+000C>"\\n"'], null]);
+  for (const ch of ["\t", "\n", "\r", "\v", "\f", "\u0085", "\u0007"]) assert(/\p{Cc}/u.test(ch));
+  for (const ch of ["\u00AD", "\u200B", "\u200C", "\u200D", "\u200E", "\u200F", "\u2060", "\uFEFF", "\u202E", "\u{E0067}"]) assert(/\p{Cf}/u.test(ch));
+  for (const ch of ["\u00A0", "\u202F", "\u3000"]) assert(/\p{Zs}/u.test(ch));
+  assert(/\p{Zl}/u.test("\u2028") && /\p{Zp}/u.test("\u2029") && /\p{So}/u.test("\u2800") && /\p{Lo}/u.test("\u3164\uFFA0".slice(0, 1)) && /\p{Lo}/u.test("\uFFA0") && /\p{Mn}/u.test("\uFE0F\u0301".slice(0, 1)) && /\p{Mn}/u.test("\u0301"));
+  assert.throws(() => cleanCell("x", "email"), /kind must be "id" or "text", got email/);
+  assert.throws(() => cleanCell("x"), TypeError);
+});
+ok("inv: \\s matches exactly what trim() removes, U+0000 to U+FFFF", () => {
+  for (let c = 0; c <= 0xFFFF; c++) {
+    const ch = String.fromCharCode(c);
+    assert.strictEqual(/\s/.test(ch), (ch + "a" + ch).trim() === "a", codeOf(ch));
+  }
+});
+ok("inv: direction controls are removed from text", () => {
+  for (const c of [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069]) {
+    assert.strictEqual(cleanCell("a" + String.fromCharCode(c) + "b", "text").value, "ab");
+  }
+});
+ok("inv: what the post says about joiners and NFKC", () => {
+  const seg = new Intl.Segmenter();
+  const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}";
+  assert.strictEqual([...seg.segment(family)].length, 1);
+  assert.strictEqual([...seg.segment(cleanCell(family, "id").value)].length, 3);
+  assert.strictEqual("ＡＢ－１２３".normalize("NFKC"), "AB-123");
+  assert.strictEqual("①".normalize("NFKC"), "1");
+  assert.strictEqual("x²".normalize("NFKC"), "x2");
+  assert.strictEqual("ﬁ".normalize("NFKC"), "fi");
+  assert.strictEqual("‐".normalize("NFKC"), "‐");
+  assert.strictEqual("\u0430" === "a", false);
+  assert.strictEqual(cleanCell("\u0430na@example.com", "id").value, "\u0430na@example.com");
+  assert.strictEqual(cleanCell("\uFE0F", "text").value, "\uFE0F");
+  assert.notStrictEqual(cleanCell("e\u0301", "text").value, "é");
+  assert.strictEqual(cleanCell("e\u0301", "text").value.normalize("NFC"), "é");
+});
+ok("inv: what passes through an ID, and the ASCII check from the post", () => {
+  for (const v of ["a\uFE0Fb", "a\uE000b", "a\uD800b"]) {
+    const r = cleanCell(v, "id");
+    assert.deepStrictEqual([r.value, r.changes, r.error], [v, [], null]);
+    assert(!/^[\x21-\x7E]+$/.test(r.value));
+  }
+  assert(/^[\x21-\x7E]+$/.test(cleanCell("\uFF21\uFF22\uFF0D\uFF11\uFF12\uFF13\u200B", "id").value));
+  const end = cleanCell("ab\u00A0", "text");
+  assert.deepStrictEqual([end.value, end.changes.map((c) => c.to)], ["ab", [" "]]);
+});
+ok("inv: the table in the post matches the code", () => {
+  const html = require("fs").readFileSync(require("path").join(__dirname, "..", "content", "posts", "find-invisible-characters-csv-excel-javascript.html"), "utf8");
+  const rows = [...html.matchAll(/<tr><td>U\+([0-9A-F]{4}) [^<]*<\/td><td>(yes|no)<\/td><td>(yes|no)<\/td><td>(\w+)<\/td><td>([\w ]+)<\/td><td>([\w ]+)<\/td><\/tr>/g)];
+  assert.strictEqual(rows.length, 12);
+  const effect = (ch, kind) => {
+    const r = cleanCell("x" + ch + "x", kind);
+    if (r.value === "xx") return "removed";
+    if (r.value === "x x") return "space";
+    if (r.value === "x\nx") return "line break";
+    if (r.value === "x" + ch + "x") return "kept";
+    return "?";
+  };
+  for (const [, hex, trims, ws, nfkc, id, text] of rows) {
+    const ch = String.fromCodePoint(parseInt(hex, 16));
+    assert.strictEqual(("a" + ch).trim() === "a" && (ch + "a").trim() === "a" ? "yes" : "no", trims, hex);
+    assert.strictEqual(/\s/.test(ch) ? "yes" : "no", ws, hex);
+    const n = ch.normalize("NFKC");
+    assert.strictEqual(n === ch ? "unchanged" : n === " " ? "space" : "?", nfkc, hex);
+    assert.strictEqual(effect(ch, "id"), id, hex);
+    assert.strictEqual(effect(ch, "text"), text, hex);
+  }
+});
+ok("inv: cleanRows example", () => {
+  const got = new Function("cleanRows", "const { clean, notes, errors } = cleanRows([\n  { email: \"ana@example.com\", sku: \"\uff21\uff22\uff0d\uff11\uff12\uff13\", name: \"Ana Lima\", note: \"\" },\n  { email: \"ana@example.com\\u200B\", sku: \"AB-124\", name: \"Ana\\u00A0Lima\", note: \"Call\\r\\nafter 5\" },\n  { email: \"ken@example.com\", sku: \"AB 125\", name: \"Ken\", note: \"\" },\n]);\nclean[0].sku; // \"AB-123\"\nclean[1].note; // \"Call\\nafter 5\"\nnotes;\n// [\"Row 2, sku: normalized to \\\"AB-123\\\" (NFKC)\",\n//  \"Row 3, email: removed zero width space (U+200B) at position 16\",\n//  \"Row 3, name: no-break space (U+00A0) at position 4 became a space\"]\nerrors;\n// [\"Row 3, email: same as row 2\",\n//  \"Row 4, sku: contains a space or line break\"]" + "\nreturn { clean, notes, errors };")(cleanRows);
+  const src = "const { clean, notes, errors } = cleanRows([\n  { email: \"ana@example.com\", sku: \"\uff21\uff22\uff0d\uff11\uff12\uff13\", name: \"Ana Lima\", note: \"\" },\n  { email: \"ana@example.com\\u200B\", sku: \"AB-124\", name: \"Ana\\u00A0Lima\", note: \"Call\\r\\nafter 5\" },\n  { email: \"ken@example.com\", sku: \"AB 125\", name: \"Ken\", note: \"\" },\n]);\nclean[0].sku; // \"AB-123\"\nclean[1].note; // \"Call\\nafter 5\"\nnotes;\n// [\"Row 2, sku: normalized to \\\"AB-123\\\" (NFKC)\",\n//  \"Row 3, email: removed zero width space (U+200B) at position 16\",\n//  \"Row 3, name: no-break space (U+00A0) at position 4 became a space\"]\nerrors;\n// [\"Row 3, email: same as row 2\",\n//  \"Row 4, sku: contains a space or line break\"]";
+  assert.strictEqual(got.clean[0].sku, "AB-123");
+  assert.strictEqual(got.clean[1].note, "Call\nafter 5");
+  assert.deepStrictEqual(got.notes, ["Row 2, sku: normalized to \"AB-123\" (NFKC)", "Row 3, email: removed zero width space (U+200B) at position 16", "Row 3, name: no-break space (U+00A0) at position 4 became a space"]);
+  assert.deepStrictEqual(got.errors, ["Row 3, email: same as row 2", "Row 4, sku: contains a space or line break"]);
+  // The comments in the post show the same values.
+  for (const s of [...got.notes, ...got.errors, "AB-123"]) assert(src.includes(JSON.stringify(s)), s);
+  assert(src.includes('// "Call\\nafter 5"'));
+  assert.deepStrictEqual(got.clean.map((r) => r.email), ["ana@example.com", "ana@example.com", "ken@example.com"]);
+});
+ok("inv: cleanRows edge cases", () => {
+  const r = cleanRows([{ email: "", sku: "A" }, { email: "", sku: "B" }, {}, { email: "x@y.z\u200B" }, { email: "x@y.z" }], 10);
+  assert.deepStrictEqual(r.errors, ["Row 14, email: same as row 13"]);
+  assert.deepStrictEqual(r.notes, ["Row 13, email: removed zero width space (U+200B) at position 6"]);
+  assert.deepStrictEqual(r.clean[2], { email: "", sku: "", name: "", note: "" });
+  assert.deepStrictEqual(cleanRows([{ email: "a@b.c", plan: " Pro\u200B" }]).clean[0], { email: "a@b.c", plan: " Pro\u200B", sku: "", name: "", note: "" });
+  assert.deepStrictEqual(cleanRows([]), { clean: [], notes: [], errors: [] });
+  assert.strictEqual(describe({ position: 0, code: "U+2028", name: "line separator", to: "\n" }), "line separator (U+2028) at position 1 became a line break");
+  // An ID with an internal break is reported as an error and as a note.
+  const b = cleanRows([{ email: "a\u2028b@c.d" }]);
+  assert.deepStrictEqual([b.notes.length, b.errors], [1, ["Row 2, email: contains a space or line break"]]);
+});
+ok("inv: SheetJS keeps hidden characters in .xlsx and CSV values", () => {
+  const X = require(process.env.XLSX_MODULE || "xlsx");
+  const values = ["ana@example.com\u200B", "Ana\u00A0Lima"];
+  const wb = X.utils.book_new();
+  X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet([["email", "name"], values]), "S");
+  const back = X.read(X.write(wb, { type: "buffer", bookType: "xlsx" }), { type: "buffer" });
+  assert.deepStrictEqual(X.utils.sheet_to_json(back.Sheets.S, { header: 1 })[1], values);
+  const csv = X.read("email,name\n" + values.join(",") + "\n", { type: "string" });
+  assert.deepStrictEqual(X.utils.sheet_to_json(csv.Sheets[csv.SheetNames[0]], { header: 1, raw: false })[1], values);
+});
+ok("inv: no invisible characters in the snippets", () => {
+  for (const s of ["const typed = \"ana@example.com\";\nconst imported = \"ana@example.com\\u200B\"; // a zero width space at the end\n\ntyped === imported;                // false\nimported.length;                   // 16\nimported.trim() === typed;         // false: trim() keeps U+200B\n\"\\u00A0ana@example.com\".trim() === typed; // true: trim() removes U+00A0", "// Control (Cc), format (Cf) and separator (Z) characters, plus three blank\n// characters that Unicode files as letters or symbols. The plain space is a\n// separator too, so the code below always lets \" \" through.\nconst HIDDEN = /^[\\p{Cc}\\p{Cf}\\p{Z}\\u2800\\u3164\\uFFA0]$/u;\n\nconst NAMES = {\n  \"\\t\": \"tab\",\n  \"\\n\": \"line feed\",\n  \"\\r\": \"carriage return\",\n  \"\\u00A0\": \"no-break space\",\n  \"\\u00AD\": \"soft hyphen\",\n  \"\\u200B\": \"zero width space\",\n  \"\\u200C\": \"zero width non-joiner\",\n  \"\\u200D\": \"zero width joiner\",\n  \"\\u200E\": \"left-to-right mark\",\n  \"\\u200F\": \"right-to-left mark\",\n  \"\\u2028\": \"line separator\",\n  \"\\u202F\": \"narrow no-break space\",\n  \"\\u2060\": \"word joiner\",\n  \"\\u2800\": \"braille pattern blank\",\n  \"\\u3000\": \"ideographic space\",\n  \"\\u3164\": \"hangul filler\",\n  \"\\uFEFF\": \"byte order mark\",\n  \"\\uFFA0\": \"halfwidth hangul filler\",\n};\n\nconst codeOf = (ch) =>\n  \"U+\" + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, \"0\");\nconst nameOf = (ch) => NAMES[ch] ?? (/\\p{Zs}/u.test(ch) ? \"space\" : \"invisible character\");\nconst isHidden = (ch) => ch !== \" \" && HIDDEN.test(ch);\n\n// For logs and previews: \"ana@example.com<U+200B>\"\nconst showHidden = (text) =>\n  [...String(text ?? \"\")].map((ch) => (isHidden(ch) ? `<${codeOf(ch)}>` : ch)).join(\"\");", "// Invisible on purpose: the non-joiner and joiner (U+200C, U+200D), the\n// left-to-right and right-to-left marks (U+200E, U+200F), and the tag\n// characters that some flag emoji are built from. Keep them in text.\nconst KEEP_IN_TEXT = /^[\\u200C-\\u200F\\u{E0020}-\\u{E007F}]$/u;\n\nfunction cleanCell(value, kind) {\n  if (kind !== \"id\" && kind !== \"text\") {\n    throw new TypeError(`kind must be \"id\" or \"text\", got ${kind}`);\n  }\n  const chars = [...String(value ?? \"\")]; // one entry per code point\n  const changes = [];\n  let out = \"\";\n  for (let position = 0; position < chars.length; position++) {\n    const ch = chars[position];\n    if (!isHidden(ch)) {\n      out += ch;\n      continue;\n    }\n    if (ch === \"\\r\" && chars[position + 1] === \"\\n\") continue; // Windows line end\n    let to = \"\"; // drop it, unless a rule below says otherwise\n    if (/[\\n\\r\\v\\f\\u0085\\u2028\\u2029]/.test(ch)) to = \"\\n\";\n    else if (ch === \"\\t\" || /\\p{Zs}/u.test(ch)) to = \" \";\n    else if (kind === \"text\" && KEEP_IN_TEXT.test(ch)) to = ch;\n    if (to !== ch) changes.push({ position, code: codeOf(ch), name: nameOf(ch), to });\n    out += to;\n  }\n  out = out.trim();\n  let error = null;\n  if (kind === \"id\") {\n    if (/\\s/.test(out)) error = \"contains a space or line break\";\n    if (!out && changes.length) error = \"contains only invisible characters\";\n    // NFKC turns full-width letters and digits into ASCII: \"\uff21\uff22\uff11\uff12\" -> \"AB12\".\n    const normalized = out.normalize(\"NFKC\").trim();\n    if (normalized !== out) {\n      changes.push({ position: null, code: \"NFKC\", name: \"NFKC normalization\", to: normalized });\n      out = normalized;\n      if (!error && /\\s/.test(out)) error = \"contains a character that NFKC turns into a space\";\n    }\n  }\n  return { value: out, changes, error };\n}", "const COLUMN_KINDS = { email: \"id\", sku: \"id\", name: \"text\", note: \"text\" };\n\nfunction describe(change) {\n  if (change.code === \"NFKC\") return `normalized to \"${change.to}\" (NFKC)`;\n  // Positions are counted from 1 for people; cleanCell counts from 0.\n  const what = `${change.name} (${change.code}) at position ${change.position + 1}`;\n  if (change.to === \"\") return `removed ${what}`;\n  return `${what} became ${change.to === \" \" ? \"a space\" : \"a line break\"}`;\n}\n\n// rows: objects keyed by column. firstRowNumber: the file row of rows[0]\n// (2 when row 1 holds the headers), so messages match what the user sees.\nfunction cleanRows(rows, firstRowNumber = 2) {\n  const clean = [], notes = [], errors = [];\n  const firstRowOfEmail = new Map();\n  rows.forEach((row, i) => {\n    const rowNumber = firstRowNumber + i;\n    const out = { ...row }; // columns not in COLUMN_KINDS are kept as they are\n    for (const [column, kind] of Object.entries(COLUMN_KINDS)) {\n      const { value, changes, error } = cleanCell(row[column], kind);\n      out[column] = value;\n      for (const c of changes) notes.push(`Row ${rowNumber}, ${column}: ${describe(c)}`);\n      if (error) errors.push(`Row ${rowNumber}, ${column}: ${error}`);\n    }\n    // Compare emails only after cleaning; add .toLowerCase() if your app ignores case.\n    const seen = firstRowOfEmail.get(out.email);\n    if (out.email && seen) errors.push(`Row ${rowNumber}, email: same as row ${seen}`);\n    else if (out.email) firstRowOfEmail.set(out.email, rowNumber);\n    clean.push(out);\n  });\n  return { clean, notes, errors };\n}", "const { clean, notes, errors } = cleanRows([\n  { email: \"ana@example.com\", sku: \"\uff21\uff22\uff0d\uff11\uff12\uff13\", name: \"Ana Lima\", note: \"\" },\n  { email: \"ana@example.com\\u200B\", sku: \"AB-124\", name: \"Ana\\u00A0Lima\", note: \"Call\\r\\nafter 5\" },\n  { email: \"ken@example.com\", sku: \"AB 125\", name: \"Ken\", note: \"\" },\n]);\nclean[0].sku; // \"AB-123\"\nclean[1].note; // \"Call\\nafter 5\"\nnotes;\n// [\"Row 2, sku: normalized to \\\"AB-123\\\" (NFKC)\",\n//  \"Row 3, email: removed zero width space (U+200B) at position 16\",\n//  \"Row 3, name: no-break space (U+00A0) at position 4 became a space\"]\nerrors;\n// [\"Row 3, email: same as row 2\",\n//  \"Row 4, sku: contains a space or line break\"]"]) assert(!/[\u00A0\u00AD\u200B-\u200F\u2028\u2029\u202F\u2060\u3000\uFEFF]/.test(s));
+});
+}

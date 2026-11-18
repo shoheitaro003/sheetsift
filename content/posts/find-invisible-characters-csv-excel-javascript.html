@@ -1,0 +1,81 @@
+title: Remove invisible characters from CSV and Excel cells in JS
+description: Zero width spaces, no-break spaces and BOMs make equal values unequal. Tested JavaScript that finds, cleans and reports them per cell before import.
+date: 2026-11-18
+---
+<p>A customer imports a file, and your app says <code>ana@example.com</code> is not in the system, or adds her twice. The value looks right, but it holds a character you cannot see, such as a zero width space at the end. <code>trim()</code> does not remove that one, so the lookup and the duplicate check both compare different strings.</p>
+<p>By the end of this post you will have <code>cleanCell(value, kind)</code> and <code>cleanRows(rows)</code>, about 100 lines with no dependencies. They remove or replace hidden characters, treat IDs (emails, SKUs) more strictly than free text (names, notes), and report every hidden character they remove or replace, and every ID that NFKC normalization changes, with its row, so your import preview can show what was changed instead of doing it silently. Every function, and every result quoted below, is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22.</p>
+
+<h2>Why trim() is not enough</h2>
+<p>This block only shows the problem. In the code, hidden characters are written as escapes such as <code>\u200B</code> so you can see them; in a real file they are the characters themselves.</p>
+{{code:INV_PROBLEM}}
+<p><code>trim()</code> removes only some characters, and only at the two ends. The no-break space (U+00A0) is one of them. The zero width space (U+200B) is not, and neither are the soft hyphen (U+00AD) or the word joiner (U+2060). <code>/\s/</code> does not help: our test checks every character from U+0000 to U+FFFF and finds that <code>\s</code> matches exactly the characters <code>trim()</code> removes.</p>
+
+<h2>Step 1: find the characters you cannot see</h2>
+<p>Every Unicode character has a <em>general category</em>, a short code for what kind of character it is. This post treats three categories as hidden: <code>Cc</code> (control characters such as tab and line feed), <code>Cf</code> (format characters such as the zero width space and the byte order mark) and <code>Z</code> (separators: all kinds of spaces, plus the line and paragraph separators). Three blank characters are in other categories, so <code>HIDDEN</code> lists them by code: U+2800 (braille pattern blank, a symbol, <code>So</code>), U+3164 (hangul filler, a letter, <code>Lo</code>) and U+FFA0 (its half-width form, also <code>Lo</code>). A regular expression with the <code>u</code> flag can match a category with <code>\p{...}</code>, so you do not need to list every character. (Our tests check every category this post names with these same regular expressions in Node 22, and the character names against Python's <code>unicodedata</code> module.)</p>
+{{code:INV_FIND}}
+<p><code>NAMES</code> only gives readable names for the characters this post discusses; any other match is still found and reported as "invisible character" with its code, such as <code>U+202E</code>. <code>showHidden</code> is for logs and support tickets: <code>showHidden("ana@example.com\u200B")</code> returns <code>ana@example.com&lt;U+200B&gt;</code>.</p>
+
+<h2>What each tool does with each character</h2>
+<p>The table compares the built-in tools with <code>cleanCell</code> from step 2. NFKC is a Unicode normalization form, explained in step 2. Each row is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our tests</a>.</p>
+<div class="table">
+<table>
+<thead><tr><th>Character</th><th><code>trim()</code> removes it at the ends</th><th><code>/\s/</code> matches</th><th><code>normalize("NFKC")</code></th><th><code>cleanCell</code>, <code>"id"</code></th><th><code>cleanCell</code>, <code>"text"</code></th></tr></thead>
+<tbody>
+<tr><td>U+00A0 no-break space</td><td>yes</td><td>yes</td><td>space</td><td>space</td><td>space</td></tr>
+<tr><td>U+202F narrow no-break space</td><td>yes</td><td>yes</td><td>space</td><td>space</td><td>space</td></tr>
+<tr><td>U+3000 ideographic space</td><td>yes</td><td>yes</td><td>space</td><td>space</td><td>space</td></tr>
+<tr><td>U+FEFF byte order mark</td><td>yes</td><td>yes</td><td>unchanged</td><td>removed</td><td>removed</td></tr>
+<tr><td>U+200B zero width space</td><td>no</td><td>no</td><td>unchanged</td><td>removed</td><td>removed</td></tr>
+<tr><td>U+2060 word joiner</td><td>no</td><td>no</td><td>unchanged</td><td>removed</td><td>removed</td></tr>
+<tr><td>U+00AD soft hyphen</td><td>no</td><td>no</td><td>unchanged</td><td>removed</td><td>removed</td></tr>
+<tr><td>U+200D zero width joiner</td><td>no</td><td>no</td><td>unchanged</td><td>removed</td><td>kept</td></tr>
+<tr><td>U+200E left-to-right mark</td><td>no</td><td>no</td><td>unchanged</td><td>removed</td><td>kept</td></tr>
+<tr><td>U+2028 line separator</td><td>yes</td><td>yes</td><td>unchanged</td><td>line break</td><td>line break</td></tr>
+<tr><td>U+0009 tab</td><td>yes</td><td>yes</td><td>unchanged</td><td>space</td><td>space</td></tr>
+<tr><td>U+0007 alert (a control character)</td><td>no</td><td>no</td><td>unchanged</td><td>removed</td><td>removed</td></tr>
+</tbody>
+</table>
+</div>
+<p>In the <code>"id"</code> column, "space" and "line break" are only fine at the ends, where they are trimmed. Inside an ID they make <code>cleanCell</code> return an error, as step 2 explains.</p>
+
+<h2>Step 2: clean a cell by kind</h2>
+<p>The right fix depends on what the column holds, so <code>cleanCell</code> takes a <code>kind</code>. Use <code>"id"</code> for values that are compared or looked up and never contain spaces: emails, SKUs, customer numbers. Use <code>"text"</code> for values people read: names, addresses, notes.</p>
+{{code:INV_CLEAN}}
+<p>Each rule, and why:</p>
+<ul>
+<li><strong>Spaces of every width become a plain space</strong>, and tabs too. A no-break space between two words in a name is meant as a space, so it is replaced rather than removed.</li>
+<li><strong>Line ends become <code>\n</code>.</strong> That includes the vertical tab, form feed and next line controls (U+000B, U+000C, U+0085), so words on either side are not joined. A Windows line end (<code>\r\n</code>) inside a note is kept as one line break and not reported, since it is not a problem. A lone <code>\r</code> and the Unicode line and paragraph separators become <code>\n</code> and are reported.</li>
+<li><strong>Format and control characters are removed</strong>: zero width spaces, byte order marks, soft hyphens, and also control characters such as U+0007 that no cell should hold.</li>
+<li><strong>Text keeps joiners, direction marks and tag characters.</strong> The zero width joiner (U+200D) holds emoji sequences together: our test segments a family emoji, written as man, joiner, woman, joiner, girl (<code>U+1F468 U+200D U+1F469 U+200D U+1F467</code>), with <code>Intl.Segmenter</code> and gets one character with the joiners and three without them. The zero width non-joiner and the left-to-right and right-to-left marks (U+200C, U+200E, U+200F) are kept for the same reason: they are invisible on purpose, and a name or note may have been written with them. So are the tag characters (U+E0020 to U+E007F): some flag emoji are built from them, and our test shows a black flag (U+1F3F4) followed by six tag characters staying one character only while they are kept. In an ID none of these belongs, so they are removed.</li>
+<li><strong>IDs are normalized with NFKC.</strong> NFKC is the Unicode compatibility form: it turns full-width letters and digits into ASCII, so <code>ＡＢ－１２３</code> becomes <code>AB-123</code>. It also turns <code>①</code> into <code>1</code>, <code>x²</code> into <code>x2</code> and the ligature <code>ﬁ</code> into <code>fi</code>. That is what you want for an ID, but it changes what a note says, so text is not normalized. It does not turn every digit into ASCII: Arabic-Indic digits such as <code>١٢</code> stay as they are. When NFKC changes an ID, <code>cleanCell</code> records one change with code <code>"NFKC"</code> and the new value.</li>
+<li><strong>An ID with a space or line break inside is an error</strong>, not something to fix. <code>ana&nbsp;@example.com</code> (with a no-break space) could be a typo or two values in one cell; the user should decide. An ID that held nothing but hidden characters is an error too, "contains only invisible characters", since it would otherwise arrive as an empty value without warning. A few characters only become a space through NFKC, such as the acute accent <code>´</code> (U+00B4); those get their own message, "contains a character that NFKC turns into a space".</li>
+</ul>
+<p>Positions count code points from 0 (the <code>[...string]</code> spread splits a string into code points), so an emoji earlier in the value counts as one position, not two. NFKC runs after the hidden characters are handled, so the positions always refer to the original value. Plain spaces at the ends are trimmed without a note. A hidden space at an end gets a note that it became a space, and is then trimmed with the rest.</p>
+<p><code>cleanCell</code> expects a string. It turns anything else into one with <code>String()</code>, which is fine for numbers but not for dates, so turn date cells into text first, as in our post on <a href="../read-excel-dates-javascript-sheetjs/">reading Excel dates</a>.</p>
+<p>NFKC does not make every dash the same. The hyphen U+2010 stays U+2010, so <code>AB‐123</code> written with it still differs from <code>AB-123</code>. If your IDs have a fixed format, check it after cleaning (for example with a regular expression) and reject values that do not fit.</p>
+
+<h2>Step 3: report the changes and find duplicates</h2>
+<p><code>cleanRows</code> runs <code>cleanCell</code> on each column with the kind you set for it, collects notes (changes the user can review) and errors (values that must be fixed before import), and finds repeated emails after cleaning. Columns that are not in <code>COLUMN_KINDS</code> are copied unchanged, a configured column missing from a row comes back as <code>""</code>, and <code>describe</code> counts positions from 1 for people.</p>
+{{code:INV_USE}}
+<p>Here it is on three rows, as your parser might give them after reading a file whose first row holds the headers:</p>
+{{code:INV_EXAMPLE}}
+<p>The duplicate is found only because the zero width space was removed first. Show the notes in your import preview so the user knows what changed; block the import, or skip the row, while there are errors.</p>
+<p>Clean after parsing, not before. In <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test</a>, SheetJS 0.20.3 returns the zero width space and the no-break space unchanged from both an .xlsx and a CSV file, so the cleaning step is still needed after <code>XLSX.read</code>. Header names need different rules (case, plurals, punctuation); our post on <a href="../map-spreadsheet-columns-to-fields-javascript/">mapping columns to your fields</a> covers them. If your CSV parser keeps a byte order mark at the start of the file, it ends up in the first header name, so strip a leading U+FEFF there too.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Lookalike letters.</strong> The Cyrillic <code>а</code> (U+0430) is visible and looks like the Latin <code>a</code>; it is not a hidden character, so <code>cleanCell</code> keeps it. Rejecting non-ASCII characters in IDs is a separate check.</li>
+<li><strong>Other direction controls.</strong> The embedding, override and isolate characters (U+202A to U+202E and U+2066 to U+2069, all in category <code>Cf</code>) are removed from text too. If you import right-to-left text such as Arabic or Hebrew, test with real samples from your users and add these to <code>KEEP_IN_TEXT</code> if they need them.</li>
+<li><strong>Variation selectors and combining marks</strong>, such as U+FE0F (variation selector-16) or U+0301 (the combining acute accent in a decomposed <code>é</code>). They are in category <code>Mn</code>, not in the three hidden categories, so they are kept, and two spellings of <code>é</code> still compare as different strings. Add <code>normalize("NFC")</code> to text if you compare names.</li>
+<li><strong>Everything else an ID may hold.</strong> Variation selectors, private-use characters (U+E000 to U+F8FF) and broken surrogate pairs pass through <code>cleanCell</code>. After cleaning, check each ID against the characters its format allows, for example <code>/^[\x21-\x7E]+$/</code> for printable ASCII.</li>
+<li><strong>Numbers.</strong> A no-break space used as a thousands separator becomes a plain space, so <code>1&nbsp;234,5</code> is still not a number. Parse number columns with their own rules, as in our post on <a href="../parse-european-number-formats-javascript/">European number formats</a>.</li>
+<li><strong>Case.</strong> <code>Ana@Example.com</code> and <code>ana@example.com</code> stay different; lowercase the key in <code>cleanRows</code> if your app treats them as one.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer. The demo on our homepage finds the header row and reads each column's type, such as email, date or number, from its name and values. It runs in your browser: drop in a file and nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. Cleaning hidden characters as shown here is not in SheetSift yet; you are free to use the functions in this post in your own code.</p>
