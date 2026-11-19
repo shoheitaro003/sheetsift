@@ -2076,11 +2076,14 @@ ok("ph: formula errors, including names not in the list", () => {
     assert.strictEqual(cellStatus(v), "formula error", v);
   // The post says a hashtag that ends in "!" is reported as a formula error too.
   assert.strictEqual(cellStatus("#Hello!"), "formula error");
+  assert.strictEqual(cellStatus("#help?"), "formula error");
+  assert.strictEqual(cellStatus("*"), "placeholder");
   for (const v of ["#", "#!", "#1!", "#N/A N/A", "#REF! (see note)"]) assert.notStrictEqual(cellStatus(v), "formula error", v);
 });
 ok("ph: allowed values are exact and per column", () => {
   assert.strictEqual(cellStatus("NA", ["NA"]), "value");
   assert.strictEqual(cellStatus(" NA ", ["NA"]), "value");
+  assert.strictEqual(checkRecords([{ rowNumber: 2, country: " NA " }], { country: { allowed: ["NA"] } }).rows[0].country, " NA ");
   assert.strictEqual(cellStatus("na", ["NA"]), "placeholder");
   assert.strictEqual(cellStatus("NA"), "placeholder");
   assert.strictEqual(cellStatus("", ["NA"]), "blank");
