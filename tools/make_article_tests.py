@@ -1266,12 +1266,16 @@ ok("ph: readRecords keeps row numbers, values and empty rows", () => {
   XLSX.utils.book_append_sheet(empty, XLSX.utils.aoa_to_sheet([]), "S");
   assert.deepStrictEqual(readRecords(XLSX.write(empty, { type: "buffer", bookType: "xlsx" }), { Email: "email" }), []);
 });
-ok("ph: SheetJS %%XLSX_VERSION%%: a CSV keeps placeholders and error text as plain strings", () => {
+ok("ph: SheetJS %%XLSX_VERSION%%: CSV error text, with and without raw: true", () => {
   const csv = 'Email,Phone\nana@example.com,#N/A\nN/A,""\n"  ",-\n';
   const records = readRecords(Buffer.from(csv), { Email: "email", Phone: "phone" });
   assert.deepStrictEqual(records.map((r) => [r.email, r.phone]), [["ana@example.com", "#N/A"], ["N/A", ""], ["  ", "-"]]);
-  const sheet = XLSX.read(Buffer.from(csv)).Sheets[XLSX.read(Buffer.from(csv)).SheetNames[0]];
-  assert.strictEqual(sheet.B2.t, "s");
+  // Without raw: true, SheetJS reads the text #N/A in a CSV as an error cell, and sheet_to_json drops it.
+  const parsed = XLSX.read(Buffer.from(csv)).Sheets.Sheet1;
+  assert.deepStrictEqual([parsed.B2.t, parsed.B2.w], ["e", "#N/A"]);
+  assert.strictEqual(XLSX.utils.sheet_to_json(parsed, { defval: "" })[0].Phone, "");
+  // With raw: true it stays a string.
+  assert.strictEqual(XLSX.read(Buffer.from(csv), { raw: true }).Sheets.Sheet1.B2.t, "s");
   assert.deepStrictEqual(records.map((r) => cellStatus(r.phone)), ["formula error", "blank", "placeholder"]);
 });
 ok("ph: SheetJS %%XLSX_VERSION%%: sheet_to_json gives every error cell the defval, like an empty cell", () => {
