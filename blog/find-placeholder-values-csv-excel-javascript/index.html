@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Find N/A, null and blank placeholders in CSV and Excel imports | SheetSift</title>
+<meta name="description" content="Required columns pass with &quot;N/A&quot;, &quot;-&quot; or &quot;TBD&quot; in them, and SheetJS reads #REF! cells as empty. Tested JavaScript that flags each one by row before import.">
+<link rel="canonical" href="https://shoheitaro003.github.io/sheetsift/blog/find-placeholder-values-csv-excel-javascript/">
+<meta property="og:title" content="Find N/A, null and blank placeholders in CSV and Excel imports | SheetSift">
+<meta property="og:description" content="Required columns pass with &quot;N/A&quot;, &quot;-&quot; or &quot;TBD&quot; in them, and SheetJS reads #REF! cells as empty. Tested JavaScript that flags each one by row before import.">
+<meta property="og:url" content="https://shoheitaro003.github.io/sheetsift/blog/find-placeholder-values-csv-excel-javascript/">
+<meta property="og:site_name" content="SheetSift">
+<meta name="twitter:card" content="summary">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400&display=swap">
+<link rel="stylesheet" href="../../blog.css">
+<meta property="og:type" content="article">
+<meta property="article:published_time" content="2026-11-19">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "Find N/A, null and blank placeholders in CSV and Excel imports", "description": "Required columns pass with \"N/A\", \"-\" or \"TBD\" in them, and SheetJS reads #REF! cells as empty. Tested JavaScript that flags each one by row before import.", "datePublished": "2026-11-19", "dateModified": "2026-11-19", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/find-placeholder-values-csv-excel-javascript/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="logo" href="../../"><svg width="24" height="24" viewBox="0 0 26 26" aria-hidden="true"><rect x="1" y="1" width="24" height="24" rx="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M1 9h24M9 9v16" stroke="currentColor" stroke-width="2"/><rect x="11" y="12" width="12" height="4" fill="var(--mark)"/></svg> SheetSift</a>
+  <nav class="nav"><a href="../../blog/">Blog</a><a class="btn" href="../../#try">Try the demo</a></nav>
+</div></header>
+<main><div class="wrap">
+<article>
+<h1>Find N/A, null and blank placeholders in CSV and Excel imports</h1>
+<p class="meta"><time datetime="2026-11-19">2026-11-19</time></p>
+<p>Your import requires an email in every row, and the check is <code>if (!row.email)</code>. A customer's file has <code>N/A</code> in some rows, <code>-</code> in others and a few cells with only spaces. All of them pass, and your database now holds contacts whose email is the text "N/A".</p>
+<p>By the end of this post you will have <code>cellStatus(value)</code>, which tells a real value from a blank cell, a placeholder or a formula error, and <code>checkRecords(records, columns)</code>, which turns that into row-by-row errors for required columns and notes for optional ones. You will also see why reading an .xlsx file with <code>sheet_to_json</code> hides formula errors, and how to read them. Every function and every result quoted below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22 with SheetJS 0.20.3.</p>
+
+<h2>Why a truthy check is not enough</h2>
+<pre><code>const row = { email: &quot;N/A&quot;, name: &quot;   &quot;, company: &quot;-&quot; };
+Boolean(row.email);       // true
+row.name.length &gt; 0;      // true
+row.company !== &quot;&quot;;       // true
+</code></pre>
+<p>A required-field check usually asks "is there a string here?". People who fill in spreadsheets answer a different question: "what do I type when I do not know?". The answer is a <em>placeholder</em>, text that stands for "no value", and it is a non-empty string, so every check above passes.</p>
+<p>Data tools in other languages handle part of this for you. pandas' <code>read_csv</code>, for example, treats an empty string, "NaN", "N/A" and "NULL" as missing by default, plus what its documentation calls "other common representations of missing data" (<a href="https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html">pandas 3.1.1 documentation</a>, read 2026-11-19). In a JavaScript importer you write that list yourself, so you also decide what is on it.</p>
+
+<h2>Step 1: tell values from placeholders</h2>
+<p><code>cellStatus</code> sorts a cell into one of four groups. <strong>Blank</strong> is nothing, or only whitespace.</p>
+<p><strong>Placeholder</strong> is a word from a fixed list, or a cell made only of punctuation such as <code>-</code> or <code>?</code>. <strong>Formula error</strong> is text like <code>#REF!</code> that a spreadsheet shows when a formula fails; in a CSV export it arrives as plain text. Everything else is a <strong>value</strong>.</p>
+<pre><code>// Text that stands for &quot;no value&quot;, compared in lower case, with spaces,
+// opening and closing brackets and trailing dots or question marks removed,
+// so &quot;(None)&quot;, &quot;[blank]&quot;, &quot;N/A.&quot; and &quot;TBD?&quot; match.
+const PLACEHOLDERS = new Set([
+  &quot;n/a&quot;, &quot;n.a&quot;, &quot;na&quot;, &quot;none&quot;, &quot;null&quot;, &quot;nil&quot;, &quot;nan&quot;, &quot;undefined&quot;, &quot;unknown&quot;,
+  &quot;notapplicable&quot;, &quot;notavailable&quot;, &quot;notprovided&quot;, &quot;tbd&quot;, &quot;tba&quot;, &quot;tbc&quot;, &quot;blank&quot;, &quot;empty&quot;, &quot;missing&quot;,
+]);
+
+// A cell made only of punctuation: &quot;-&quot;, &quot;- -&quot;, &quot;?&quot;, &quot;...&quot;, &quot;/&quot;, &quot;#&quot;, &quot;—&quot;.
+const ONLY_PUNCTUATION = /^\p{P}+$/u;
+
+// Formula errors, as a CSV export writes them: &quot;#N/A&quot;, &quot;#REF!&quot;, &quot;#DIV/0!&quot;.
+// The second part catches any &quot;#WORD!&quot; or &quot;#WORD?&quot; so newer error names are found too.
+// Case-insensitive, so a hand-typed &quot;#n/a&quot; is caught.
+const FORMULA_ERROR = /^#(N\/A|GETTING_DATA|[A-Z][A-Z0-9\/_]*[!?])$/i;
+
+// Returns &quot;value&quot;, &quot;blank&quot;, &quot;placeholder&quot; or &quot;formula error&quot;.
+// allowed: values that look like placeholders but are real in this column,
+// compared exactly after trim(), for example [&quot;NA&quot;] in a country column.
+function cellStatus(value, allowed = []) {
+  if (value === null || value === undefined) return &quot;blank&quot;;
+  const text = String(value).trim();
+  if (text === &quot;&quot;) return &quot;blank&quot;;
+  if (allowed.includes(text)) return &quot;value&quot;;
+  if (FORMULA_ERROR.test(text)) return &quot;formula error&quot;;
+  const squeezed = text.toLowerCase().replace(/\s+/g, &quot;&quot;);
+  if (ONLY_PUNCTUATION.test(squeezed)) return &quot;placeholder&quot;;
+  const key = squeezed.replace(/^[(\[&lt;]+|[)\]&gt;.?]+$/g, &quot;&quot;);
+  if (PLACEHOLDERS.has(key)) return &quot;placeholder&quot;;
+  return &quot;value&quot;;
+}
+</code></pre>
+<p>Why each rule is there:</p>
+<ul>
+<li><strong>Whole cells only.</strong> The list is compared with the entire cell, so <code>none of the above</code>, <code>Nina</code> and <code>n/a/b</code> stay values. Before the comparison, spaces are removed, then brackets at the start and end and dots or question marks at the end, so <code>N / A</code>, <code>(None)</code>, <code>[blank]</code>, <code>N/A.</code> and <code>TBD?</code> all match.</li>
+<li><strong>Punctuation, not symbols.</strong> <code>\p{P}</code> is the Unicode punctuation category. It holds hyphens, dashes, dots, question marks, slashes, the asterisk and the underscore, and also <code>#</code>, <code>%</code>, <code>@</code>, <code>&amp;</code> and quote marks, so a cell holding only one of those is a placeholder too. Spaces are removed first, so <code>- -</code> counts. Currency signs, <code>+</code>, <code>~</code> and <code>|</code> are symbols, not punctuation, so a lone <code>$</code> stays a value. <code>-5</code> has a digit, so it is a value too.</li>
+<li><strong>Formula errors are separate</strong> because the fix is different, and they are checked first. A placeholder means the person had no value; <code>#REF!</code> means the file had one and a broken formula lost it. The second half of the pattern accepts any name that starts with a letter and ends in <code>!</code> or <code>?</code>, so error names that are not in the list are still caught. The match ignores case, so a hand-typed <code>#n/a</code> is caught; the price is that a cell that holds only a hashtag ending in <code>!</code> or <code>?</code>, such as <code>#Hello!</code>, is a formula error too.</li>
+<li><strong>Numbers and booleans are values.</strong> <code>0</code> and <code>false</code> are answers, not gaps. The number <code>NaN</code> is the exception: it becomes the text "NaN", which is on the list.</li>
+</ul>
+<p>Here is what it returns for common inputs. The test reads this table from the post and checks every row.</p>
+<div class="table">
+<table>
+<thead><tr><th>Cell</th><th>Why</th><th><code>cellStatus</code></th></tr></thead>
+<tbody>
+<tr class="st"><td><code>""</code> <code>"   "</code> <code>null</code> <code>undefined</code></td><td>nothing after <code>trim()</code></td><td>blank</td></tr>
+<tr class="st"><td><code>N/A</code> <code>n.a.</code> <code>NA</code> <code>None</code> <code>NULL</code></td><td>on the list, any case</td><td>placeholder</td></tr>
+<tr class="st"><td><code>TBD</code> <code>unknown</code> <code>(blank)</code> <code>missing</code></td><td>on the list</td><td>placeholder</td></tr>
+<tr class="st"><td><code>(None)</code> <code>[blank]</code> <code>N/A.</code> <code>Not applicable</code></td><td>on the list after brackets, dots and spaces go</td><td>placeholder</td></tr>
+<tr class="st"><td><code>-</code> <code>- -</code> <code>?</code> <code>...</code> <code>#</code></td><td>only punctuation</td><td>placeholder</td></tr>
+<tr class="st"><td><code>#N/A</code> <code>#REF!</code> <code>#DIV/0!</code> <code>#SPILL!</code></td><td>formula error text</td><td>formula error</td></tr>
+<tr class="st"><td><code>#Hello!</code></td><td>looks like an error name (the known false positive)</td><td>formula error</td></tr>
+<tr class="st"><td><code>0</code> <code>false</code> <code>-5</code></td><td>real answers</td><td>value</td></tr>
+<tr class="st"><td><code>Nina</code> <code>none of the above</code> <code>NAB</code></td><td>not a whole-cell match</td><td>value</td></tr>
+<tr class="st"><td><code>$</code> <code>~</code> <code>#123</code> <code>C#</code></td><td>symbols, or no <code>!</code> or <code>?</code> at the end</td><td>value</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Step 2: when a placeholder is a real value</h2>
+<p>Some placeholders are real data in one column. <code>NA</code> is the two-letter region code for Namibia: in Node 22, <code>new Intl.DisplayNames("en", { type: "region" }).of("NA")</code> returns <code>"Namibia"</code>. Treat it as missing in a country column and you reject every customer there.</p>
+<p>That is what the <code>allowed</code> argument is for. It is a list per column, compared exactly after <code>trim()</code>, so <code>["NA"]</code> lets <code>NA</code> through but still flags <code>na</code> and <code>N/A</code>. A value that passes keeps its spaces (<code>" NA "</code> stays <code>" NA "</code>); trim it when you store it.</p>
+<p>Keep the list short and per column: allowing <code>NA</code> everywhere would let it through in the email column too. If a column has a fixed set of codes, such as countries, validate against that set instead; then the placeholder check only has to catch the gaps.</p>
+
+<h2>Step 3: errors for required columns, notes for the rest</h2>
+<p>A blank or placeholder in a required column must be fixed before import. In an optional column it should become a real empty value (<code>null</code>), so "n/a" does not end up in your database as text, and the user should see that it happened. A formula error is always an error, required or not, because a value existed and was lost.</p>
+<pre><code>// columns: { field: { required, allowed } }. records: objects from your parser,
+// each with the spreadsheet row number in rowNumber.
+// Import rows only when no problem has level &quot;error&quot;.
+function checkRecords(records, columns) {
+  const rows = [];
+  const problems = [];
+  const skipped = [];
+  for (const record of records) {
+    const statuses = Object.keys(columns).map((field) =&gt;
+      [field, cellStatus(record[field], columns[field].allowed)]);
+    // A row with nothing in it is padding, not a record with missing values.
+    if (statuses.every(([, status]) =&gt; status === &quot;blank&quot;)) { skipped.push(record.rowNumber); continue; }
+
+    const out = { rowNumber: record.rowNumber };
+    for (const [field, status] of statuses) {
+      const value = record[field];
+      if (status === &quot;value&quot;) { out[field] = value; continue; }
+      out[field] = null;
+      const problem = { row: record.rowNumber, field, value: value ?? &quot;&quot;, status };
+      if (status === &quot;formula error&quot; || columns[field].required) problems.push({ ...problem, level: &quot;error&quot; });
+      else if (status === &quot;placeholder&quot;) problems.push({ ...problem, level: &quot;note&quot; });
+    }
+    rows.push(out);
+  }
+  if (rows.length === 0) problems.push({ row: null, field: null, value: &quot;&quot;, status: &quot;no data rows&quot;, level: &quot;error&quot; });
+  return { rows, problems, skipped };
+}
+
+function describe(problem) {
+  if (problem.status === &quot;no data rows&quot;) return &quot;The file has no data rows.&quot;;
+  const where = `Row ${problem.row}, ${problem.field}: `;
+  const shown = JSON.stringify(String(problem.value));
+  if (problem.status === &quot;formula error&quot;) return where + `${shown} is a formula error in the file. Fix it there and export again.`;
+  if (problem.level === &quot;note&quot;) return where + `${shown} was read as empty.`;
+  if (problem.status === &quot;blank&quot;) return where + &quot;is empty, but this column is required.&quot;;
+  return where + `${shown} is a placeholder, but this column is required.`;
+}
+</code></pre>
+<p>Three choices in <code>checkRecords</code> are worth knowing:</p>
+<ul>
+<li><strong><code>rows</code> holds every row that was checked, including rows with errors</strong>, so you can show them in a preview. Import them only when no problem has level <code>"error"</code>.</li>
+<li><strong>Empty rows are skipped, not reported as missing values.</strong> Spreadsheets often end with blank rows, and reporting each as "email is empty" buries the real problems. A row is skipped if every configured column is blank; columns you did not configure are not looked at. <code>skipped</code> lists the row numbers, so you can mention blank rows in the middle of the data, which can mean a paste went wrong. A row of dashes is not skipped: someone typed them, so they are reported.</li>
+<li><strong>A file with no data rows is an error</strong>, so a header-only file does not import as a silent success.</li>
+</ul>
+<p>Here it is on four rows. <code>rowNumber</code> is the row number the user sees in their spreadsheet (the header is row 1), so the messages point to the right place.</p>
+<pre><code>const columns = {
+  email:   { required: true },
+  country: { required: true, allowed: [&quot;NA&quot;] }, // &quot;NA&quot; is Namibia
+  phone:   {},
+};
+const { rows, problems, skipped } = checkRecords([
+  { rowNumber: 2, email: &quot;ana@example.com&quot;, country: &quot;NA&quot;,  phone: &quot;n/a&quot; },
+  { rowNumber: 3, email: &quot;N/A&quot;,             country: &quot;DE&quot;,  phone: &quot;&quot; },
+  { rowNumber: 4, email: &quot;bo@example.com&quot;,  country: &quot;  &quot;,  phone: &quot;#REF!&quot; },
+  { rowNumber: 5, email: &quot;&quot;,                country: &quot;&quot;,    phone: &quot;&quot; },
+], columns);
+
+problems.map(describe);
+// [ &#x27;Row 2, phone: &quot;n/a&quot; was read as empty.&#x27;,
+//   &#x27;Row 3, email: &quot;N/A&quot; is a placeholder, but this column is required.&#x27;,
+//   &#x27;Row 4, country: is empty, but this column is required.&#x27;,
+//   &#x27;Row 4, phone: &quot;#REF!&quot; is a formula error in the file. Fix it there and export again.&#x27; ]
+skipped;       // [5]  (row numbers of empty rows)
+rows[0].phone; // null
+</code></pre>
+<p>Show the errors and block the import until they are fixed; show the notes in your preview so the user can see what was cleared. Values that pass are returned unchanged, so run your other checks (email format, numbers, dates) after this one.</p>
+
+<h2>Step 4: read Excel error cells with SheetJS</h2>
+<p>In an .xlsx file, a failed formula is not text. The cell has type <code>"e"</code> and a numeric error code. In our test with SheetJS 0.20.3, <code>sheet_to_json</code> returns such a cell as an empty value, for all eight error codes the test writes: with <code>defval: null</code> you get <code>null</code>; with <code>defval: ""</code> you get <code>""</code>, except for <code>#NULL!</code>, which comes back as <code>null</code>. This holds with <code>header: 1</code> or without it, with <code>raw: false</code> or without it.</p>
+<p>So <code>#REF!</code> in a required column reaches your check as "empty", and the user is told to fill in a cell that already shows an error. <code>sheet_to_csv</code> writes the error text instead.</p>
+<p>The fix is to read the cells yourself and use the error's text, which SheetJS stores in the cell's <code>w</code> property. If <code>w</code> is ever missing, the fallback <code>#ERROR!</code> is still reported as a formula error.</p>
+<pre><code>// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
+import * as XLSX from &quot;xlsx&quot;;
+
+// Records from the first sheet, with Excel error cells kept as their text (&quot;#REF!&quot;)
+// and the spreadsheet row number in rowNumber. headers: { &quot;Header text&quot;: &quot;field&quot; }.
+function readRecords(bytes, headers) {
+  // raw: true keeps CSV text as text, so &quot;0123&quot; is not turned into the number 123.
+  const workbook = XLSX.read(bytes, { raw: true });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  if (!sheet || !sheet[&quot;!ref&quot;]) return [];
+  const range = XLSX.utils.decode_range(sheet[&quot;!ref&quot;]);
+  const cellText = (r, c) =&gt; {
+    const cell = sheet[XLSX.utils.encode_cell({ r, c })];
+    if (!cell) return &quot;&quot;;
+    if (cell.t === &quot;e&quot;) return cell.w ?? &quot;#ERROR!&quot;; // w holds the error text, such as &quot;#REF!&quot;
+    return cell.v;
+  };
+  // The first row holds the headers.
+  const fieldOf = [];
+  for (let c = range.s.c; c &lt;= range.e.c; c++) {
+    const header = String(cellText(range.s.r, c)).trim();
+    if (Object.hasOwn(headers, header)) fieldOf[c] = headers[header]; // not &quot;constructor&quot; etc.
+  }
+  const records = [];
+  for (let r = range.s.r + 1; r &lt;= range.e.r; r++) {
+    const record = { rowNumber: r + 1 };
+    for (let c = range.s.c; c &lt;= range.e.c; c++) if (fieldOf[c]) record[fieldOf[c]] = cellText(r, c);
+    records.push(record);
+  }
+  return records;
+}
+</code></pre>
+<p>Our test writes eight error codes into an .xlsx file with SheetJS, reads it back with <code>readRecords</code>, and checks that each one arrives as its text (<code>#NULL!</code>, <code>#DIV/0!</code>, <code>#VALUE!</code>, <code>#REF!</code>, <code>#NAME?</code>, <code>#NUM!</code>, <code>#N/A</code>, <code>#GETTING_DATA</code>) and that <code>cellStatus</code> reports it as a formula error. The same function reads a CSV, and there the option <code>raw: true</code> matters twice. Without it, our test shows SheetJS reading the text <code>#N/A</code> in a CSV as an error cell, so <code>sheet_to_json</code> drops it just as it does in an .xlsx file. With it, <code>#N/A</code> stays a string; <code>readRecords</code> returns <code>"#N/A"</code> either way.</p>
+<p><code>raw: true</code> also stops other conversions in text formats: without it, our test shows SheetJS turning <code>0123</code> into the number 123 and <code>TRUE</code> into <code>true</code>. In our .xlsx test, numbers still arrive as numbers with it. In an .xlsx file, a date cell's <code>v</code> is a serial number; our post on <a href="../read-excel-dates-javascript-sheetjs/">reading Excel dates</a> shows how to convert it.</p>
+<p>A quoted empty cell (<code>""</code>) in a CSV arrives as an empty value. Rows with no cells at all come back with every field <code>""</code>, which <code>checkRecords</code> then skips.</p>
+<p><code>readRecords</code> reads only the first sheet and assumes the headers are in the first row and match your names exactly. Before calling <code>checkRecords</code>, check that every required column was found: if <code>Email</code> is spelled <code>E-mail</code> in the file, every row would be reported as having an empty email, or skipped as empty, instead of one clear "column not found" message. Real files often have title rows above the headers and headers spelled many ways; our posts on <a href="../detect-header-row-spreadsheet-javascript/">finding the header row</a> and <a href="../map-spreadsheet-columns-to-fields-javascript/">mapping columns to your fields</a> cover both.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Invisible characters.</strong> <code>trim()</code> does not remove a zero width space, so a cell holding only U+200B is a "value" here. Run the cleaning from our post on <a href="../find-invisible-characters-csv-excel-javascript/">invisible characters</a> first.</li>
+<li><strong>Sentinel values</strong> such as <code>0</code>, <code>999</code> or <code>1900-01-01</code> that some systems write for "unknown". They are valid numbers and dates, so only a rule for that column can catch them, for example "a birth date before 1901 is an error".</li>
+<li><strong>Placeholders in other languages.</strong> The list is English. Add the words your users type, in lower case without spaces.</li>
+<li><strong>What a dash means in a number column.</strong> <code>-</code> is a placeholder here. If your users' files use it for zero, treat that column separately.</li>
+<li><strong>Short names.</strong> Placeholders match in any case and without spaces, so a person whose name is written <code>Nan</code>, <code>Na</code> or <code>Null</code> is flagged. In name columns, make this a warning the user can dismiss rather than an error, or add the names to <code>allowed</code>.</li>
+<li><strong>Merged cells and repeated headers.</strong> In a merged cell only the top-left cell holds the value, so the other rows read as empty and are flagged. Two columns with the same header map to one field, and the last one wins. Check for both when you read the sheet if your users' files have them.</li>
+<li><strong>Single marks.</strong> If your users' files use <code>x</code> for "none", add it per column; on a shared list it would also catch real values such as a size. The reverse also happens: in a checkbox column a lone <code>*</code> may mean "yes", but here it is punctuation and so a placeholder.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer. The demo on our homepage finds the header row and reads each column's type, such as email, date or number, from its name and values. It runs in your browser: drop in a file and nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. Flagging placeholders as shown here is not in SheetSift yet; you are free to use the functions in this post in your own code.</p>
+
+</article>
+</div></main>
+<footer><div class="wrap"><span>SheetSift · a drop-in importer for messy Excel and CSV files</span><a href="../../#waitlist">Join the waitlist</a></div>
+<div class="wrap"><small>Visits are counted with <a href="https://www.goatcounter.com/">GoatCounter</a>, which does not track you across sites.</small></div></footer>
+<script>
+// Page view counter (GoatCounter). Only on the public site, so local runs and tests are never counted.
+if (location.hostname === "shoheitaro003.github.io") {
+  var gc = document.createElement("script");
+  gc.async = true; gc.src = "https://gc.zgo.at/count.js";
+  gc.setAttribute("data-goatcounter", "https://sheetsift.goatcounter.com/count");
+  document.body.appendChild(gc);
+}
+</script>
+</body>
+</html>

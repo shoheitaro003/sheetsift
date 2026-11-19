@@ -2,7 +2,8 @@
 
 Take the top unchecked item. Add new ideas from questions people send.
 
-- [ ] Placeholder values in required columns: empty, whitespace-only, "N/A", "-", "null" and "TBD" cells, and how to flag them before import (gap found in the review of the invisible characters post, 2026-11-18)
+- [x] Placeholder values in required columns: empty, whitespace-only, "N/A", "-", "null" and "TBD" cells, and how to flag them before import (published 2026-11-19)
+- [ ] Required columns missing from the file: report "column not found" once instead of an empty-value error on every row; also repeated headers and merged cells (gaps found in the review of the placeholders post, 2026-11-19)
 - [ ] Lookalike letters in imported emails and IDs: detect Cyrillic or Greek letters mixed into Latin text with Unicode script properties (left out of the invisible characters post, 2026-11-18)
 - [x] Why CSV importers break on real Excel files (published 2026-11-05)
 - [x] Flatfile is now Obvious: what should importer users do? (published 2026-11-05)

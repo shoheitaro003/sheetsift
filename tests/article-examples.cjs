@@ -1935,3 +1935,286 @@ ok("inv: no invisible characters in the snippets", () => {
   for (const s of ["const typed = \"ana@example.com\";\nconst imported = \"ana@example.com\\u200B\"; // a zero width space at the end\n\ntyped === imported;                // false\nimported.length;                   // 16\nimported.trim() === typed;         // false: trim() keeps U+200B\n\"\\u00A0ana@example.com\".trim() === typed; // true: trim() removes U+00A0", "// Control (Cc), format (Cf) and separator (Z) characters, plus three blank\n// characters that Unicode files as letters or symbols. The plain space is a\n// separator too, so the code below always lets \" \" through.\nconst HIDDEN = /^[\\p{Cc}\\p{Cf}\\p{Z}\\u2800\\u3164\\uFFA0]$/u;\n\nconst NAMES = {\n  \"\\t\": \"tab\",\n  \"\\n\": \"line feed\",\n  \"\\r\": \"carriage return\",\n  \"\\u00A0\": \"no-break space\",\n  \"\\u00AD\": \"soft hyphen\",\n  \"\\u200B\": \"zero width space\",\n  \"\\u200C\": \"zero width non-joiner\",\n  \"\\u200D\": \"zero width joiner\",\n  \"\\u200E\": \"left-to-right mark\",\n  \"\\u200F\": \"right-to-left mark\",\n  \"\\u2028\": \"line separator\",\n  \"\\u202F\": \"narrow no-break space\",\n  \"\\u2060\": \"word joiner\",\n  \"\\u2800\": \"braille pattern blank\",\n  \"\\u3000\": \"ideographic space\",\n  \"\\u3164\": \"hangul filler\",\n  \"\\uFEFF\": \"byte order mark\",\n  \"\\uFFA0\": \"halfwidth hangul filler\",\n};\n\nconst codeOf = (ch) =>\n  \"U+\" + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, \"0\");\nconst nameOf = (ch) => NAMES[ch] ?? (/\\p{Zs}/u.test(ch) ? \"space\" : \"invisible character\");\nconst isHidden = (ch) => ch !== \" \" && HIDDEN.test(ch);\n\n// For logs and previews: \"ana@example.com<U+200B>\"\nconst showHidden = (text) =>\n  [...String(text ?? \"\")].map((ch) => (isHidden(ch) ? `<${codeOf(ch)}>` : ch)).join(\"\");", "// Invisible on purpose: the non-joiner and joiner (U+200C, U+200D), the\n// left-to-right and right-to-left marks (U+200E, U+200F), and the tag\n// characters that some flag emoji are built from. Keep them in text.\nconst KEEP_IN_TEXT = /^[\\u200C-\\u200F\\u{E0020}-\\u{E007F}]$/u;\n\nfunction cleanCell(value, kind) {\n  if (kind !== \"id\" && kind !== \"text\") {\n    throw new TypeError(`kind must be \"id\" or \"text\", got ${kind}`);\n  }\n  const chars = [...String(value ?? \"\")]; // one entry per code point\n  const changes = [];\n  let out = \"\";\n  for (let position = 0; position < chars.length; position++) {\n    const ch = chars[position];\n    if (!isHidden(ch)) {\n      out += ch;\n      continue;\n    }\n    if (ch === \"\\r\" && chars[position + 1] === \"\\n\") continue; // Windows line end\n    let to = \"\"; // drop it, unless a rule below says otherwise\n    if (/[\\n\\r\\v\\f\\u0085\\u2028\\u2029]/.test(ch)) to = \"\\n\";\n    else if (ch === \"\\t\" || /\\p{Zs}/u.test(ch)) to = \" \";\n    else if (kind === \"text\" && KEEP_IN_TEXT.test(ch)) to = ch;\n    if (to !== ch) changes.push({ position, code: codeOf(ch), name: nameOf(ch), to });\n    out += to;\n  }\n  out = out.trim();\n  let error = null;\n  if (kind === \"id\") {\n    if (/\\s/.test(out)) error = \"contains a space or line break\";\n    if (!out && changes.length) error = \"contains only invisible characters\";\n    // NFKC turns full-width letters and digits into ASCII: \"\uff21\uff22\uff11\uff12\" -> \"AB12\".\n    const normalized = out.normalize(\"NFKC\").trim();\n    if (normalized !== out) {\n      changes.push({ position: null, code: \"NFKC\", name: \"NFKC normalization\", to: normalized });\n      out = normalized;\n      if (!error && /\\s/.test(out)) error = \"contains a character that NFKC turns into a space\";\n    }\n  }\n  return { value: out, changes, error };\n}", "const COLUMN_KINDS = { email: \"id\", sku: \"id\", name: \"text\", note: \"text\" };\n\nfunction describe(change) {\n  if (change.code === \"NFKC\") return `normalized to \"${change.to}\" (NFKC)`;\n  // Positions are counted from 1 for people; cleanCell counts from 0.\n  const what = `${change.name} (${change.code}) at position ${change.position + 1}`;\n  if (change.to === \"\") return `removed ${what}`;\n  return `${what} became ${change.to === \" \" ? \"a space\" : \"a line break\"}`;\n}\n\n// rows: objects keyed by column. firstRowNumber: the file row of rows[0]\n// (2 when row 1 holds the headers), so messages match what the user sees.\nfunction cleanRows(rows, firstRowNumber = 2) {\n  const clean = [], notes = [], errors = [];\n  const firstRowOfEmail = new Map();\n  rows.forEach((row, i) => {\n    const rowNumber = firstRowNumber + i;\n    const out = { ...row }; // columns not in COLUMN_KINDS are kept as they are\n    for (const [column, kind] of Object.entries(COLUMN_KINDS)) {\n      const { value, changes, error } = cleanCell(row[column], kind);\n      out[column] = value;\n      for (const c of changes) notes.push(`Row ${rowNumber}, ${column}: ${describe(c)}`);\n      if (error) errors.push(`Row ${rowNumber}, ${column}: ${error}`);\n    }\n    // Compare emails only after cleaning; add .toLowerCase() if your app ignores case.\n    const seen = firstRowOfEmail.get(out.email);\n    if (out.email && seen) errors.push(`Row ${rowNumber}, email: same as row ${seen}`);\n    else if (out.email) firstRowOfEmail.set(out.email, rowNumber);\n    clean.push(out);\n  });\n  return { clean, notes, errors };\n}", "const { clean, notes, errors } = cleanRows([\n  { email: \"ana@example.com\", sku: \"\uff21\uff22\uff0d\uff11\uff12\uff13\", name: \"Ana Lima\", note: \"\" },\n  { email: \"ana@example.com\\u200B\", sku: \"AB-124\", name: \"Ana\\u00A0Lima\", note: \"Call\\r\\nafter 5\" },\n  { email: \"ken@example.com\", sku: \"AB 125\", name: \"Ken\", note: \"\" },\n]);\nclean[0].sku; // \"AB-123\"\nclean[1].note; // \"Call\\nafter 5\"\nnotes;\n// [\"Row 2, sku: normalized to \\\"AB-123\\\" (NFKC)\",\n//  \"Row 3, email: removed zero width space (U+200B) at position 16\",\n//  \"Row 3, name: no-break space (U+00A0) at position 4 became a space\"]\nerrors;\n// [\"Row 3, email: same as row 2\",\n//  \"Row 4, sku: contains a space or line break\"]"]) assert(!/[\u00A0\u00AD\u200B-\u200F\u2028\u2029\u202F\u2060\u3000\uFEFF]/.test(s));
 });
 }
+
+// --- blog/find-placeholder-values-csv-excel-javascript ---
+{
+const XLSX = require(process.env.XLSX_MODULE || "xlsx");
+// Text that stands for "no value", compared in lower case, with spaces,
+// opening and closing brackets and trailing dots or question marks removed,
+// so "(None)", "[blank]", "N/A." and "TBD?" match.
+const PLACEHOLDERS = new Set([
+  "n/a", "n.a", "na", "none", "null", "nil", "nan", "undefined", "unknown",
+  "notapplicable", "notavailable", "notprovided", "tbd", "tba", "tbc", "blank", "empty", "missing",
+]);
+
+// A cell made only of punctuation: "-", "- -", "?", "...", "/", "#", "—".
+const ONLY_PUNCTUATION = /^\p{P}+$/u;
+
+// Formula errors, as a CSV export writes them: "#N/A", "#REF!", "#DIV/0!".
+// The second part catches any "#WORD!" or "#WORD?" so newer error names are found too.
+// Case-insensitive, so a hand-typed "#n/a" is caught.
+const FORMULA_ERROR = /^#(N\/A|GETTING_DATA|[A-Z][A-Z0-9\/_]*[!?])$/i;
+
+// Returns "value", "blank", "placeholder" or "formula error".
+// allowed: values that look like placeholders but are real in this column,
+// compared exactly after trim(), for example ["NA"] in a country column.
+function cellStatus(value, allowed = []) {
+  if (value === null || value === undefined) return "blank";
+  const text = String(value).trim();
+  if (text === "") return "blank";
+  if (allowed.includes(text)) return "value";
+  if (FORMULA_ERROR.test(text)) return "formula error";
+  const squeezed = text.toLowerCase().replace(/\s+/g, "");
+  if (ONLY_PUNCTUATION.test(squeezed)) return "placeholder";
+  const key = squeezed.replace(/^[(\[<]+|[)\]>.?]+$/g, "");
+  if (PLACEHOLDERS.has(key)) return "placeholder";
+  return "value";
+}
+
+
+// columns: { field: { required, allowed } }. records: objects from your parser,
+// each with the spreadsheet row number in rowNumber.
+// Import rows only when no problem has level "error".
+function checkRecords(records, columns) {
+  const rows = [];
+  const problems = [];
+  const skipped = [];
+  for (const record of records) {
+    const statuses = Object.keys(columns).map((field) =>
+      [field, cellStatus(record[field], columns[field].allowed)]);
+    // A row with nothing in it is padding, not a record with missing values.
+    if (statuses.every(([, status]) => status === "blank")) { skipped.push(record.rowNumber); continue; }
+
+    const out = { rowNumber: record.rowNumber };
+    for (const [field, status] of statuses) {
+      const value = record[field];
+      if (status === "value") { out[field] = value; continue; }
+      out[field] = null;
+      const problem = { row: record.rowNumber, field, value: value ?? "", status };
+      if (status === "formula error" || columns[field].required) problems.push({ ...problem, level: "error" });
+      else if (status === "placeholder") problems.push({ ...problem, level: "note" });
+    }
+    rows.push(out);
+  }
+  if (rows.length === 0) problems.push({ row: null, field: null, value: "", status: "no data rows", level: "error" });
+  return { rows, problems, skipped };
+}
+
+function describe(problem) {
+  if (problem.status === "no data rows") return "The file has no data rows.";
+  const where = `Row ${problem.row}, ${problem.field}: `;
+  const shown = JSON.stringify(String(problem.value));
+  if (problem.status === "formula error") return where + `${shown} is a formula error in the file. Fix it there and export again.`;
+  if (problem.level === "note") return where + `${shown} was read as empty.`;
+  if (problem.status === "blank") return where + "is empty, but this column is required.";
+  return where + `${shown} is a placeholder, but this column is required.`;
+}
+
+
+
+// Records from the first sheet, with Excel error cells kept as their text ("#REF!")
+// and the spreadsheet row number in rowNumber. headers: { "Header text": "field" }.
+function readRecords(bytes, headers) {
+  // raw: true keeps CSV text as text, so "0123" is not turned into the number 123.
+  const workbook = XLSX.read(bytes, { raw: true });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  if (!sheet || !sheet["!ref"]) return [];
+  const range = XLSX.utils.decode_range(sheet["!ref"]);
+  const cellText = (r, c) => {
+    const cell = sheet[XLSX.utils.encode_cell({ r, c })];
+    if (!cell) return "";
+    if (cell.t === "e") return cell.w ?? "#ERROR!"; // w holds the error text, such as "#REF!"
+    return cell.v;
+  };
+  // The first row holds the headers.
+  const fieldOf = [];
+  for (let c = range.s.c; c <= range.e.c; c++) {
+    const header = String(cellText(range.s.r, c)).trim();
+    if (Object.hasOwn(headers, header)) fieldOf[c] = headers[header]; // not "constructor" etc.
+  }
+  const records = [];
+  for (let r = range.s.r + 1; r <= range.e.r; r++) {
+    const record = { rowNumber: r + 1 };
+    for (let c = range.s.c; c <= range.e.c; c++) if (fieldOf[c]) record[fieldOf[c]] = cellText(r, c);
+    records.push(record);
+  }
+  return records;
+}
+
+
+ok("ph: the problem lines print what the comments say", () => {
+  const lines = "const row = { email: \"N/A\", name: \"   \", company: \"-\" };\nBoolean(row.email);       // true\nrow.name.length > 0;      // true\nrow.company !== \"\";       // true\n".split("\n");
+  const setup = lines.filter((l) => l.startsWith("const ")).join("\n");
+  let checked = 0;
+  for (const line of lines) {
+    const m = /^(.*?);\s*\/\/ (true|false)$/.exec(line);
+    if (!m || line.startsWith("const ")) continue;
+    assert.strictEqual(String(new Function(setup + "\nreturn (" + m[1] + ");")()), m[2], line);
+    checked++;
+  }
+  assert.strictEqual(checked, 3);
+});
+ok("ph: every row of the status table in the post", () => {
+  const table = [[["\"\"", "\"   \"", "null", "undefined"], "blank"], [["N/A", "n.a.", "NA", "None", "NULL"], "placeholder"], [["TBD", "unknown", "(blank)", "missing"], "placeholder"], [["(None)", "[blank]", "N/A.", "Not applicable"], "placeholder"], [["-", "- -", "?", "...", "#"], "placeholder"], [["#N/A", "#REF!", "#DIV/0!", "#SPILL!"], "formula error"], [["#Hello!"], "formula error"], [["0", "false", "-5"], "value"], [["Nina", "none of the above", "NAB"], "value"], [["$", "~", "#123", "C#"], "value"]];
+  for (const [inputs, want] of table) for (const input of inputs) {
+    const value = input === "null" ? null : input === "undefined" ? undefined : input.replace(/^"|"$/g, "");
+    assert.strictEqual(cellStatus(value), want, JSON.stringify(input));
+  }
+});
+ok("ph: cellStatus finds placeholders and leaves real values alone", () => {
+  const placeholders = ["N/A", "n/a", " N / A ", "n.a.", "NA", "na", "None", "NULL", "nil", "NaN", "undefined", "Unknown",
+    "TBD", "tba", "TBC", "(blank)", "(None)", "[blank]", "<null>", "N/A.", "None.", "N/A?", "TBD?", "Not applicable", "not available", "Not provided", "- -", ". . .", "#", "%", "@", "&", "-", "--", "\u2013", "\u2014", "?", "???", "...", ".", "/", "*", "_"];
+  for (const v of placeholders) assert.strictEqual(cellStatus(v), "placeholder", JSON.stringify(v));
+  assert.strictEqual(cellStatus(NaN), "placeholder");
+  for (const v of ["", "   ", "\t", "\u00a0", "\u3000", null, undefined]) assert.strictEqual(cellStatus(v), "blank", JSON.stringify(v));
+  const values = ["Nina", "NAB", "Anna", "none of the above", "Null Island Ltd", "0", 0, false, "false", "-5", "$", "+", "€",
+    "#1", "#123", "#hashtag", "C#", "n/a/b", "N/A2", "~", "|", "x", "(Nina)", "Nan Li", "2026-11-19", new Date(Date.UTC(2026, 0, 5))];
+  for (const v of values) assert.strictEqual(cellStatus(v), "value", JSON.stringify(v));
+});
+ok("ph: formula errors, including names not in the list", () => {
+  for (const v of ["#N/A", "#n/a", "#REF!", "#DIV/0!", "#VALUE!", "#NAME?", "#NUM!", "#NULL!", "#GETTING_DATA", "#SPILL!", "#CALC!", " #REF! "])
+    assert.strictEqual(cellStatus(v), "formula error", v);
+  // The post says a hashtag that ends in "!" is reported as a formula error too.
+  assert.strictEqual(cellStatus("#Hello!"), "formula error");
+  assert.strictEqual(cellStatus("#help?"), "formula error");
+  assert.strictEqual(cellStatus("*"), "placeholder");
+  for (const v of ["#", "#!", "#1!", "#N/A N/A", "#REF! (see note)"]) assert.notStrictEqual(cellStatus(v), "formula error", v);
+});
+ok("ph: allowed values are exact and per column", () => {
+  assert.strictEqual(cellStatus("NA", ["NA"]), "value");
+  assert.strictEqual(cellStatus(" NA ", ["NA"]), "value");
+  assert.strictEqual(checkRecords([{ rowNumber: 2, country: " NA " }], { country: { allowed: ["NA"] } }).rows[0].country, " NA ");
+  assert.strictEqual(cellStatus("na", ["NA"]), "placeholder");
+  assert.strictEqual(cellStatus("NA"), "placeholder");
+  assert.strictEqual(cellStatus("", ["NA"]), "blank");
+  assert.strictEqual(cellStatus("#N/A", ["NA"]), "formula error");
+  assert.strictEqual(new Intl.DisplayNames("en", { type: "region" }).of("NA"), "Namibia");
+});
+ok("ph: known limits stated in the post", () => {
+  // A zero width space is not trimmed and is not punctuation: clean invisible characters first.
+  assert.strictEqual(cellStatus("\u200b"), "value");
+  // Sentinel values are not placeholders.
+  for (const v of ["0", "999", "1900-01-01", "x"]) assert.strictEqual(cellStatus(v), "value", v);
+});
+ok("ph: the example gives the output in its comments", () => {
+  const src = "const columns = {\n  email:   { required: true },\n  country: { required: true, allowed: [\"NA\"] }, // \"NA\" is Namibia\n  phone:   {},\n};\nconst { rows, problems, skipped } = checkRecords([\n  { rowNumber: 2, email: \"ana@example.com\", country: \"NA\",  phone: \"n/a\" },\n  { rowNumber: 3, email: \"N/A\",             country: \"DE\",  phone: \"\" },\n  { rowNumber: 4, email: \"bo@example.com\",  country: \"  \",  phone: \"#REF!\" },\n  { rowNumber: 5, email: \"\",                country: \"\",    phone: \"\" },\n], columns);\n\nproblems.map(describe);\n// [ 'Row 2, phone: \"n/a\" was read as empty.',\n//   'Row 3, email: \"N/A\" is a placeholder, but this column is required.',\n//   'Row 4, country: is empty, but this column is required.',\n//   'Row 4, phone: \"#REF!\" is a formula error in the file. Fix it there and export again.' ]\nskipped;       // [5]  (row numbers of empty rows)\nrows[0].phone; // null\n";
+  const got = new Function("checkRecords", "describe", src + "\nreturn { rows, problems, skipped, messages: problems.map(describe) };")(checkRecords, describe);
+  assert.deepStrictEqual(got.messages, [
+    'Row 2, phone: "n/a" was read as empty.',
+    'Row 3, email: "N/A" is a placeholder, but this column is required.',
+    'Row 4, country: is empty, but this column is required.',
+    'Row 4, phone: "#REF!" is a formula error in the file. Fix it there and export again.',
+  ]);
+  const comment = src.slice(src.indexOf("// [")).split("\n").filter((l) => l.startsWith("//")).join("\n");
+  for (const m of got.messages) assert(comment.includes(m), m);
+  assert.deepStrictEqual(got.skipped, [5]);
+  assert.strictEqual(got.rows.length, 3);
+  assert.strictEqual(got.rows[0].phone, null);
+  assert.strictEqual(got.rows[0].country, "NA");
+  assert.deepStrictEqual(got.rows.map((r) => r.rowNumber), [2, 3, 4]);
+  assert(/skipped;\s+\/\/ \[5\] /.test(src) && /rows\[0\]\.phone; \/\/ null/.test(src));
+});
+ok("ph: checkRecords edge cases", () => {
+  const cols = { email: { required: true }, note: {} };
+  // Header only, or only empty rows: one error, nothing to import.
+  for (const records of [[], [{ rowNumber: 2, email: "", note: "  " }]]) {
+    const r = checkRecords(records, cols);
+    assert.deepStrictEqual(r.rows, []);
+    assert.deepStrictEqual(r.problems.map(describe), ["The file has no data rows."]);
+  }
+  // A missing field counts as blank; a formula error in an optional column is still an error.
+  const r = checkRecords([{ rowNumber: 7, note: "#VALUE!" }, { rowNumber: 8, email: "a@b.co", note: "-" }], cols);
+  assert.deepStrictEqual(r.problems.map((p) => [p.row, p.field, p.status, p.level]),
+    [[7, "email", "blank", "error"], [7, "note", "formula error", "error"], [8, "note", "placeholder", "note"]]);
+  assert.strictEqual(describe(r.problems[0]), "Row 7, email: is empty, but this column is required.");
+  // A row of placeholders is not skipped: someone typed them.
+  const dashes = checkRecords([{ rowNumber: 3, email: "-", note: "-" }], cols);
+  assert.deepStrictEqual(dashes.skipped, []);
+  assert.deepStrictEqual(dashes.problems.map((p) => p.level), ["error", "note"]);
+  // Real values are passed through unchanged (not trimmed, not converted).
+  const kept = checkRecords([{ rowNumber: 2, email: " a@b.co ", note: 0 }], cols);
+  assert.deepStrictEqual(kept.rows, [{ rowNumber: 2, email: " a@b.co ", note: 0 }]);
+});
+const phBook = (rows, errors = {}) => {
+  const sheet = XLSX.utils.aoa_to_sheet(rows);
+  for (const [address, code] of Object.entries(errors)) sheet[address] = { t: "e", v: code };
+  const book = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(book, sheet, "Contacts");
+  return XLSX.write(book, { type: "buffer", bookType: "xlsx" });
+};
+ok("ph: SheetJS 0.20.3: sheet_to_json turns Excel error cells into empty cells", () => {
+  assert.strictEqual(XLSX.version, "0.20.3");
+  const bytes = phBook([["Email", "Phone"], ["ana@example.com", ""], ["bo@example.com", ""]], { B2: 0x17, B3: 0x2a });
+  const sheet = XLSX.read(bytes).Sheets.Contacts;
+  assert.deepStrictEqual([sheet.B2.t, sheet.B2.w, sheet.B3.w], ["e", "#REF!", "#N/A"]);
+  assert.deepStrictEqual(XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" }).slice(1).map((r) => r[1]), ["", ""]);
+  assert.deepStrictEqual(XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", raw: false }).slice(1).map((r) => r[1]), ["", ""]);
+  assert.deepStrictEqual(XLSX.utils.sheet_to_json(sheet, { defval: null }).map((r) => r.Phone), [null, null]);
+  // ...while sheet_to_csv writes the error text.
+  assert.strictEqual(XLSX.utils.sheet_to_csv(sheet).split("\n")[1], "ana@example.com,#REF!");
+});
+ok("ph: SheetJS 0.20.3: every error code it writes reads back as text the check finds", () => {
+  const codes = [0x00, 0x07, 0x0f, 0x17, 0x1d, 0x24, 0x2a, 0x2b];
+  const errors = Object.fromEntries(codes.map((code, i) => ["B" + (i + 2), code]));
+  const rows = [["Email", "Phone"], ...codes.map((_, i) => ["u" + i + "@example.com", ""])];
+  const records = readRecords(phBook(rows, errors), { Email: "email", Phone: "phone" });
+  assert.deepStrictEqual(records.map((r) => r.phone), ["#NULL!", "#DIV/0!", "#VALUE!", "#REF!", "#NAME?", "#NUM!", "#N/A", "#GETTING_DATA"]);
+  for (const r of records) assert.strictEqual(cellStatus(r.phone), "formula error", r.phone);
+});
+ok("ph: readRecords keeps row numbers, values and empty rows", () => {
+  const bytes = phBook([["Email", "Country", "Ignored"], ["ana@example.com", "NA", "x"], [], ["N/A", "DE", ""], ["", 0, ""]]);
+  const records = readRecords(bytes, { Email: "email", Country: "country" });
+  assert.deepStrictEqual(records, [
+    { rowNumber: 2, email: "ana@example.com", country: "NA" },
+    { rowNumber: 3, email: "", country: "" },
+    { rowNumber: 4, email: "N/A", country: "DE" },
+    { rowNumber: 5, email: "", country: 0 },
+  ]);
+  const { problems, skipped } = checkRecords(records, { email: { required: true }, country: { required: true, allowed: ["NA"] } });
+  assert.deepStrictEqual(skipped, [3]);
+  assert.deepStrictEqual(problems.map((p) => [p.row, p.field, p.status]), [[4, "email", "placeholder"], [5, "email", "blank"]]);
+  // An empty workbook sheet gives no records.
+  const empty = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(empty, XLSX.utils.aoa_to_sheet([]), "S");
+  assert.deepStrictEqual(readRecords(XLSX.write(empty, { type: "buffer", bookType: "xlsx" }), { Email: "email" }), []);
+});
+ok("ph: SheetJS 0.20.3: CSV error text, with and without raw: true", () => {
+  const csv = 'Email,Phone\nana@example.com,#N/A\nN/A,""\n"  ",-\n';
+  const records = readRecords(Buffer.from(csv), { Email: "email", Phone: "phone" });
+  assert.deepStrictEqual(records.map((r) => [r.email, r.phone]), [["ana@example.com", "#N/A"], ["N/A", ""], ["  ", "-"]]);
+  // Without raw: true, SheetJS reads the text #N/A in a CSV as an error cell, and sheet_to_json drops it.
+  const parsed = XLSX.read(Buffer.from(csv)).Sheets.Sheet1;
+  assert.deepStrictEqual([parsed.B2.t, parsed.B2.w], ["e", "#N/A"]);
+  assert.strictEqual(XLSX.utils.sheet_to_json(parsed, { defval: "" })[0].Phone, "");
+  // With raw: true it stays a string.
+  assert.strictEqual(XLSX.read(Buffer.from(csv), { raw: true }).Sheets.Sheet1.B2.t, "s");
+  assert.deepStrictEqual(records.map((r) => cellStatus(r.phone)), ["formula error", "blank", "placeholder"]);
+});
+ok("ph: SheetJS 0.20.3: sheet_to_json gives every error cell the defval, like an empty cell", () => {
+  const codes = [0x00, 0x07, 0x0f, 0x17, 0x1d, 0x24, 0x2a, 0x2b];
+  const errors = Object.fromEntries(codes.map((code, i) => ["B" + (i + 2), code]));
+  const rows = [["Email", "Phone"], ...codes.map((_, i) => ["u" + i + "@example.com", ""])];
+  const sheet = XLSX.read(phBook(rows, errors)).Sheets.Contacts;
+  for (const raw of [true, false]) {
+    // #NULL! (code 0) comes back as null even with defval: "".
+    const withEmpty = codes.map((code) => (code === 0 ? null : ""));
+    assert.deepStrictEqual(XLSX.utils.sheet_to_json(sheet, { defval: "", raw }).map((r) => r.Phone), withEmpty);
+    assert.deepStrictEqual(XLSX.utils.sheet_to_json(sheet, { defval: null, raw }).map((r) => r.Phone), codes.map(() => null));
+    assert.deepStrictEqual(XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", raw }).slice(1).map((r) => r[1]), withEmpty);
+  }
+});
+ok("ph: readRecords ignores headers that are Object.prototype names", () => {
+  const records = readRecords(phBook([["Email", "constructor", "toString"], ["a@b.co", "x", "y"]]), { Email: "email" });
+  assert.deepStrictEqual(records, [{ rowNumber: 2, email: "a@b.co" }]);
+});
+ok("ph: SheetJS 0.20.3: raw: true keeps CSV text; without it values are converted", () => {
+  const csv = Buffer.from("Phone,Active\n0123,TRUE\n");
+  const plain = XLSX.read(csv).Sheets.Sheet1;
+  assert.deepStrictEqual([plain.A2.v, plain.B2.v], [123, true]);
+  const records = readRecords(csv, { Phone: "phone", Active: "active" });
+  assert.deepStrictEqual(records, [{ rowNumber: 2, phone: "0123", active: "TRUE" }]);
+});
+ok("ph: snippets have no invisible characters", () => {
+  for (const s of ["const row = { email: \"N/A\", name: \"   \", company: \"-\" };\nBoolean(row.email);       // true\nrow.name.length > 0;      // true\nrow.company !== \"\";       // true\n", "// Text that stands for \"no value\", compared in lower case, with spaces,\n// opening and closing brackets and trailing dots or question marks removed,\n// so \"(None)\", \"[blank]\", \"N/A.\" and \"TBD?\" match.\nconst PLACEHOLDERS = new Set([\n  \"n/a\", \"n.a\", \"na\", \"none\", \"null\", \"nil\", \"nan\", \"undefined\", \"unknown\",\n  \"notapplicable\", \"notavailable\", \"notprovided\", \"tbd\", \"tba\", \"tbc\", \"blank\", \"empty\", \"missing\",\n]);\n\n// A cell made only of punctuation: \"-\", \"- -\", \"?\", \"...\", \"/\", \"#\", \"\u2014\".\nconst ONLY_PUNCTUATION = /^\\p{P}+$/u;\n\n// Formula errors, as a CSV export writes them: \"#N/A\", \"#REF!\", \"#DIV/0!\".\n// The second part catches any \"#WORD!\" or \"#WORD?\" so newer error names are found too.\n// Case-insensitive, so a hand-typed \"#n/a\" is caught.\nconst FORMULA_ERROR = /^#(N\\/A|GETTING_DATA|[A-Z][A-Z0-9\\/_]*[!?])$/i;\n\n// Returns \"value\", \"blank\", \"placeholder\" or \"formula error\".\n// allowed: values that look like placeholders but are real in this column,\n// compared exactly after trim(), for example [\"NA\"] in a country column.\nfunction cellStatus(value, allowed = []) {\n  if (value === null || value === undefined) return \"blank\";\n  const text = String(value).trim();\n  if (text === \"\") return \"blank\";\n  if (allowed.includes(text)) return \"value\";\n  if (FORMULA_ERROR.test(text)) return \"formula error\";\n  const squeezed = text.toLowerCase().replace(/\\s+/g, \"\");\n  if (ONLY_PUNCTUATION.test(squeezed)) return \"placeholder\";\n  const key = squeezed.replace(/^[(\\[<]+|[)\\]>.?]+$/g, \"\");\n  if (PLACEHOLDERS.has(key)) return \"placeholder\";\n  return \"value\";\n}\n", "// columns: { field: { required, allowed } }. records: objects from your parser,\n// each with the spreadsheet row number in rowNumber.\n// Import rows only when no problem has level \"error\".\nfunction checkRecords(records, columns) {\n  const rows = [];\n  const problems = [];\n  const skipped = [];\n  for (const record of records) {\n    const statuses = Object.keys(columns).map((field) =>\n      [field, cellStatus(record[field], columns[field].allowed)]);\n    // A row with nothing in it is padding, not a record with missing values.\n    if (statuses.every(([, status]) => status === \"blank\")) { skipped.push(record.rowNumber); continue; }\n\n    const out = { rowNumber: record.rowNumber };\n    for (const [field, status] of statuses) {\n      const value = record[field];\n      if (status === \"value\") { out[field] = value; continue; }\n      out[field] = null;\n      const problem = { row: record.rowNumber, field, value: value ?? \"\", status };\n      if (status === \"formula error\" || columns[field].required) problems.push({ ...problem, level: \"error\" });\n      else if (status === \"placeholder\") problems.push({ ...problem, level: \"note\" });\n    }\n    rows.push(out);\n  }\n  if (rows.length === 0) problems.push({ row: null, field: null, value: \"\", status: \"no data rows\", level: \"error\" });\n  return { rows, problems, skipped };\n}\n\nfunction describe(problem) {\n  if (problem.status === \"no data rows\") return \"The file has no data rows.\";\n  const where = `Row ${problem.row}, ${problem.field}: `;\n  const shown = JSON.stringify(String(problem.value));\n  if (problem.status === \"formula error\") return where + `${shown} is a formula error in the file. Fix it there and export again.`;\n  if (problem.level === \"note\") return where + `${shown} was read as empty.`;\n  if (problem.status === \"blank\") return where + \"is empty, but this column is required.\";\n  return where + `${shown} is a placeholder, but this column is required.`;\n}\n", "const columns = {\n  email:   { required: true },\n  country: { required: true, allowed: [\"NA\"] }, // \"NA\" is Namibia\n  phone:   {},\n};\nconst { rows, problems, skipped } = checkRecords([\n  { rowNumber: 2, email: \"ana@example.com\", country: \"NA\",  phone: \"n/a\" },\n  { rowNumber: 3, email: \"N/A\",             country: \"DE\",  phone: \"\" },\n  { rowNumber: 4, email: \"bo@example.com\",  country: \"  \",  phone: \"#REF!\" },\n  { rowNumber: 5, email: \"\",                country: \"\",    phone: \"\" },\n], columns);\n\nproblems.map(describe);\n// [ 'Row 2, phone: \"n/a\" was read as empty.',\n//   'Row 3, email: \"N/A\" is a placeholder, but this column is required.',\n//   'Row 4, country: is empty, but this column is required.',\n//   'Row 4, phone: \"#REF!\" is a formula error in the file. Fix it there and export again.' ]\nskipped;       // [5]  (row numbers of empty rows)\nrows[0].phone; // null\n", "// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz\nimport * as XLSX from \"xlsx\";\n\n// Records from the first sheet, with Excel error cells kept as their text (\"#REF!\")\n// and the spreadsheet row number in rowNumber. headers: { \"Header text\": \"field\" }.\nfunction readRecords(bytes, headers) {\n  // raw: true keeps CSV text as text, so \"0123\" is not turned into the number 123.\n  const workbook = XLSX.read(bytes, { raw: true });\n  const sheet = workbook.Sheets[workbook.SheetNames[0]];\n  if (!sheet || !sheet[\"!ref\"]) return [];\n  const range = XLSX.utils.decode_range(sheet[\"!ref\"]);\n  const cellText = (r, c) => {\n    const cell = sheet[XLSX.utils.encode_cell({ r, c })];\n    if (!cell) return \"\";\n    if (cell.t === \"e\") return cell.w ?? \"#ERROR!\"; // w holds the error text, such as \"#REF!\"\n    return cell.v;\n  };\n  // The first row holds the headers.\n  const fieldOf = [];\n  for (let c = range.s.c; c <= range.e.c; c++) {\n    const header = String(cellText(range.s.r, c)).trim();\n    if (Object.hasOwn(headers, header)) fieldOf[c] = headers[header]; // not \"constructor\" etc.\n  }\n  const records = [];\n  for (let r = range.s.r + 1; r <= range.e.r; r++) {\n    const record = { rowNumber: r + 1 };\n    for (let c = range.s.c; c <= range.e.c; c++) if (fieldOf[c]) record[fieldOf[c]] = cellText(r, c);\n    records.push(record);\n  }\n  return records;\n}\n"]) assert(!/[\u00A0\u00AD\u200B-\u200F\u2028\u2029\u202F\u2060\u3000\uFEFF]/.test(s));
+});
+}
