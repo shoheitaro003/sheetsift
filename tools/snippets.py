@@ -1080,3 +1080,136 @@ notes;
 errors;
 // ["Row 3, email: same as row 2",
 //  "Row 4, sku: contains a space or line break"]'''
+
+# --- blog/find-placeholder-values-csv-excel-javascript ---
+PH_PROBLEM = r'''const row = { email: "N/A", name: "   ", company: "-" };
+Boolean(row.email);       // true
+row.name.length > 0;      // true
+row.company !== "";       // true
+'''
+
+PH_STATUS = r'''// Text that stands for "no value", compared in lower case, with spaces,
+// opening and closing brackets and trailing dots or question marks removed,
+// so "(None)", "[blank]", "N/A." and "TBD?" match.
+const PLACEHOLDERS = new Set([
+  "n/a", "n.a", "na", "none", "null", "nil", "nan", "undefined", "unknown",
+  "notapplicable", "notavailable", "notprovided", "tbd", "tba", "tbc", "blank", "empty", "missing",
+]);
+
+// A cell made only of punctuation: "-", "- -", "?", "...", "/", "#", "—".
+const ONLY_PUNCTUATION = /^\p{P}+$/u;
+
+// Formula errors, as a CSV export writes them: "#N/A", "#REF!", "#DIV/0!".
+// The second part catches any "#WORD!" or "#WORD?" so newer error names are found too.
+// Case-insensitive, so a hand-typed "#n/a" is caught.
+const FORMULA_ERROR = /^#(N\/A|GETTING_DATA|[A-Z][A-Z0-9\/_]*[!?])$/i;
+
+// Returns "value", "blank", "placeholder" or "formula error".
+// allowed: values that look like placeholders but are real in this column,
+// compared exactly after trim(), for example ["NA"] in a country column.
+function cellStatus(value, allowed = []) {
+  if (value === null || value === undefined) return "blank";
+  const text = String(value).trim();
+  if (text === "") return "blank";
+  if (allowed.includes(text)) return "value";
+  if (FORMULA_ERROR.test(text)) return "formula error";
+  const squeezed = text.toLowerCase().replace(/\s+/g, "");
+  if (ONLY_PUNCTUATION.test(squeezed)) return "placeholder";
+  const key = squeezed.replace(/^[(\[<]+|[)\]>.?]+$/g, "");
+  if (PLACEHOLDERS.has(key)) return "placeholder";
+  return "value";
+}
+'''
+
+PH_CHECK = r'''// columns: { field: { required, allowed } }. records: objects from your parser,
+// each with the spreadsheet row number in rowNumber.
+// Import rows only when no problem has level "error".
+function checkRecords(records, columns) {
+  const rows = [];
+  const problems = [];
+  const skipped = [];
+  for (const record of records) {
+    const statuses = Object.keys(columns).map((field) =>
+      [field, cellStatus(record[field], columns[field].allowed)]);
+    // A row with nothing in it is padding, not a record with missing values.
+    if (statuses.every(([, status]) => status === "blank")) { skipped.push(record.rowNumber); continue; }
+
+    const out = { rowNumber: record.rowNumber };
+    for (const [field, status] of statuses) {
+      const value = record[field];
+      if (status === "value") { out[field] = value; continue; }
+      out[field] = null;
+      const problem = { row: record.rowNumber, field, value: value ?? "", status };
+      if (status === "formula error" || columns[field].required) problems.push({ ...problem, level: "error" });
+      else if (status === "placeholder") problems.push({ ...problem, level: "note" });
+    }
+    rows.push(out);
+  }
+  if (rows.length === 0) problems.push({ row: null, field: null, value: "", status: "no data rows", level: "error" });
+  return { rows, problems, skipped };
+}
+
+function describe(problem) {
+  if (problem.status === "no data rows") return "The file has no data rows.";
+  const where = `Row ${problem.row}, ${problem.field}: `;
+  const shown = JSON.stringify(String(problem.value));
+  if (problem.status === "formula error") return where + `${shown} is a formula error in the file. Fix it there and export again.`;
+  if (problem.level === "note") return where + `${shown} was read as empty.`;
+  if (problem.status === "blank") return where + "is empty, but this column is required.";
+  return where + `${shown} is a placeholder, but this column is required.`;
+}
+'''
+
+PH_EXAMPLE = r'''const columns = {
+  email:   { required: true },
+  country: { required: true, allowed: ["NA"] }, // "NA" is Namibia
+  phone:   {},
+};
+const { rows, problems, skipped } = checkRecords([
+  { rowNumber: 2, email: "ana@example.com", country: "NA",  phone: "n/a" },
+  { rowNumber: 3, email: "N/A",             country: "DE",  phone: "" },
+  { rowNumber: 4, email: "bo@example.com",  country: "  ",  phone: "#REF!" },
+  { rowNumber: 5, email: "",                country: "",    phone: "" },
+], columns);
+
+problems.map(describe);
+// [ 'Row 2, phone: "n/a" was read as empty.',
+//   'Row 3, email: "N/A" is a placeholder, but this column is required.',
+//   'Row 4, country: is empty, but this column is required.',
+//   'Row 4, phone: "#REF!" is a formula error in the file. Fix it there and export again.' ]
+skipped;       // [5]  (row numbers of empty rows)
+rows[0].phone; // null
+'''
+
+PH_SHEETJS = r'''// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
+import * as XLSX from "xlsx";
+
+// Records from the first sheet, with Excel error cells kept as their text ("#REF!")
+// and the spreadsheet row number in rowNumber. headers: { "Header text": "field" }.
+function readRecords(bytes, headers) {
+  // raw: true keeps CSV text as text, so "0123" is not turned into the number 123.
+  const workbook = XLSX.read(bytes, { raw: true });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  if (!sheet || !sheet["!ref"]) return [];
+  const range = XLSX.utils.decode_range(sheet["!ref"]);
+  const cellText = (r, c) => {
+    const cell = sheet[XLSX.utils.encode_cell({ r, c })];
+    if (!cell) return "";
+    if (cell.t === "e") return cell.w ?? "#ERROR!"; // w holds the error text, such as "#REF!"
+    return cell.v;
+  };
+  // The first row holds the headers.
+  const fieldOf = [];
+  for (let c = range.s.c; c <= range.e.c; c++) {
+    const header = String(cellText(range.s.r, c)).trim();
+    if (Object.hasOwn(headers, header)) fieldOf[c] = headers[header]; // not "constructor" etc.
+  }
+  const records = [];
+  for (let r = range.s.r + 1; r <= range.e.r; r++) {
+    const record = { rowNumber: r + 1 };
+    for (let c = range.s.c; c <= range.e.c; c++) if (fieldOf[c]) record[fieldOf[c]] = cellText(r, c);
+    records.push(record);
+  }
+  return records;
+}
+'''
