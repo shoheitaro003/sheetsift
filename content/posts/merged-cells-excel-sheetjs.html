@@ -1,0 +1,93 @@
+title: Handle merged cells in Excel imports with SheetJS
+description: SheetJS returns a merged cell's value only in its top-left cell. Tested JavaScript that fills merged rows, names two-row headers and flags the rest.
+date: 2026-11-20
+---
+<p>A customer uploads a sales report. "North" is merged over two rows, "Q1" over two columns, and the header takes two rows. Your importer reads it with <code>sheet_to_json</code> and gets columns called <code>__EMPTY</code>, a first record that is really the second header row, and a row where the region is empty.</p>
+<p>By the end of this post you will have <code>readMergedTable(bytes)</code>, about 170 lines on top of SheetJS. It turns a two-row header into one name per column (<code>Q1 Revenue</code>), copies merged values down their column, skips title rows, and reports with Excel addresses the merges it should not guess about. Every function and every result quoted below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22 with SheetJS 0.20.3.</p>
+
+<h2>What SheetJS gives you</h2>
+<p>When you merge cells in Excel, "the contents of only one cell (the upper-left cell for left-to-right languages, or the upper-right cell for right-to-left languages) appear in the merged cell", and "the contents of the other cells that you merge are deleted" (<a href="https://support.microsoft.com/en-us/excel/get-started/merge-and-unmerge-cells-in-excel">Microsoft Support, "Merge and unmerge cells in Excel"</a>, updated 2026-11-19, read 2026-11-20). The file stores the value in one cell and the merge as a separate list of ranges.</p>
+<p>Here is the report from the introduction. Our test file was written by openpyxl, a Python library, so it is not a file SheetJS wrote itself; a file SheetJS writes gives the same results.</p>
+{{code:MG_PROBLEM}}
+<p>Three things go wrong. Columns under a group label have no name, so SheetJS calls them <code>__EMPTY</code> and <code>__EMPTY_1</code>. The second header row comes back as a record. And every row covered by a merge, except the first, is empty in the merged column.</p>
+<p>The merges are all there in <code>sheet["!merges"]</code>; the code below uses them.</p>
+
+<h2>Step 1: read the rows and the merges</h2>
+{{code:MG_READ}}
+<p><code>header: 1</code> returns each row as an array, so you decide what the column names are. <code>defval: ""</code> fills missing cells and <code>blankrows: true</code> keeps empty rows, so <code>rows[r][c]</code> always points at the same cell as the sheet.</p>
+<p>A sheet's stored range does not have to start at A1. <code>origin</code> is its first cell, and each merge is moved by it so it uses the same positions as <code>rows</code>. The original <code>address</code> is kept, because that is what the user sees in Excel. <code>raw: true</code> keeps CSV text as text, so <code>0123</code> is not turned into 123.</p>
+
+<h2>Step 2: find the header rows and name the columns</h2>
+<p>The header has more than one row when a merge in it says so. A label merged down, like <code>Region</code> over rows 1 and 2, covers the row below. A label merged across, like <code>Q1</code> over C and D, names a group, so the row below holds the real column names.</p>
+{{code:MG_HEADER}}
+<p>Why each rule is there:</p>
+<ul>
+<li><strong>A header row holds only text.</strong> A row with a number, a date or a boolean is data, so a merged header over data columns cannot swallow the first record. (With <code>raw: true</code>, dates in an .xlsx file arrive as serial numbers; our post on <a href="../read-excel-dates-javascript-sheetjs/">reading Excel dates</a> shows how to convert them.)</li>
+<li><strong>A group needs a label under every column it covers.</strong> <code>Q1</code> over <code>Revenue</code> and an empty cell is not a two-row header.</li>
+<li><strong>The loop repeats</strong> because one extra row can bring in another: <code>2026</code> over <code>Q1</code> and <code>Q2</code>, each over <code>Rev</code> and <code>Cost</code>, gives names like <code>2026 Q1 Rev</code>.</li>
+<li><strong><code>maxDepth</code> is 3</strong> because a label merged down over many rows is more likely a layout choice than a header. Such a merge is reported in step 3.</li>
+<li><strong>A merge counts once per column.</strong> <code>Region</code> merged over two rows gives <code>Region</code>, not <code>Region Region</code>.</li>
+</ul>
+<p>With our tests, these headers give these results:</p>
+<div class="table">
+<table>
+<thead><tr><th>Header (merged cells)</th><th>Rows</th><th>Column names</th></tr></thead>
+<tbody>
+<tr><td><code>Name</code>, <code>Email</code> (none)</td><td>1</td><td><code>Name</code>, <code>Email</code></td></tr>
+<tr><td><code>Region</code> (A1:A2), <code>Q1</code> (C1:D1) over <code>Revenue</code>, <code>Cost</code></td><td>2</td><td><code>Region</code>, <code>Q1 Revenue</code>, <code>Q1 Cost</code></td></tr>
+<tr><td><code>2026</code> over <code>Q1</code>, <code>Q2</code>, each over <code>Rev</code>, <code>Cost</code></td><td>3</td><td><code>2026 Q1 Rev</code> and three more</td></tr>
+<tr><td><code>Q1</code> (B1:C1) over <code>Revenue</code> and an empty cell</td><td>1</td><td>the row below is data</td></tr>
+<tr><td><code>Amount</code> (B1:C1) over numbers</td><td>1</td><td><code>Amount</code>, <code>Amount</code>: reported as a repeated name</td></tr>
+<tr><td><code>Name</code> (A1:A5) over five rows</td><td>1</td><td>reported: the merge runs into the data</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Step 3: fill or flag the merges in the data</h2>
+<p>Below the header, the shape of a merge tells you what it means. Only one shape is safe to fill.</p>
+<div class="table">
+<table>
+<thead><tr><th>Merge in the data</th><th>Usually means</th><th>What <code>fillMerges</code> does</th></tr></thead>
+<tbody>
+<tr><td>One column, several rows (A3:A4)</td><td>a group label, such as a region for several reps</td><td>copies the value down; adds a note</td></tr>
+<tr><td>One row, the whole table width (A6:F6)</td><td>a title, a section name or a footnote</td><td>skips the row; adds a note</td></tr>
+<tr><td>Some columns of one row (C8:D8)</td><td>a long text that needed room</td><td>leaves the value in the first column; reports a problem</td></tr>
+<tr><td>Several rows and columns (A5:B6)</td><td>layout</td><td>reports a problem</td></tr>
+<tr><td>Starts in the header, ends in the data</td><td>a mistake, or a header the rules missed</td><td>reports a problem</td></tr>
+</tbody>
+</table>
+</div>
+{{code:MG_DATA}}
+<p>Filling across columns is the mistake to avoid: a note merged over C and D would also land in D, which may be your amount column. The value stays in the column where the file stores it, and the user decides.</p>
+<p>Excel deletes the other cells' contents when you merge, but a file written by another program can still hold values under a merge. Our test writes one with SheetJS: <code>North</code> merged over A2:A3, with <code>South</code> stored in A3. Excel would show <code>North</code>, so that is what is used, and the hidden value is reported, because the user cannot see it in their sheet.</p>
+
+<h2>Step 4: read the table</h2>
+<p><code>readMergedTable</code> puts the steps together and returns one record per data row, with the row number the user sees in Excel.</p>
+{{code:MG_TABLE}}
+<p>Besides the merges, it reports two header problems that merges often cause: a column with data but no name, and a name used twice (compared without case). A repeated name is an error, not a detail: in an object the second column would overwrite the first. A column with neither a name nor data is dropped without a message.</p>
+<p>Here it is on the sales report:</p>
+{{code:MG_EXAMPLE}}
+<p>Show the notes in your import preview, so the user can see that <code>North</code> was copied and row 6 was skipped. Show the problems and let the user fix the file, or confirm, before you import.</p>
+<p>If the header is not in the first row, pass its index as <code>headerTop</code>: our post on <a href="../detect-header-row-spreadsheet-javascript/">finding the header row</a> finds it. A title merged across the top, such as <code>Sales export</code> in A1:B1, is above the header and is ignored. To match the combined names to your own fields, use <a href="../map-spreadsheet-columns-to-fields-javascript/">column mapping</a>; it also reports required fields that no column fills.</p>
+
+<h2>CSV files have no merges</h2>
+<p>A CSV stores no merges. In our test, SheetJS returns no merges for a CSV, and a region merged over several rows arrives as one value followed by empty cells, the same as cells nobody filled in. You cannot tell the two apart from the file, so do not fill down on your own. If the user says a column is grouped this way, fill that column:</p>
+{{code:MG_CSV}}
+<p>Use it after <code>readMergedTable</code>, which reads CSV files too. The first rows stay empty if the column starts empty.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Two-row headers in a CSV.</strong> Without merges you cannot see where <code>Q1</code> ends, so <code>readMergedTable</code> reads one header row. Combine the rows yourself after the user confirms.</li>
+<li><strong>A header merged over text-only data.</strong> <code>Address</code> merged over two columns, with street and city text below it, looks like a two-row header, so the first record becomes column names. The note <code>2 header rows combined</code> shows it in the preview.</li>
+<li><strong>Section labels as data.</strong> A row like <code>Europe</code> across the table is skipped. If the rows below belong to it, add it as a column yourself.</li>
+<li><strong>Other sheets and hidden rows.</strong> Only the first sheet is read, and this code does not check whether a row is hidden.</li>
+<li><strong>Blank cells that are not merged.</strong> They stay empty. Our post on <a href="../find-placeholder-values-csv-excel-javascript/">placeholder values</a> shows how to report them in required columns.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer. The demo on our homepage finds the header row and reads each column's type, such as email, date or number, from its name and values. It runs in your browser: drop in a file and nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. Reading merged cells as shown here is not in SheetSift yet; you are free to use the functions in this post in your own code.</p>
