@@ -29,12 +29,13 @@
 <h1>Handle merged cells in Excel imports with SheetJS</h1>
 <p class="meta"><time datetime="2026-11-20">2026-11-20</time></p>
 <p>A customer uploads a sales report. "North" is merged over two rows, "Q1" over two columns, and the header takes two rows. Your importer reads it with <code>sheet_to_json</code> and gets columns called <code>__EMPTY</code>, a first record that is really the second header row, and a row where the region is empty.</p>
-<p>By the end of this post you will have <code>readMergedTable(bytes)</code>, about 170 lines on top of SheetJS. It turns a two-row header into one name per column (<code>Q1 Revenue</code>), copies merged values down their column, skips title rows, and reports with Excel addresses the merges it should not guess about. Every function and every result quoted below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22 with SheetJS 0.20.3.</p>
+<p>By the end of this post you will have <code>readMergedTable(bytes)</code>, five short functions on top of SheetJS. It turns a two-row header into one name per column (<code>Q1 Revenue</code>), copies merged values down their column, skips title rows, and reports with Excel addresses the merges it should not guess about. Every function and every result quoted below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22 with SheetJS 0.20.3.</p>
 
 <h2>What SheetJS gives you</h2>
-<p>When you merge cells in Excel, "the contents of only one cell (the upper-left cell for left-to-right languages, or the upper-right cell for right-to-left languages) appear in the merged cell", and "the contents of the other cells that you merge are deleted" (<a href="https://support.microsoft.com/en-us/excel/get-started/merge-and-unmerge-cells-in-excel">Microsoft Support, "Merge and unmerge cells in Excel"</a>, updated 2026-11-19, read 2026-11-20). The file stores the value in one cell and the merge as a separate list of ranges.</p>
+<p>When you merge cells in Excel, "the contents of only one cell (the upper-left cell for left-to-right languages, or the upper-right cell for right-to-left languages) appear in the merged cell", and "the contents of the other cells that you merge are deleted" (<a href="https://support.microsoft.com/en-us/excel/get-started/merge-and-unmerge-cells-in-excel">Microsoft Support, "Merge and unmerge cells in Excel"</a>, read 2026-11-20). The file stores the value in one cell and the merge as a separate list of ranges.</p>
 <p>Here is the report from the introduction. Our test file was written by openpyxl, a Python library, so it is not a file SheetJS wrote itself; a file SheetJS writes gives the same results.</p>
-<pre><code>// Sales.xlsx: &quot;Region&quot; merged over A1:A2, &quot;Q1&quot; over C1:D1, &quot;North&quot; over A3:A4.
+<pre><code>// Sales.xlsx, six merges: &quot;Region&quot; over A1:A2, &quot;Rep&quot; over B1:B2, &quot;Q1&quot; over C1:D1,
+// &quot;Q2&quot; over E1:F1, &quot;North&quot; over A3:A4, &quot;Note: figures in EUR&quot; over A6:F6.
 const sheet = workbook.Sheets[workbook.SheetNames[0]];
 const records = XLSX.utils.sheet_to_json(sheet, { defval: &quot;&quot; });
 Object.keys(records[0]); // [ &#x27;Region&#x27;, &#x27;Rep&#x27;, &#x27;Q1&#x27;, &#x27;__EMPTY&#x27;, &#x27;Q2&#x27;, &#x27;__EMPTY_1&#x27; ]
@@ -74,6 +75,11 @@ function readSheet(bytes) {
 <pre><code>const isEmpty = (value) =&gt; String(value ?? &quot;&quot;).trim() === &quot;&quot;;
 const isLabel = (value) =&gt; typeof value === &quot;string&quot; &amp;&amp; value.trim() !== &quot;&quot;;
 const covers = (m, r, c) =&gt; r &gt;= m.top &amp;&amp; r &lt;= m.bottom &amp;&amp; c &gt;= m.left &amp;&amp; c &lt;= m.right;
+// What the user sees in a cell: a cell under a merge shows the merge&#x27;s value.
+const shown = (rows, merges, r, c) =&gt; {
+  const m = merges.find((range) =&gt; covers(range, r, c));
+  return m ? rows[m.top]?.[m.left] : rows[r]?.[c];
+};
 
 // A row can be part of the header only if it has labels and no numbers, dates or booleans.
 const labelRow = (row = []) =&gt; row.some(isLabel) &amp;&amp; row.every((v) =&gt; isEmpty(v) || isLabel(v));
@@ -89,8 +95,9 @@ function headerDepth(rows, merges, top, maxDepth = 3) {
     for (const m of merges) {
       if (m.top &lt; top || m.top &gt; bottom) continue;
       let last = m.bottom;
-      const below = rows[m.bottom + 1] ?? [];
-      if (m.right &gt; m.left &amp;&amp; below.slice(m.left, m.right + 1).every(isLabel)) last = m.bottom + 1;
+      const below = [];
+      for (let c = m.left; c &lt;= m.right; c++) below.push(shown(rows, merges, m.bottom + 1, c));
+      if (m.right &gt; m.left &amp;&amp; below.every(isLabel)) last = m.bottom + 1;
       if (last &lt;= bottom || last &gt;= top + maxDepth) continue;
       if (!rows.slice(bottom + 1, last + 1).every((row) =&gt; labelRow(row))) continue;
       bottom = last;
@@ -123,7 +130,7 @@ function headerNames(rows, merges, top, depth) {
 <p>Why each rule is there:</p>
 <ul>
 <li><strong>A header row holds only text.</strong> A row with a number, a date or a boolean is data, so a merged header over data columns cannot swallow the first record. (With <code>raw: true</code>, dates in an .xlsx file arrive as serial numbers; our post on <a href="../read-excel-dates-javascript-sheetjs/">reading Excel dates</a> shows how to convert them.)</li>
-<li><strong>A group needs a label under every column it covers.</strong> <code>Q1</code> over <code>Revenue</code> and an empty cell is not a two-row header.</li>
+<li><strong>A group needs a label under every column it covers.</strong> <code>Q1</code> over <code>Revenue</code> and an empty cell is not a two-row header. A cell under another merge counts as that merge's label, so <code>2026</code> over a merged <code>Q1</code> and a merged <code>Q2</code> works.</li>
 <li><strong>The loop repeats</strong> because one extra row can bring in another: <code>2026</code> over <code>Q1</code> and <code>Q2</code>, each over <code>Rev</code> and <code>Cost</code>, gives names like <code>2026 Q1 Rev</code>.</li>
 <li><strong><code>maxDepth</code> is 3</strong> because a label merged down over many rows is more likely a layout choice than a header. Such a merge is reported in step 3.</li>
 <li><strong>A merge counts once per column.</strong> <code>Region</code> merged over two rows gives <code>Region</code>, not <code>Region Region</code>.</li>
@@ -136,7 +143,7 @@ function headerNames(rows, merges, top, depth) {
 <tr><td><code>Name</code>, <code>Email</code> (none)</td><td>1</td><td><code>Name</code>, <code>Email</code></td></tr>
 <tr><td><code>Region</code> (A1:A2), <code>Q1</code> (C1:D1) over <code>Revenue</code>, <code>Cost</code></td><td>2</td><td><code>Region</code>, <code>Q1 Revenue</code>, <code>Q1 Cost</code></td></tr>
 <tr><td><code>2026</code> over <code>Q1</code>, <code>Q2</code>, each over <code>Rev</code>, <code>Cost</code></td><td>3</td><td><code>2026 Q1 Rev</code> and three more</td></tr>
-<tr><td><code>Q1</code> (B1:C1) over <code>Revenue</code> and an empty cell</td><td>1</td><td>the row below is data</td></tr>
+<tr><td><code>Q1</code> (B1:C1) over <code>Revenue</code> and an empty cell</td><td>1</td><td><code>Q1</code>, <code>Q1</code>: reported as a repeated name; the row below is data</td></tr>
 <tr><td><code>Amount</code> (B1:C1) over numbers</td><td>1</td><td><code>Amount</code>, <code>Amount</code>: reported as a repeated name</td></tr>
 <tr><td><code>Name</code> (A1:A5) over five rows</td><td>1</td><td>reported: the merge runs into the data</td></tr>
 </tbody>
@@ -150,16 +157,16 @@ function headerNames(rows, merges, top, depth) {
 <thead><tr><th>Merge in the data</th><th>Usually means</th><th>What <code>fillMerges</code> does</th></tr></thead>
 <tbody>
 <tr><td>One column, several rows (A3:A4)</td><td>a group label, such as a region for several reps</td><td>copies the value down; adds a note</td></tr>
-<tr><td>One row, the whole table width (A6:F6)</td><td>a title, a section name or a footnote</td><td>skips the row; adds a note</td></tr>
+<tr><td>The whole table width, one row or more (A6:F6)</td><td>a title, a section name or a footnote</td><td>skips the rows; adds a note</td></tr>
 <tr><td>Some columns of one row (C8:D8)</td><td>a long text that needed room</td><td>leaves the value in the first column; reports a problem</td></tr>
-<tr><td>Several rows and columns (A5:B6)</td><td>layout</td><td>reports a problem</td></tr>
+<tr><td>Several rows and columns (A5:B6)</td><td>layout</td><td>leaves the value in the first cell; reports a problem; the rows below are still read</td></tr>
 <tr><td>Starts in the header, ends in the data</td><td>a mistake, or a header the rules missed</td><td>reports a problem</td></tr>
 </tbody>
 </table>
 </div>
 <pre><code>// Copies each merged value down its column; reports the merges it will not fill.
 // Changes rows in place. firstData: index of the first row under the header.
-// width: number of columns in the table.
+// width: number of named columns in the table.
 function fillMerges(rows, merges, firstData, width, origin) {
   const notes = [];
   const problems = [];
@@ -174,38 +181,43 @@ function fillMerges(rows, merges, firstData, width, origin) {
     }
     const value = rows[m.top]?.[m.left] ?? &quot;&quot;;
     const last = Math.min(m.bottom, rows.length - 1);
-    if (m.left === m.right) {
-      // One column, several rows: a group label such as a region. Fill it down.
-      for (let r = m.top + 1; r &lt;= last; r++) {
-        const hidden = rows[r][m.left];
-        if (!isEmpty(hidden)) {
-          const cell = address(r, m.left, r, m.left);
-          const reason = `hides ${JSON.stringify(hidden)} in ${cell}; ${JSON.stringify(value)} was used`;
-          problems.push({ range: m.address, reason });
-        }
-        rows[r][m.left] = value;
+    // Excel shows only the first cell of a merge. A value stored under it is invisible
+    // to the user, so it is reported and not imported.
+    for (let r = m.top; r &lt;= last; r++) {
+      for (let c = m.left; c &lt;= m.right; c++) {
+        if ((r === m.top &amp;&amp; c === m.left) || isEmpty(rows[r][c])) continue;
+        problems.push({ range: m.address, reason: `hides ${JSON.stringify(rows[r][c])} in ${address(r, c, r, c)}` });
+        rows[r][c] = &quot;&quot;;
       }
+    }
+    const height = m.bottom - m.top + 1;
+    const span = m.right - m.left + 1;
+    const first = address(m.top, m.left, m.top, m.left);
+    if (span === 1) {
+      // One column, several rows: a group label such as a region. Fill it down.
+      for (let r = m.top + 1; r &lt;= last; r++) rows[r][m.left] = value;
       if (!isEmpty(value) &amp;&amp; last &gt; m.top) {
         const filled = address(m.top + 1, m.left, last, m.left);
         notes.push({ range: m.address, reason: `${JSON.stringify(value)} copied into ${filled}` });
       }
-    } else if (m.top === m.bottom &amp;&amp; m.left &lt;= 0 &amp;&amp; m.right &gt;= width - 1) {
+    } else if (m.left &lt;= 0 &amp;&amp; m.right &gt;= width - 1) {
       // One cell across the whole table: a title or a note, not a record.
-      titleRows.add(m.top);
+      for (let r = m.top; r &lt;= last; r++) titleRows.add(r);
       const row = origin.r + m.top + 1;
-      notes.push({ range: m.address, reason: `row ${row} skipped: ${JSON.stringify(value)} spans the table` });
+      const where = last &gt; m.top ? `rows ${row}-${origin.r + last + 1}` : `row ${row}`;
+      notes.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });
     } else {
-      // Across some columns: the value belongs to one of them, and only the user knows which.
-      const first = address(m.top, m.left, m.top, m.left);
-      const reason = `covers ${m.right - m.left + 1} columns; its value is read into ${first} only`;
-      problems.push({ range: m.address, reason });
+      // Across columns: the value belongs to one of them, and only the user knows which.
+      const size = height &gt; 1 ? `${height} rows and ${span} columns` : `${span} columns`;
+      problems.push({ range: m.address, reason: `covers ${size}; its value is read into ${first} only` });
     }
   }
   return { notes, problems, titleRows };
 }
 </code></pre>
 <p>Filling across columns is the mistake to avoid: a note merged over C and D would also land in D, which may be your amount column. The value stays in the column where the file stores it, and the user decides.</p>
-<p>Excel deletes the other cells' contents when you merge, but a file written by another program can still hold values under a merge. Our test writes one with SheetJS: <code>North</code> merged over A2:A3, with <code>South</code> stored in A3. Excel would show <code>North</code>, so that is what is used, and the hidden value is reported, because the user cannot see it in their sheet.</p>
+<p>Excel deletes the other cells' contents when you merge, but a file written by another program can still hold values under a merge. Our test writes one with SheetJS: <code>North</code> merged over A2:A3, with <code>South</code> stored in A3. The user only sees <code>North</code>, so <code>fillMerges</code> reports the hidden value and does not import it, for every shape of merge.</p>
+<p>"The whole table width" means from the first column to the last column that has a name. A stray cell further right, such as a comment in column H, does not stop a footnote row from being recognised.</p>
 
 <h2>Step 4: read the table</h2>
 <p><code>readMergedTable</code> puts the steps together and returns one record per data row, with the row number the user sees in Excel.</p>
@@ -219,16 +231,20 @@ function readMergedTable(bytes, headerTop = 0) {
   const depth = headerDepth(rows, merges, headerTop);
   const columns = headerNames(rows, merges, headerTop, depth);
   const firstData = headerTop + depth;
-  const { notes, problems, titleRows } = fillMerges(rows, merges, firstData, columns.length, origin);
+  // The table ends at the last named column; a stray cell further right does not widen it.
+  const width = columns.findLastIndex((name) =&gt; name !== &quot;&quot;) + 1;
+  // Rows that are empty in the file stay skipped, even when a merge fills them below.
+  const blank = new Set(rows.flatMap((row, r) =&gt; (row.every(isEmpty) ? [r] : [])));
+  const { notes, problems, titleRows } = fillMerges(rows, merges, firstData, width, origin);
   if (depth &gt; 1) {
     const range = XLSX.utils.encode_range({
       s: { r: origin.r + headerTop, c: origin.c },
-      e: { r: origin.r + firstData - 1, c: origin.c + columns.length - 1 },
+      e: { r: origin.r + firstData - 1, c: origin.c + Math.max(width, 1) - 1 },
     });
     notes.unshift({ range, reason: `${depth} header rows combined into one name per column` });
   }
 
-  const isData = (r) =&gt; r &gt;= firstData &amp;&amp; !titleRows.has(r) &amp;&amp; !rows[r].every(isEmpty);
+  const isData = (r) =&gt; r &gt;= firstData &amp;&amp; !titleRows.has(r) &amp;&amp; !blank.has(r);
   const seen = new Set();
   columns.forEach((name, c) =&gt; {
     const cell = XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });
@@ -252,7 +268,8 @@ function readMergedTable(bytes, headerTop = 0) {
   return { columns, records, notes, problems };
 }
 </code></pre>
-<p>Besides the merges, it reports two header problems that merges often cause: a column with data but no name, and a name used twice (compared without case). A repeated name is an error, not a detail: in an object the second column would overwrite the first. A column with neither a name nor data is dropped without a message.</p>
+<p>Besides the merges, it reports two header problems that merges often cause: a column with data but no name, and a name used twice (compared without case). A repeated name is an error, not a detail: in <code>records</code> the second column overwrites the first. So use <code>records</code> for the preview, and import only when <code>problems</code> is empty or the user has fixed or accepted each one. A column with neither a name nor data is dropped without a message.</p>
+<p>Rows that are empty in the file are skipped, even when a merge fills the merged column in them, so a blank line inside a region does not become a record.</p>
 <p>Here it is on the sales report:</p>
 <pre><code>const { columns, records, notes, problems } = readMergedTable(await file.arrayBuffer());
 columns;
@@ -283,12 +300,14 @@ function fillDown(records, column) {
   return records;
 }
 </code></pre>
-<p>Use it after <code>readMergedTable</code>, which reads CSV files too. The first rows stay empty if the column starts empty.</p>
+<p>Use it after <code>readMergedTable</code>, which reads CSV files too. Two differences from .xlsx: every value in a CSV arrives as a string (<code>"90"</code>, not <code>90</code>), so convert numbers and dates in your own checks, and the first rows stay empty if the column starts empty. <code>fillDown</code> does not see the title rows that were skipped, so if a file has sections, run it on each section's records separately; otherwise a region carries over into the next section.</p>
 
 <h2>What this does not cover</h2>
 <ul>
 <li><strong>Two-row headers in a CSV.</strong> Without merges you cannot see where <code>Q1</code> ends, so <code>readMergedTable</code> reads one header row. Combine the rows yourself after the user confirms.</li>
+<li><strong>Numbers in a header row.</strong> A header cell typed as a number, such as the year <code>2026</code> under a merged <code>Revenue</code>, makes that row data, because a header row holds only text here. If your users' files do this, type the years as text or confirm the header with the user.</li>
 <li><strong>A header merged over text-only data.</strong> <code>Address</code> merged over two columns, with street and city text below it, looks like a two-row header, so the first record becomes column names. The note <code>2 header rows combined</code> shows it in the preview.</li>
+<li><strong>A title merged down into the header.</strong> A merge that starts above <code>headerTop</code> and ends inside the header is not counted as a header row, but its value still becomes part of a column name. Pass the row under it as <code>headerTop</code>, or unmerge it.</li>
 <li><strong>Section labels as data.</strong> A row like <code>Europe</code> across the table is skipped. If the rows below belong to it, add it as a column yourself.</li>
 <li><strong>Other sheets and hidden rows.</strong> Only the first sheet is read, and this code does not check whether a row is hidden.</li>
 <li><strong>Blank cells that are not merged.</strong> They stay empty. Our post on <a href="../find-placeholder-values-csv-excel-javascript/">placeholder values</a> shows how to report them in required columns.</li>
