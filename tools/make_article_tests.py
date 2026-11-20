@@ -1320,4 +1320,209 @@ PH_TESTS = PH_TESTS.replace("%%PH_TABLE_JSON%%", _json.dumps(_ph_table))
 PH_TESTS = PH_TESTS.replace("%%PH_ALL_JSON%%", _json.dumps([globals()[k] for k in _ph_names]))
 PH_TESTS = PH_TESTS.replace("%%XLSX_VERSION%%", "0.20.3")
 out += PH_TESTS
+
+# --- blog/merged-cells-excel-sheetjs ---
+_mg_names = ["MG_PROBLEM", "MG_READ", "MG_HEADER", "MG_DATA", "MG_TABLE", "MG_EXAMPLE", "MG_CSV"]
+MG_TESTS = r"""
+// --- blog/merged-cells-excel-sheetjs ---
+{
+const XLSX = require(process.env.XLSX_MODULE || "xlsx");
+const fs = require("fs");
+const path = require("path");
+%%MG_READ_CJS%%
+%%MG_HEADER%%
+%%MG_DATA%%
+%%MG_TABLE%%
+%%MG_CSV%%
+// tests/fixtures/sales-merged.xlsx was written by openpyxl 3.1.5 (tools/make_merged_fixture.py).
+const salesBytes = fs.readFileSync(path.join(__dirname, "fixtures", "sales-merged.xlsx"));
+const mgBook = (rows, merges, origin) => {
+  const sheet = XLSX.utils.aoa_to_sheet(rows, origin ? { origin } : undefined);
+  // Store the range from the origin, as Excel does for a sheet whose first cell is not A1.
+  if (origin) sheet["!ref"] = XLSX.utils.encode_range({ s: XLSX.utils.decode_cell(origin), e: XLSX.utils.decode_range(sheet["!ref"]).e });
+  sheet["!merges"] = merges.map((a) => XLSX.utils.decode_range(a));
+  const book = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(book, sheet, "S");
+  return XLSX.write(book, { type: "buffer", bookType: "xlsx" });
+};
+const text = (list) => list.map((p) => `${p.range}: ${p.reason}`);
+
+ok("mg: SheetJS %%XLSX_VERSION%%: the problem lines give what the comments say", () => {
+  assert.strictEqual(XLSX.version, "%%XLSX_VERSION%%");
+  const workbook = XLSX.read(salesBytes);
+  const src = %%MG_PROBLEM_JSON%%;
+  const lines = src.split("\n").filter((l) => l && !l.startsWith("//"));
+  const setup = lines.filter((l) => l.startsWith("const ")).join("\n");
+  let checked = 0;
+  for (const line of lines.filter((l) => !l.startsWith("const "))) {
+    const m = /^(.*?);\s*\/\/ (.*?)(\s{2,}\(.*\))?$/.exec(line);
+    const got = new Function("XLSX", "workbook", setup + "\nreturn (" + m[1] + ");")(XLSX, workbook);
+    const want = m[2].trim();
+    const shown = typeof got === "string" ? "'" + got + "'" : Array.isArray(got) ? "[ " + got.map((k) => "'" + k + "'").join(", ") + " ]" : String(got);
+    assert.strictEqual(shown, want, line);
+    checked++;
+  }
+  assert.strictEqual(checked, 4);
+  // Only the top-left cell of each merge holds a value in the file.
+  const sheet = workbook.Sheets.Sales;
+  for (const a of ["A2", "B2", "D1", "F1", "A4", "B6", "F6"]) assert.strictEqual(sheet[a], undefined, a);
+});
+ok("mg: SheetJS %%XLSX_VERSION%%: the example gives the output in its comments", async () => {
+  const file = { arrayBuffer: async () => salesBytes };
+  const src = %%MG_EXAMPLE_JSON%%;
+  const body = src.split("\n").filter((l) => l.startsWith("const ")).join("\n");
+  const got = await new Function("readMergedTable", "file", "return (async () => {" + body + "\nreturn { columns, records, notes, problems }; })();")(readMergedTable, file);
+  assert.deepStrictEqual(got.columns, ["Region", "Rep", "Q1 Revenue", "Q1 Cost", "Q2 Revenue", "Q2 Cost"]);
+  assert.deepStrictEqual(got.records[1], { row: 4, values: { Region: "North", Rep: "Bo", "Q1 Revenue": 90, "Q1 Cost": 30, "Q2 Revenue": 95, "Q2 Cost": 35 } });
+  assert.deepStrictEqual(got.records.map((r) => [r.row, r.values.Region]), [[3, "North"], [4, "North"], [5, "South"]]);
+  const notes = text(got.notes);
+  assert.deepStrictEqual(notes, [
+    "A1:F2: 2 header rows combined into one name per column",
+    'A3:A4: "North" copied into A4',
+    'A6:F6: row 6 skipped: "Note: figures in EUR" spans the table',
+  ]);
+  for (const n of notes) assert(src.includes("'" + n + "'"), n);
+  assert.deepStrictEqual(got.problems, []);
+  assert(src.includes("problems; // []"));
+});
+ok("mg: SheetJS %%XLSX_VERSION%%: a file SheetJS writes reads the same way", () => {
+  const bytes = mgBook([["Region", "Rep", "Q1", "", "Q2", ""], ["", "", "Revenue", "Cost", "Revenue", "Cost"],
+    ["North", "Ana", 100, 40, 120, 50], ["", "Bo", 90, 30, 95, 35], ["South", "Cy", 70, 20, 80, 25], ["Note", "", "", "", "", ""]],
+    ["A1:A2", "B1:B2", "C1:D1", "E1:F1", "A3:A4", "A6:F6"]);
+  const fromSheetJS = readMergedTable(bytes);
+  const fromOpenpyxl = readMergedTable(salesBytes);
+  assert.deepStrictEqual(fromSheetJS.columns, fromOpenpyxl.columns);
+  assert.deepStrictEqual(fromSheetJS.records, fromOpenpyxl.records);
+});
+ok("mg: headerDepth", () => {
+  const d = (rows, merges) => headerDepth(rows, readSheet(mgBook(rows, merges)).merges, 0);
+  assert.strictEqual(d([["Name", "Email"], ["Ana", "a@b.co"]], []), 1);
+  // A group label over sub-labels: two rows.
+  assert.strictEqual(d([["Name", "Q1", ""], ["", "Revenue", "Cost"], ["Ana", 1, 2]], ["B1:C1"]), 2);
+  // A label merged down: two rows, even with no group label.
+  assert.strictEqual(d([["Name", "Email"], ["", "Work"], ["Ana", "a@b.co"]], ["A1:A2"]), 2);
+  // A merged header over data with numbers: the data row is not swallowed.
+  assert.strictEqual(d([["Name", "Amount", ""], ["Ana", 1, 2]], ["B1:C1"]), 1);
+  // Sub-labels missing under part of the group: not a header row.
+  assert.strictEqual(d([["Name", "Q1", ""], ["", "Revenue", ""], ["Ana", "x", "y"]], ["B1:C1"]), 1);
+  // Three levels: 2026 over Q1 and Q2, each over Revenue and Cost.
+  assert.strictEqual(d([["Rep", "2026", "", "", ""], ["", "Q1", "", "Q2", ""], ["", "Rev", "Cost", "Rev", "Cost"], ["Ana", 1, 2, 3, 4]],
+    ["A1:A3", "B1:E1", "B2:C2", "D2:E2"]), 3);
+  // maxDepth: a label merged down over more rows than that is not a header.
+  assert.strictEqual(d([["Name", "Note"], ["", "a"], ["", "b"], ["", "c"], ["", "d"]], ["A1:A5"]), 1);
+  assert.strictEqual(d([["Name", "Note"], ["", "a"], ["", "b"], ["", "c"]], ["A1:A3"]), 3);
+  // The post's limits and table rows: a header merged over text-only data is read as two rows;
+  // a label merged down over five rows is reported.
+  const a = readMergedTable(mgBook([["Name", "Address", ""], ["Ana", "Main St", "Paris"], ["Bo", "High St", "Leeds"]], ["B1:C1"]));
+  assert.deepStrictEqual(a.columns, ["Name Ana", "Address Main St", "Address Paris"]);
+  assert.strictEqual(text(a.notes)[0], "A1:C2: 2 header rows combined into one name per column");
+  const five = readMergedTable(mgBook([["Name", "Note"], ["", "a"], ["", "b"], ["", "c"], ["", "d"]], ["A1:A5"]));
+  assert.deepStrictEqual(text(five.problems), ["A1:A5: runs from the header into the data"]);
+  // Dates in an .xlsx file arrive as serial numbers.
+  const dated = readMergedTable(mgBook([["Joined"], [new Date(Date.UTC(2026, 0, 5))]], []));
+  assert.strictEqual(typeof dated.records[0].values.Joined, "number");
+  const t = readMergedTable(mgBook([["Rep", "2026", "", "", ""], ["", "Q1", "", "Q2", ""], ["", "Rev", "Cost", "Rev", "Cost"], ["Ana", 1, 2, 3, 4]],
+    ["A1:A3", "B1:E1", "B2:C2", "D2:E2"]));
+  assert.deepStrictEqual(t.columns, ["Rep", "2026 Q1 Rev", "2026 Q1 Cost", "2026 Q2 Rev", "2026 Q2 Cost"]);
+  assert.deepStrictEqual(t.records, [{ row: 4, values: { Rep: "Ana", "2026 Q1 Rev": 1, "2026 Q1 Cost": 2, "2026 Q2 Rev": 3, "2026 Q2 Cost": 4 } }]);
+});
+ok("mg: a header merged over data columns is reported, not guessed", () => {
+  const t = readMergedTable(mgBook([["Name", "Amount", ""], ["Ana", 1, 2]], ["B1:C1"]));
+  assert.deepStrictEqual(t.columns, ["Name", "Amount", "Amount"]);
+  assert.deepStrictEqual(text(t.problems), ['C1: repeats the column name "Amount"']);
+  // A label merged down into a row with numbers runs from the header into the data.
+  const v = readMergedTable(mgBook([["Name", "Score"], ["", 5], ["Bo", 6]], ["A1:A2"]));
+  assert.deepStrictEqual(v.columns, ["Name", "Score"]);
+  assert.deepStrictEqual(v.records.map((r) => r.row), [2, 3]);
+  assert.deepStrictEqual(text(v.problems), ["A1:A2: runs from the header into the data"]);
+});
+ok("mg: merges in the data", () => {
+  const rows = [["Region", "Rep", "Amount", "Note"],
+    ["North", "Ana", 1, "see C"], ["", "Bo", 2, ""], ["", "Cy", 3, "x"],   // A2:A4 down; D2 over C? no: D2:D2
+    ["South", "Di", 4, "long note"], ["", "", 5, ""],                       // A5:B6 block, D5 alone
+    ["Europe", "", "", ""],                                                 // A7:D7 title
+    ["West", "Ed", 6, "wide"], ["", "Fay", 7, ""]];                         // C8:D8 across, A8:A10 past the end
+  const bytes = mgBook(rows, ["A2:A4", "A5:B6", "A7:D7", "C8:D8", "A8:A10"]);
+  const t = readMergedTable(bytes);
+  assert.deepStrictEqual(t.records.map((r) => [r.row, r.values.Region, r.values.Rep]),
+    [[2, "North", "Ana"], [3, "North", "Bo"], [4, "North", "Cy"], [5, "South", "Di"], [6, "", ""], [8, "West", "Ed"], [9, "West", "Fay"]]);
+  assert.deepStrictEqual(text(t.notes), [
+    'A2:A4: "North" copied into A3:A4',
+    'A7:D7: row 7 skipped: "Europe" spans the table',
+    'A8:A10: "West" copied into A9',
+  ]);
+  assert.deepStrictEqual(text(t.problems), [
+    "A5:B6: covers 2 columns; its value is read into A5 only",
+    "C8:D8: covers 2 columns; its value is read into C8 only",
+  ]);
+});
+ok("mg: a value hidden under a merge is reported", () => {
+  // Excel shows only the top-left value; a file written by a program can still hold others.
+  const t = readMergedTable(mgBook([["Region", "Rep"], ["North", "Ana"], ["South", "Bo"]], ["A2:A3"]));
+  assert.deepStrictEqual(t.records.map((r) => r.values.Region), ["North", "North"]);
+  assert.deepStrictEqual(text(t.problems), ['A2:A3: hides "South" in A3; "North" was used']);
+  // An empty merged cell fills nothing and adds no note.
+  const e = readMergedTable(mgBook([["Region", "Rep"], ["", "Ana"], ["", "Bo"]], ["A2:A3"]));
+  assert.deepStrictEqual([e.notes, e.problems], [[], []]);
+  assert.deepStrictEqual(e.records.map((r) => r.values.Region), ["", ""]);
+});
+ok("mg: a sheet that does not start at A1 keeps Excel addresses and row numbers", () => {
+  const bytes = mgBook([["Region", "Rep"], ["North", "Ana"], ["", "Bo"], ["Total", ""]], ["B4:B5", "B6:C6"], "B3");
+  const { origin, merges } = readSheet(bytes);
+  assert.deepStrictEqual([origin, merges[0]], [{ r: 2, c: 1 }, { address: "B4:B5", top: 1, bottom: 2, left: 0, right: 0 }]);
+  const t = readMergedTable(bytes);
+  assert.deepStrictEqual(t.records, [{ row: 4, values: { Region: "North", Rep: "Ana" } }, { row: 5, values: { Region: "North", Rep: "Bo" } }]);
+  assert.deepStrictEqual(text(t.notes), ['B4:B5: "North" copied into B5', 'B6:C6: row 6 skipped: "Total" spans the table']);
+});
+ok("mg: duplicate and empty column names", () => {
+  const t = readMergedTable(mgBook([["Name", "name", "", "", "Email"], ["Ana", "x", "", "y", "a@b.co"]], []));
+  assert.deepStrictEqual(text(t.problems), ['B1: repeats the column name "name"', "D1: has data but no column name"]);
+  assert.deepStrictEqual(Object.keys(t.records[0].values), ["Name", "name", "Email"]);
+  // A blank column without data is dropped quietly.
+  assert.deepStrictEqual(readMergedTable(mgBook([["Name", "", "Email"], ["Ana", "", "a@b.co"]], [])).problems, []);
+  // Object.prototype names are plain keys.
+  const p = readMergedTable(mgBook([["__proto__", "constructor"], ["x", "y"]], []));
+  assert.strictEqual(Object.getPrototypeOf(p.records[0].values), Object.prototype);
+  assert.deepStrictEqual(Object.keys(p.records[0].values), ["__proto__", "constructor"]);
+});
+ok("mg: empty sheets and header-only sheets", () => {
+  const empty = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(empty, XLSX.utils.aoa_to_sheet([]), "S");
+  const t = readMergedTable(XLSX.write(empty, { type: "buffer", bookType: "xlsx" }));
+  assert.deepStrictEqual(text(t.problems), ["null: the sheet has no header row"]);
+  const h = readMergedTable(mgBook([["Name", "Email"]], []));
+  assert.deepStrictEqual([h.columns, h.records, h.problems], [["Name", "Email"], [], []]);
+  // Empty rows are not records.
+  assert.deepStrictEqual(readMergedTable(mgBook([["Name"], [""], ["Ana"]], [])).records, [{ row: 3, values: { Name: "Ana" } }]);
+  // headerTop: a title row above the header.
+  const titled = readMergedTable(mgBook([["Sales export"], ["Region", "Rep"], ["North", "Ana"], ["", "Bo"]], ["A1:B1", "A3:A4"]), 1);
+  assert.deepStrictEqual(titled.columns, ["Region", "Rep"]);
+  assert.deepStrictEqual(titled.records.map((r) => [r.row, r.values.Region]), [[3, "North"], [4, "North"]]);
+});
+ok("mg: SheetJS %%XLSX_VERSION%%: a CSV has no merges; fillDown fills one column on request", () => {
+  const csv = Buffer.from("Region,Rep\nNorth,Ana\n,Bo\nSouth,Cy\n,Di\n");
+  assert.deepStrictEqual(readSheet(csv).merges, []);
+  const t = readMergedTable(csv);
+  assert.deepStrictEqual(t.records.map((r) => r.values.Region), ["North", "", "South", ""]);
+  fillDown(t.records, "Region");
+  assert.deepStrictEqual(t.records.map((r) => r.values.Region), ["North", "North", "South", "South"]);
+  // An empty first cell stays empty; a missing column is filled with "".
+  assert.deepStrictEqual(fillDown([{ values: { Region: "" } }, { values: { Region: "East" } }, { values: {} }], "Region").map((r) => r.values.Region), ["", "East", "East"]);
+  // raw: true keeps CSV text as text.
+  assert.strictEqual(readMergedTable(Buffer.from("Id\n0123\n")).records[0].values.Id, "0123");
+});
+ok("mg: snippets have no invisible characters", () => {
+  for (const s of %%MG_ALL_JSON%%) assert(!/[\u00A0\u00AD\u200B-\u200F\u2028\u2029\u202F\u2060\u3000\uFEFF]/.test(s));
+});
+}
+"""
+_mg_read_cjs = MG_READ.replace('// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz\nimport * as XLSX from "xlsx";\n', '')
+assert _mg_read_cjs != MG_READ
+MG_TESTS = MG_TESTS.replace("%%MG_READ_CJS%%", _mg_read_cjs)
+for _k in _mg_names:
+    MG_TESTS = MG_TESTS.replace("%%" + _k + "%%", globals()[_k])
+    MG_TESTS = MG_TESTS.replace("%%" + _k + "_JSON%%", _json.dumps(globals()[_k]))
+MG_TESTS = MG_TESTS.replace("%%MG_ALL_JSON%%", _json.dumps([globals()[k] for k in _mg_names]))
+MG_TESTS = MG_TESTS.replace("%%XLSX_VERSION%%", "0.20.3")
+out += MG_TESTS
 open(sys.argv[1] if len(sys.argv) > 1 else "/dev/stdout", "w").write(out)
