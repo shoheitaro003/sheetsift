@@ -1233,13 +1233,16 @@ import * as XLSX from "xlsx";
 // Both count from 0 at the top-left cell of the sheet's stored range (origin).
 function readSheet(bytes) {
   const data = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;
+  const starts = (a, b) => data[0] === a && data[1] === b;
   // .xlsx files are zip archives (they start with "PK"); .xls files start with D0 CF.
-  // Anything else is text. Decode it as UTF-8 yourself: without a byte order mark,
+  // Anything else is text. Decode it yourself: without a byte order mark (BOM),
   // SheetJS does not assume UTF-8, and "München" would arrive as "MÃ¼nchen".
-  const binary = (data[0] === 0x50 && data[1] === 0x4b) || (data[0] === 0xd0 && data[1] === 0xcf);
+  // FF FE and FE FF are UTF-16 BOMs, as in Excel's "Unicode Text" export.
+  const binary = starts(0x50, 0x4b) || starts(0xd0, 0xcf);
+  const encoding = starts(0xff, 0xfe) ? "utf-16le" : starts(0xfe, 0xff) ? "utf-16be" : "utf-8";
   const workbook = binary
     ? XLSX.read(data, { raw: true })
-    : XLSX.read(new TextDecoder("utf-8", { fatal: true }).decode(data), { type: "string", raw: true });
+    : XLSX.read(new TextDecoder(encoding, { fatal: true }).decode(data), { type: "string", raw: true });
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   if (!sheet || !sheet["!ref"]) return { rows: [], merges: [], origin: { r: 0, c: 0 } };
   const origin = XLSX.utils.decode_range(sheet["!ref"]).s;
@@ -1276,6 +1279,7 @@ function headerDepth(rows, merges, top, maxDepth = 3) {
     changed = false;
     for (const m of merges) {
       if (m.top < top || m.top > bottom) continue;
+      // last: the lowest row this merge pulls into the header.
       let last = m.bottom;
       const below = [];
       for (let c = m.left; c <= m.right; c++) below.push(shown(rows, merges, m.bottom + 1, c));
@@ -1358,7 +1362,9 @@ function fillMerges(rows, merges, firstData, width, origin) {
       for (let r = m.top; r <= last; r++) titleRows.add(r);
       const row = origin.r + m.top + 1;
       const where = last > m.top ? `rows ${row}-${origin.r + last + 1}` : `row ${row}`;
-      notes.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });
+      // Text is a title or a footnote. A number across the table (a total?) is reported.
+      const list = isLabel(value) || isEmpty(value) ? notes : problems;
+      list.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });
     } else {
       // Across columns: the value belongs to one of them, and only the user knows which.
       const size = height > 1 ? `${height} rows and ${span} columns` : `${span} columns`;
@@ -1390,6 +1396,16 @@ function readMergedTable(bytes, headerTop = 0) {
       e: { r: origin.r + firstData - 1, c: origin.c + Math.max(width, 1) - 1 },
     });
     notes.unshift({ range, reason: `${depth} header rows combined into one name per column` });
+    // In a real multi-row header, a cell below the first row sits under a merge that
+    // starts above it ("Revenue" under "Q1"). A value under a cell that is not merged
+    // ("Ana" under "Name") suggests the row is really the first record.
+    for (let r = headerTop + 1; r < firstData; r++) {
+      rows[r].forEach((value, c) => {
+        if (isEmpty(value) || merges.some((m) => m.top >= headerTop && m.top < r && covers(m, m.top, c))) return;
+        const cell = XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });
+        problems.push({ range: cell, reason: `${JSON.stringify(value)} is under a header cell that is not merged; row ${origin.r + r + 1} may be data` });
+      });
+    }
   }
 
   const isData = (r) => r >= firstData && !titleRows.has(r) && !blank.has(r);

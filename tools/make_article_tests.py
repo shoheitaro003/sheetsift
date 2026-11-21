@@ -1587,6 +1587,11 @@ ok("mg: SheetJS %%XLSX_VERSION%%: text files are read as UTF-8, with or without 
     assert.deepStrictEqual(t.columns, ["Name", "City"]);
     assert.deepStrictEqual(t.records[0].values, { Name: "José", City: "München" });
   }
+  // UTF-16 with a BOM (Excel's "Unicode Text" is tab-separated UTF-16LE), both byte orders.
+  const tsv = "Name\tCity\nJosé\tMünchen\n";
+  const le = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(tsv, "utf16le")]);
+  const be = Buffer.from(le); be.swap16();
+  for (const bytes of [le, be]) assert.deepStrictEqual(readMergedTable(bytes).records[0].values, { Name: "José", City: "München" });
   // A Windows-1252 file is not UTF-8: decode() throws instead of guessing.
   assert.throws(() => readMergedTable(Buffer.from([0x4e, 0x0a, 0x4a, 0x6f, 0x73, 0xe9, 0x0a])), TypeError);
   // .xls (binary) and .xlsx (zip) files are passed to SheetJS as bytes, also as an ArrayBuffer.
@@ -1603,6 +1608,30 @@ ok("mg: a label merged down over a text-only row makes that row part of the head
   const t = readMergedTable(mgBook([["Name", "City"], ["", "Berlin"], ["Ana", "Paris"]], ["A1:A2"]));
   assert.deepStrictEqual(t.columns, ["Name", "City Berlin"]);
   assert.strictEqual(text(t.notes)[0], "A1:B2: 2 header rows combined into one name per column");
+  assert.deepStrictEqual(text(t.problems), ['B2: "Berlin" is under a header cell that is not merged; row 2 may be data']);
+  // A merged header over text-only data (a contact list): reported, not only noted.
+  const c = readMergedTable(mgBook([["Name", "Contact", ""], ["Al", "a@x.co", "555"], ["Bo", "b@x.co", "556"]], ["B1:C1"]));
+  assert.deepStrictEqual(c.columns, ["Name Al", "Contact a@x.co", "Contact 555"]);
+  assert.deepStrictEqual(text(c.problems), ['A2: "Al" is under a header cell that is not merged; row 2 may be data']);
+  const a = readMergedTable(mgBook([["Name", "Address", ""], ["Ana", "Main St", "Paris"]], ["B1:C1"]));
+  assert.deepStrictEqual(text(a.problems), ['A2: "Ana" is under a header cell that is not merged; row 2 may be data']);
+  // Real two- and three-row headers raise no such problem.
+  assert.deepStrictEqual(readMergedTable(salesBytes).problems, []);
+  const three = readMergedTable(mgBook([["Rep", "2026", "", "", ""], ["", "Q1", "", "Q2", ""], ["", "Rev", "Cost", "Rev", "Cost"], ["Ana", 1, 2, 3, 4]],
+    ["B1:E1", "B2:C2", "D2:E2"]));
+  assert.deepStrictEqual(three.problems, []);
+});
+ok("mg: a number merged across the table is skipped and reported; text is only noted", () => {
+  const t = readMergedTable(mgBook([["Name", "Amount"], ["Ana", 5], [500, ""], ["Total: 500", ""]], ["A3:B3", "A4:B4"]));
+  assert.deepStrictEqual(t.records.length, 1);
+  assert.deepStrictEqual(text(t.problems), ["A3:B3: row 3 skipped: 500 spans the table"]);
+  assert.deepStrictEqual(text(t.notes), ['A4:B4: row 4 skipped: "Total: 500" spans the table']);
+});
+ok("mg: a header that is not in the first row gives unnamed columns (headerTop)", () => {
+  const t = readMergedTable(mgBook([["", ""], ["Name", "City"], ["Ana", "Paris"]], []));
+  assert.deepStrictEqual(t.columns, ["", ""]);
+  assert.deepStrictEqual(text(t.problems), ["A1: has data but no column name", "B1: has data but no column name"]);
+  assert.deepStrictEqual(readMergedTable(mgBook([["", ""], ["Name", "City"], ["Ana", "Paris"]], []), 1).columns, ["Name", "City"]);
 });
 ok("mg: snippets have no invisible characters", () => {
   for (const s of %%MG_ALL_JSON%%) assert(!/[\u00A0\u00AD\u200B-\u200F\u2028\u2029\u202F\u2060\u3000\uFEFF]/.test(s));

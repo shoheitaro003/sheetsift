@@ -33,7 +33,7 @@
 
 <h2>What SheetJS gives you</h2>
 <p>When you merge cells in Excel, "the contents of only one cell (the upper-left cell for left-to-right languages, or the upper-right cell for right-to-left languages) appear in the merged cell", and "the contents of the other cells that you merge are deleted" (<a href="https://support.microsoft.com/en-us/excel/get-started/merge-and-unmerge-cells-in-excel">Microsoft Support, "Merge and unmerge cells in Excel"</a>, read 2026-11-20). The file stores the value in one cell and the merge as a separate list of ranges.</p>
-<p>Here is the report from the introduction. Our test file was written by openpyxl, a Python library, so it is not a file SheetJS wrote itself; a file SheetJS writes gives the same results.</p>
+<p>Here is the report from the introduction, read the usual way:</p>
 <pre><code>// Sales.xlsx, six merges: &quot;Region&quot; over A1:A2, &quot;Rep&quot; over B1:B2, &quot;Q1&quot; over C1:D1,
 // &quot;Q2&quot; over E1:F1, &quot;North&quot; over A3:A4, &quot;Note: figures in EUR&quot; over A6:F6.
 const sheet = workbook.Sheets[workbook.SheetNames[0]];
@@ -47,6 +47,7 @@ sheet[&quot;!merges&quot;].length; // 6
 <p>The merges are all there in <code>sheet["!merges"]</code>; the code below uses them.</p>
 
 <h2>Step 1: read the rows and the merges</h2>
+<p>The code in steps 1 to 4 goes in one module: the small helpers at the top of step 2 are used by the later steps too.</p>
 <pre><code>// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
 import * as XLSX from &quot;xlsx&quot;;
 
@@ -54,13 +55,16 @@ import * as XLSX from &quot;xlsx&quot;;
 // Both count from 0 at the top-left cell of the sheet&#x27;s stored range (origin).
 function readSheet(bytes) {
   const data = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;
+  const starts = (a, b) =&gt; data[0] === a &amp;&amp; data[1] === b;
   // .xlsx files are zip archives (they start with &quot;PK&quot;); .xls files start with D0 CF.
-  // Anything else is text. Decode it as UTF-8 yourself: without a byte order mark,
+  // Anything else is text. Decode it yourself: without a byte order mark (BOM),
   // SheetJS does not assume UTF-8, and &quot;München&quot; would arrive as &quot;MÃ¼nchen&quot;.
-  const binary = (data[0] === 0x50 &amp;&amp; data[1] === 0x4b) || (data[0] === 0xd0 &amp;&amp; data[1] === 0xcf);
+  // FF FE and FE FF are UTF-16 BOMs, as in Excel&#x27;s &quot;Unicode Text&quot; export.
+  const binary = starts(0x50, 0x4b) || starts(0xd0, 0xcf);
+  const encoding = starts(0xff, 0xfe) ? &quot;utf-16le&quot; : starts(0xfe, 0xff) ? &quot;utf-16be&quot; : &quot;utf-8&quot;;
   const workbook = binary
     ? XLSX.read(data, { raw: true })
-    : XLSX.read(new TextDecoder(&quot;utf-8&quot;, { fatal: true }).decode(data), { type: &quot;string&quot;, raw: true });
+    : XLSX.read(new TextDecoder(encoding, { fatal: true }).decode(data), { type: &quot;string&quot;, raw: true });
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   if (!sheet || !sheet[&quot;!ref&quot;]) return { rows: [], merges: [], origin: { r: 0, c: 0 } };
   const origin = XLSX.utils.decode_range(sheet[&quot;!ref&quot;]).s;
@@ -75,7 +79,7 @@ function readSheet(bytes) {
 }
 </code></pre>
 <p><code>header: 1</code> returns each row as an array, so you decide what the column names are. <code>defval: ""</code> fills missing cells and <code>blankrows: true</code> keeps empty rows, so <code>rows[r][c]</code> always points at the same cell as the sheet.</p>
-<p>A CSV file is text, and SheetJS has to guess its encoding. In our test, a UTF-8 CSV without a byte order mark (BOM, three bytes some programs put at the start of UTF-8 files) comes back as <code>MÃ¼nchen</code> instead of <code>München</code>. So <code>readSheet</code> decodes text files as UTF-8 itself. With <code>fatal: true</code>, a file in another encoding, such as a Windows-1252 export, throws a <code>TypeError</code> instead of filling your database with wrong characters; our post on <a href="../decode-shift-jis-windows-1252-utf-16-csv-javascript/">decoding legacy CSV files</a> shows how to read those.</p>
+<p>A CSV file is text, and SheetJS has to guess its encoding. In our test, a UTF-8 CSV without a byte order mark (BOM, three bytes some programs put at the start of UTF-8 files) comes back as <code>MÃ¼nchen</code> instead of <code>München</code>. So <code>readSheet</code> decodes text files itself: as UTF-16 when the file starts with a UTF-16 BOM (Excel's "Unicode Text" export does), and as UTF-8 otherwise. With <code>fatal: true</code>, a file in another encoding, such as a Windows-1252 export, throws a <code>TypeError</code> instead of filling your database with wrong characters; our post on <a href="../decode-shift-jis-windows-1252-utf-16-csv-javascript/">decoding legacy CSV files</a> shows how to read those.</p>
 <p>A sheet's stored range does not have to start at A1. <code>origin</code> is its first cell, and each merge is moved by it so it uses the same positions as <code>rows</code>. The original <code>address</code> is kept, because that is what the user sees in Excel. <code>raw: true</code> keeps CSV text as text, so <code>0123</code> is not turned into 123.</p>
 
 <h2>Step 2: find the header rows and name the columns</h2>
@@ -102,6 +106,7 @@ function headerDepth(rows, merges, top, maxDepth = 3) {
     changed = false;
     for (const m of merges) {
       if (m.top &lt; top || m.top &gt; bottom) continue;
+      // last: the lowest row this merge pulls into the header.
       let last = m.bottom;
       const below = [];
       for (let c = m.left; c &lt;= m.right; c++) below.push(shown(rows, merges, m.bottom + 1, c));
@@ -166,7 +171,8 @@ function headerNames(rows, merges, top, depth) {
 <tbody>
 <tr><td>Text in one column, several rows (A3:A4)</td><td>a group label, such as a region for several reps</td><td>copies the value down; adds a note</td></tr>
 <tr><td>A number, date or boolean in one column, several rows (C3:C4)</td><td>a total for several lines, or a shared date</td><td>leaves the value in the first row; reports a problem</td></tr>
-<tr><td>The whole table width, one row or more (A6:F6)</td><td>a title, a section name or a footnote</td><td>skips the rows; adds a note</td></tr>
+<tr><td>Text across the whole table width, one row or more (A6:F6)</td><td>a title, a section name or a footnote</td><td>skips the rows; adds a note</td></tr>
+<tr><td>A number across the whole table width</td><td>maybe a total</td><td>skips the rows; reports a problem</td></tr>
 <tr><td>Some columns of one row (C8:D8)</td><td>a long text that needed room</td><td>leaves the value in the first column; reports a problem</td></tr>
 <tr><td>Several rows and columns (A5:B6)</td><td>layout</td><td>leaves the value in the first cell; reports a problem; the rows below are still read</td></tr>
 <tr><td>Starts in the header, ends in the data</td><td>a mistake, or a header the rules missed</td><td>reports a problem</td></tr>
@@ -221,7 +227,9 @@ function fillMerges(rows, merges, firstData, width, origin) {
       for (let r = m.top; r &lt;= last; r++) titleRows.add(r);
       const row = origin.r + m.top + 1;
       const where = last &gt; m.top ? `rows ${row}-${origin.r + last + 1}` : `row ${row}`;
-      notes.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });
+      // Text is a title or a footnote. A number across the table (a total?) is reported.
+      const list = isLabel(value) || isEmpty(value) ? notes : problems;
+      list.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });
     } else {
       // Across columns: the value belongs to one of them, and only the user knows which.
       const size = height &gt; 1 ? `${height} rows and ${span} columns` : `${span} columns`;
@@ -258,6 +266,16 @@ function readMergedTable(bytes, headerTop = 0) {
       e: { r: origin.r + firstData - 1, c: origin.c + Math.max(width, 1) - 1 },
     });
     notes.unshift({ range, reason: `${depth} header rows combined into one name per column` });
+    // In a real multi-row header, a cell below the first row sits under a merge that
+    // starts above it (&quot;Revenue&quot; under &quot;Q1&quot;). A value under a cell that is not merged
+    // (&quot;Ana&quot; under &quot;Name&quot;) suggests the row is really the first record.
+    for (let r = headerTop + 1; r &lt; firstData; r++) {
+      rows[r].forEach((value, c) =&gt; {
+        if (isEmpty(value) || merges.some((m) =&gt; m.top &gt;= headerTop &amp;&amp; m.top &lt; r &amp;&amp; covers(m, m.top, c))) return;
+        const cell = XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });
+        problems.push({ range: cell, reason: `${JSON.stringify(value)} is under a header cell that is not merged; row ${origin.r + r + 1} may be data` });
+      });
+    }
   }
 
   const isData = (r) =&gt; r &gt;= firstData &amp;&amp; !titleRows.has(r) &amp;&amp; !blank.has(r);
@@ -293,8 +311,8 @@ function readMergedTable(bytes, headerTop = 0) {
   return { columns, records, notes, problems };
 }
 </code></pre>
-<p>Besides the merges, it reports two header problems that merges often cause: a column with data but no name, and a name used twice. Names that differ only in capital letters, like <code>Email</code> and <code>EMAIL</code>, count as the same name. The second one is renamed <code>Amount (2)</code>, so both values show up in the preview instead of one overwriting the other. A column with neither a name nor data is dropped without a message.</p>
-<p>Use <code>records</code> for the preview, and import only when <code>problems</code> is empty or the user has fixed or accepted each one.</p>
+<p>Besides the merges, it reports three header problems that merges often cause. The first is a value in a lower header row under a cell that is not merged, such as <code>Ana</code> under <code>Name</code>: in a real two-row header that cell is empty, so the "header row" is probably the first record. The other two are a column with data but no name, and a name used twice. Names that differ only in capital letters, like <code>Email</code> and <code>EMAIL</code>, count as the same name. The second one is renamed <code>Amount (2)</code>, so both values show up in the preview instead of one overwriting the other. A column with neither a name nor data is dropped without a message.</p>
+<p>Use <code>records</code> for the preview, and import only when <code>problems</code> is empty or the user has fixed or accepted each one. If every column comes back without a name, the header is not in the first row of the sheet: pass <code>headerTop</code>, as shown below.</p>
 <p>Rows that are empty in the file are skipped, even when a merge fills the merged column in them, so a blank line inside a region does not become a record.</p>
 <p>Here it is on the sales report:</p>
 <pre><code>const { columns, records, notes, problems } = readMergedTable(await file.arrayBuffer());
@@ -338,7 +356,7 @@ function fillDown(records, column) {
 <ul>
 <li><strong>Two-row headers in a CSV.</strong> Without merges you cannot see where <code>Q1</code> ends, so <code>readMergedTable</code> reads one header row. Combine the rows yourself after the user confirms.</li>
 <li><strong>Numbers in a header row.</strong> A header cell typed as a number, such as the year <code>2026</code> under a merged <code>Revenue</code>, makes that row data, because a header row holds only text here. If your users' files do this, type the years as text or confirm the header with the user.</li>
-<li><strong>A header over text-only data.</strong> <code>Address</code> merged over two columns, with street and city text below it, looks like a two-row header, so the first record becomes column names. The same happens with a label merged down: <code>Name</code> merged over A1:A2, with <code>City</code> in B1 and <code>Berlin</code> in B2, gives the column <code>City Berlin</code>. The note <code>2 header rows combined</code> shows it in the preview.</li>
+<li><strong>A header over text-only data.</strong> <code>Contact</code> merged over two columns, with an email and a phone number stored as text below it, looks like a two-row header, so the first record becomes column names. The same happens with a label merged down: <code>Name</code> merged over A1:A2, with <code>City</code> in B1 and <code>Berlin</code> in B2, gives the column <code>City Berlin</code>. The code cannot be sure, but it reports a problem when a value sits under a header cell that is not merged, so the user sees it before anything is imported.</li>
 <li><strong>A title merged down into the header.</strong> A merge that starts above <code>headerTop</code> and ends inside the header is not counted as a header row, but its value still becomes part of a column name. Pass the row under it as <code>headerTop</code>, or unmerge it.</li>
 <li><strong>Section labels as data.</strong> A row like <code>Europe</code> across the table is skipped. If the rows below belong to it, add it as a column yourself.</li>
 <li><strong>Other sheets and hidden rows.</strong> Only the first sheet is read, and this code does not check whether a row is hidden.</li>
