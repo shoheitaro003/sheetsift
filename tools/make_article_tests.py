@@ -1459,7 +1459,7 @@ ok("mg: merges in the data", () => {
     [[2, "North", "Ana"], [3, "North", "Bo"], [4, "North", "Cy"], [5, "South", ""], [6, "", ""], [8, "West", "Ed"], [9, "West", "Fay"]]);
   assert.deepStrictEqual(t.records[5].values, { Region: "West", Rep: "Ed", Amount: 6, Note: "" });
   assert.deepStrictEqual(text(t.notes), [
-    'A2:A4: "North" copied into A3:A4',
+    'A2:A4: "North" copied into A3, A4',
     'A7:D7: row 7 skipped: "Europe" spans the table',
     'A8:A10: "West" copied into A9',
   ]);
@@ -1489,6 +1489,7 @@ ok("mg: a value hidden under a merge is reported", () => {
   // A row that is empty in the file is not turned into a record by filling down.
   const gap = readMergedTable(mgBook([["Region", "Rep"], ["North", "Ana"], ["", ""], ["", "Bo"]], ["A2:A4"]));
   assert.deepStrictEqual(gap.records.map((r) => [r.row, r.values.Region, r.values.Rep]), [[2, "North", "Ana"], [4, "North", "Bo"]]);
+  assert.deepStrictEqual(text(gap.notes), ['A2:A4: "North" copied into A4']);
   // A footnote merged over two rows across the table skips both rows.
   const foot = readMergedTable(mgBook([["Name", "Rep"], ["Ana", "x"], ["Note", ""], ["", ""]], ["A3:B4"]));
   assert.deepStrictEqual([foot.records.length, text(foot.notes), foot.problems], [1, ['A3:B4: rows 3-4 skipped: "Note" spans the table'], []]);
@@ -1562,7 +1563,7 @@ ok("mg: only text is filled down; numbers, dates and booleans merged down are re
   const n = readMergedTable(mgBook([["Invoice", "Line", "Total"], ["A-1", "Pens", 100], ["", "Ink", ""], ["", "Pads", ""]], ["A2:A4", "C2:C3"]));
   assert.deepStrictEqual(n.records.map((r) => r.values.Total), [100, "", ""]);
   assert.deepStrictEqual(n.records.map((r) => r.values.Invoice), ["A-1", "A-1", "A-1"]);
-  assert.deepStrictEqual(text(n.notes), ['A2:A4: "A-1" copied into A3:A4']);
+  assert.deepStrictEqual(text(n.notes), ['A2:A4: "A-1" copied into A3, A4']);
   assert.deepStrictEqual(text(n.problems), ["C2:C3: covers 2 rows; its value 100 is read into C2 only"]);
   // A date arrives as a serial number, so it is reported too; a boolean as well.
   const d = readMergedTable(mgBook([["Day", "Rep", "Ok"], [new Date(Date.UTC(2026, 0, 5)), "Ana", true], ["", "Bo", ""]], ["A2:A3", "C2:C3"]));
@@ -1615,6 +1616,11 @@ ok("mg: a label merged down over a text-only row makes that row part of the head
   assert.deepStrictEqual(text(c.problems), ['A2: "Al" is under a header cell that is not merged; row 2 may be data']);
   const a = readMergedTable(mgBook([["Name", "Address", ""], ["Ana", "Main St", "Paris"]], ["B1:C1"]));
   assert.deepStrictEqual(text(a.problems), ['A2: "Ana" is under a header cell that is not merged; row 2 may be data']);
+  // Every header cell merged, text-only data: the first data row looks like the header row.
+  const all = readMergedTable(mgBook([["Customer", "", "Location", ""], ["Ana", "Smith", "Berlin", "DE"], ["Bo", "Li", "Paris", "FR"]], ["A1:B1", "C1:D1"]));
+  assert.deepStrictEqual(text(all.problems), ["A2:D2: row 2 was read as a header row, but the first data row has text in the same columns; check whether row 2 is data"]);
+  const id = readMergedTable(mgBook([["ID", "Customer", ""], ["", "First", "Last"], ["A-1", "Ana", "Smith"]], ["A1:A2", "B1:C1"]));
+  assert.strictEqual(id.problems.length, 1);
   // Real two- and three-row headers raise no such problem.
   assert.deepStrictEqual(readMergedTable(salesBytes).problems, []);
   const three = readMergedTable(mgBook([["Rep", "2026", "", "", ""], ["", "Q1", "", "Q2", ""], ["", "Rev", "Cost", "Rev", "Cost"], ["Ana", 1, 2, 3, 4]],
@@ -1629,8 +1635,16 @@ ok("mg: a number merged across the table is skipped and reported; text is only n
 });
 ok("mg: a header that is not in the first row gives unnamed columns (headerTop)", () => {
   const t = readMergedTable(mgBook([["", ""], ["Name", "City"], ["Ana", "Paris"]], []));
-  assert.deepStrictEqual(t.columns, ["", ""]);
-  assert.deepStrictEqual(text(t.problems), ["A1: has data but no column name", "B1: has data but no column name"]);
+  assert.deepStrictEqual([t.columns, t.records], [[], []]);
+  assert.deepStrictEqual(text(t.problems), ["A1: row 1 has no column names; if the header is lower, pass its index as headerTop"]);
+  // The same for a sheet whose stored range starts above the data, and for an empty CSV.
+  const low = mgBook([["Name", "City"], ["Ana", "Paris"]], [], "C3");
+  const shifted = XLSX.read(low); const sh = shifted.Sheets.S; sh["!ref"] = "A1:" + sh["!ref"].split(":")[1];
+  const lowBytes = XLSX.write(shifted, { type: "buffer", bookType: "xlsx" });
+  assert.deepStrictEqual(text(readMergedTable(lowBytes).problems), ["A1: row 1 has no column names; if the header is lower, pass its index as headerTop"]);
+  assert.deepStrictEqual(readMergedTable(lowBytes, 2).columns, ["", "", "Name", "City"]);
+  assert.deepStrictEqual(readMergedTable(lowBytes, 2).records[0].values, { Name: "Ana", City: "Paris" });
+  assert.strictEqual(readMergedTable(Buffer.alloc(0)).problems.length, 1);
   assert.deepStrictEqual(readMergedTable(mgBook([["", ""], ["Name", "City"], ["Ana", "Paris"]], []), 1).columns, ["Name", "City"]);
 });
 ok("mg: snippets have no invisible characters", () => {

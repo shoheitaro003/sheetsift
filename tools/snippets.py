@@ -1345,11 +1345,16 @@ function fillMerges(rows, merges, firstData, width, origin) {
     const span = m.right - m.left + 1;
     const first = address(m.top, m.left, m.top, m.left);
     if (span === 1 && isLabel(value)) {
-      // One column, several rows, with text: a group label such as a region. Fill it down.
-      for (let r = m.top + 1; r <= last; r++) rows[r][m.left] = value;
-      if (last > m.top) {
-        const filled = address(m.top + 1, m.left, last, m.left);
-        notes.push({ range: m.address, reason: `${JSON.stringify(value)} copied into ${filled}` });
+      // One column, several rows, with text: a group label such as a region. Fill it down,
+      // except into rows that are empty in the file: those are skipped later.
+      const filled = [];
+      for (let r = m.top + 1; r <= last; r++) {
+        if (rows[r].every(isEmpty)) continue;
+        rows[r][m.left] = value;
+        filled.push(address(r, m.left, r, m.left));
+      }
+      if (filled.length > 0) {
+        notes.push({ range: m.address, reason: `${JSON.stringify(value)} copied into ${filled.join(", ")}` });
       }
     } else if (span === 1) {
       // A number, date or boolean merged down: copying 100 into two invoice lines
@@ -1387,7 +1392,12 @@ function readMergedTable(bytes, headerTop = 0) {
   const firstData = headerTop + depth;
   // The table ends at the last named column; a stray cell further right does not widen it.
   const width = columns.findLastIndex((name) => name !== "") + 1;
-  // Rows that are empty in the file stay skipped, even when a merge fills them below.
+  if (width === 0) {
+    const cell = XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c });
+    const reason = `row ${origin.r + headerTop + 1} has no column names; if the header is lower, pass its index as headerTop`;
+    return { columns: [], records: [], notes: [], problems: [{ range: cell, reason }] };
+  }
+  // Rows that are empty in the file are skipped.
   const blank = new Set(rows.flatMap((row, r) => (row.every(isEmpty) ? [r] : [])));
   const { notes, problems, titleRows } = fillMerges(rows, merges, firstData, width, origin);
   if (depth > 1) {
@@ -1396,15 +1406,24 @@ function readMergedTable(bytes, headerTop = 0) {
       e: { r: origin.r + firstData - 1, c: origin.c + Math.max(width, 1) - 1 },
     });
     notes.unshift({ range, reason: `${depth} header rows combined into one name per column` });
-    // In a real multi-row header, a cell below the first row sits under a merge that
-    // starts above it ("Revenue" under "Q1"). A value under a cell that is not merged
-    // ("Ana" under "Name") suggests the row is really the first record.
+    // Was a lower header row really the first record? Two signs, both reported:
+    // a value under a header cell that is not merged ("Ana" under "Name"; in a real
+    // header that cell is empty), or a first data row with text in the same columns.
+    const next = rows.slice(firstData).find((row) => !row.every(isEmpty)) ?? [];
     for (let r = headerTop + 1; r < firstData; r++) {
-      rows[r].forEach((value, c) => {
-        if (isEmpty(value) || merges.some((m) => m.top >= headerTop && m.top < r && covers(m, m.top, c))) return;
+      const row = origin.r + r + 1;
+      const used = rows[r].flatMap((value, c) => (isEmpty(value) ? [] : [c]));
+      const loose = used.filter((c) =>
+        !merges.some((m) => m.top >= headerTop && m.top < r && covers(m, m.top, c)));
+      for (const c of loose) {
         const cell = XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });
-        problems.push({ range: cell, reason: `${JSON.stringify(value)} is under a header cell that is not merged; row ${origin.r + r + 1} may be data` });
-      });
+        problems.push({ range: cell, reason: `${JSON.stringify(rows[r][c])} is under a header cell that is not merged; row ${row} may be data` });
+      }
+      if (loose.length === 0 && used.length > 0 && used.every((c) => isLabel(next[c]))) {
+        const rowRange = XLSX.utils.encode_range({
+          s: { r: origin.r + r, c: origin.c }, e: { r: origin.r + r, c: origin.c + width - 1 } });
+        problems.push({ range: rowRange, reason: `row ${row} was read as a header row, but the first data row has text in the same columns; check whether row ${row} is data` });
+      }
     }
   }
 
