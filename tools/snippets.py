@@ -1232,7 +1232,14 @@ import * as XLSX from "xlsx";
 // rows: arrays of cells from the first sheet. merges: the sheet's merged ranges.
 // Both count from 0 at the top-left cell of the sheet's stored range (origin).
 function readSheet(bytes) {
-  const workbook = XLSX.read(bytes, { raw: true });
+  const data = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;
+  // .xlsx files are zip archives (they start with "PK"); .xls files start with D0 CF.
+  // Anything else is text. Decode it as UTF-8 yourself: without a byte order mark,
+  // SheetJS does not assume UTF-8, and "München" would arrive as "MÃ¼nchen".
+  const binary = (data[0] === 0x50 && data[1] === 0x4b) || (data[0] === 0xd0 && data[1] === 0xcf);
+  const workbook = binary
+    ? XLSX.read(data, { raw: true })
+    : XLSX.read(new TextDecoder("utf-8", { fatal: true }).decode(data), { type: "string", raw: true });
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   if (!sheet || !sheet["!ref"]) return { rows: [], merges: [], origin: { r: 0, c: 0 } };
   const origin = XLSX.utils.decode_range(sheet["!ref"]).s;
@@ -1314,6 +1321,7 @@ function fillMerges(rows, merges, firstData, width, origin) {
     s: { r: origin.r + r1, c: origin.c + c1 }, e: { r: origin.r + r2, c: origin.c + c2 } });
   for (const m of merges) {
     if (m.bottom < firstData) continue; // inside the header: headerNames used it
+    if (m.top >= rows.length) continue;  // below the last row: nothing to read
     if (m.top < firstData) {
       problems.push({ range: m.address, reason: "runs from the header into the data" });
       continue;
@@ -1332,12 +1340,18 @@ function fillMerges(rows, merges, firstData, width, origin) {
     const height = m.bottom - m.top + 1;
     const span = m.right - m.left + 1;
     const first = address(m.top, m.left, m.top, m.left);
-    if (span === 1) {
-      // One column, several rows: a group label such as a region. Fill it down.
+    if (span === 1 && isLabel(value)) {
+      // One column, several rows, with text: a group label such as a region. Fill it down.
       for (let r = m.top + 1; r <= last; r++) rows[r][m.left] = value;
-      if (!isEmpty(value) && last > m.top) {
+      if (last > m.top) {
         const filled = address(m.top + 1, m.left, last, m.left);
         notes.push({ range: m.address, reason: `${JSON.stringify(value)} copied into ${filled}` });
+      }
+    } else if (span === 1) {
+      // A number, date or boolean merged down: copying 100 into two invoice lines
+      // would double it. Empty merges need nothing.
+      if (!isEmpty(value) && last > m.top) {
+        problems.push({ range: m.address, reason: `covers ${height} rows; its value ${JSON.stringify(value)} is read into ${first} only` });
       }
     } else if (m.left <= 0 && m.right >= width - 1) {
       // One cell across the whole table: a title or a note, not a record.
@@ -1379,16 +1393,25 @@ function readMergedTable(bytes, headerTop = 0) {
   }
 
   const isData = (r) => r >= firstData && !titleRows.has(r) && !blank.has(r);
+  // A repeated name gets a number ("Amount (2)"), so its values are not overwritten
+  // in the records. "Email" and "EMAIL" count as the same name.
+  const used = new Set(columns.map((name) => name.toLowerCase()));
   const seen = new Set();
   columns.forEach((name, c) => {
     const cell = XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });
     if (name === "") {
       const hasData = rows.some((row, r) => isData(r) && !isEmpty(row[c]));
       if (hasData) problems.push({ range: cell, reason: "has data but no column name" });
-    } else if (seen.has(name.toLowerCase())) {
-      problems.push({ range: cell, reason: `repeats the column name ${JSON.stringify(name)}` });
+      return;
     }
-    seen.add(name.toLowerCase());
+    if (seen.has(name.toLowerCase())) {
+      let n = 2;
+      while (used.has(`${name} (${n})`.toLowerCase())) n++;
+      columns[c] = `${name} (${n})`;
+      used.add(columns[c].toLowerCase());
+      problems.push({ range: cell, reason: `repeats the column name ${JSON.stringify(name)}; read as ${JSON.stringify(columns[c])}` });
+    }
+    seen.add(columns[c].toLowerCase());
   });
 
   const records = [];
@@ -1418,7 +1441,8 @@ problems; // []
 '''
 
 MG_CSV = r'''// A CSV keeps no merges: "North" merged over three rows arrives as "North", "", "".
-// Fill a column only after the user says it is grouped this way.
+// Fill a column only after the user says it is grouped this way, and after
+// title and footnote rows are removed: in a CSV they arrive as records.
 function fillDown(records, column) {
   let last = "";
   for (const record of records) {
