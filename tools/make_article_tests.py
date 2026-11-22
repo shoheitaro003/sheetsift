@@ -1320,4 +1320,148 @@ PH_TESTS = PH_TESTS.replace("%%PH_TABLE_JSON%%", _json.dumps(_ph_table))
 PH_TESTS = PH_TESTS.replace("%%PH_ALL_JSON%%", _json.dumps([globals()[k] for k in _ph_names]))
 PH_TESTS = PH_TESTS.replace("%%XLSX_VERSION%%", "0.20.3")
 out += PH_TESTS
+# --- blog/detect-lookalike-cyrillic-greek-letters-javascript ---
+_lk_names = ["LK_PROBLEM", "LK_SCRIPTS", "LK_CHECK", "LK_USE", "LK_EXAMPLE"]
+_lk_post = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "content/posts/detect-lookalike-cyrillic-greek-letters-javascript.html")).read()
+# The table in the post: data-input holds the value as JS escapes; the cells hold what the post claims.
+_lk_table = []
+for _inp, _row in _re.findall(r'<tr class="lk" data-input="([^"]*)">(.*?)</tr>', _lk_post, _re.S):
+    _cells = [_html.unescape(_re.sub(r"<[^>]+>", "", c)).strip() for c in _re.findall(r"<td>(.*?)</td>", _row, _re.S)]
+    _lk_table.append([_inp.encode().decode("unicode_escape"), _cells])
+assert len(_lk_table) == 12, len(_lk_table)
+# Character names the post relies on.
+assert _ud.name("\u0430") == "CYRILLIC SMALL LETTER A" and _ud.name("\u0410") == "CYRILLIC CAPITAL LETTER A"
+assert _ud.name("\u0408") == "CYRILLIC CAPITAL LETTER JE" and _ud.name("\u042f") == "CYRILLIC CAPITAL LETTER YA"
+assert _ud.name("\u039a") == "GREEK CAPITAL LETTER KAPPA" and _ud.name("\u039c") == "GREEK CAPITAL LETTER MU"
+assert _ud.name("\ua4ee") == "LISU LETTER A" and _ud.name("\u2013") == "EN DASH" and _ud.name("\u0301") == "COMBINING ACUTE ACCENT"
+assert _ud.name("\u30fc") == "KATAKANA-HIRAGANA PROLONGED SOUND MARK" and _ud.name("\U0001D400") == "MATHEMATICAL BOLD CAPITAL A"
+LK_TESTS = r"""
+// --- blog/detect-lookalike-cyrillic-greek-letters-javascript ---
+{
+%%LK_SCRIPTS%%
+%%LK_CHECK%%
+%%LK_USE%%
+const evalLine = (line) => new Function("typed", "imported", "return " + line.split(";")[0])("paypal", "p\u0430yp\u0430l");
+ok("lk: the problem lines give what the comments say", () => {
+  const lines = %%LK_PROBLEM_JSON%%.split("\n").filter((l) => /^(imported|\/)/.test(l));
+  assert.strictEqual(lines.length, 4);
+  for (const line of lines) assert.strictEqual(evalLine(line), / \/\/ true/.test(line), line);
+});
+ok("lk: the table in the post matches the functions", () => {
+  for (const [input, [shown, , resolved, text, id]] of %%LK_TABLE_JSON%%) {
+    assert.strictEqual(shown, input);
+    const r = resolvedScripts(input);
+    assert.strictEqual(resolved, r === null ? "any" : r.length === 0 ? "none: mixed" : r.join(", "), input);
+    assert.strictEqual(text, checkText(input)?.marked ?? "ok", input);
+    assert.strictEqual(id, checkId(input) ? "flagged" : "ok", input);
+  }
+});
+ok("lk: the example prints what its comment says", () => {
+  const src = %%LK_EXAMPLE_JSON%%;
+  const got = new Function("checkRecords", "return " + src.split("\n// [")[0].trim().replace(/;$/, ""))(checkRecords);
+  const comment = src.split("\n").filter((l) => l.startsWith("//")).map((l) => l.slice(3)).join("\n");
+  assert.deepStrictEqual(got, eval(comment));
+  assert.strictEqual(got.length, 4);
+});
+ok("lk: UTS #39 table 1a examples and the cases in the text", () => {
+  assert.deepStrictEqual(resolvedScripts("Circle"), ["Latin"]);
+  assert.deepStrictEqual(resolvedScripts("\u0421ir\u0441l\u0435"), []);
+  assert.deepStrictEqual(resolvedScripts("\u0421\u0456\u0433\u0441\u04c0\u0435"), ["Cyrillic"]);
+  assert.deepStrictEqual(resolvedScripts("Circ1e"), ["Latin"]);
+  assert.deepStrictEqual(resolvedScripts("\u3006\u5207"), ["Han", "Han with Bopomofo", "Japanese", "Korean"]);
+  assert.deepStrictEqual(resolvedScripts("\u306d\u30ac"), ["Japanese"]);
+  assert.strictEqual(resolvedScripts("123-45"), null);
+  assert.strictEqual(resolvedScripts(""), null);
+  // Digits, punctuation, spaces and emoji count as any script.
+  for (const c of ["1", "-", " ", "!", "\u{1F600}", "\u2013"]) assert.strictEqual(scriptsOf(c), null, c);
+  // The long vowel mark: Script is Common, Script_Extensions Hiragana and Katakana.
+  assert(/\p{Script=Common}/u.test("\u30fc") && !/\p{Script=Hiragana}/u.test("\u30fc"));
+  assert(/\p{Script_Extensions=Hiragana}/u.test("\u30fc") && /\p{Script_Extensions=Katakana}/u.test("\u30fc"));
+  assert.deepStrictEqual(scriptsOf("\u30fc"), ["Hiragana", "Katakana", "Japanese"]);
+  assert.deepStrictEqual(resolvedScripts("\u30bf\u30fc\u30e0"), ["Katakana", "Japanese"]);
+  // A script that is not listed is Other, and mixed next to Latin.
+  assert(/\p{Script=Lisu}/u.test("\ua4ee"));
+  assert.deepStrictEqual(scriptsOf("\ua4ee"), ["Other"]);
+  assert.strictEqual(checkText("\ua4eepple").marked, "[\ua4ee]pple");
+  // Two different unlisted scripts are taken as one (the limit the post states).
+  assert(/\p{Script=Ethiopic}/u.test("\u1200"));
+  assert.strictEqual(checkText("\u1200\ua4ee"), null);
+  // The cache returns the same answer.
+  assert.strictEqual(scriptsOf("\u0430"), scriptsOf("\u0430"));
+});
+ok("lk: checkText checks the whole value", () => {
+  assert.strictEqual(checkText("Toys-\u042f-Us").marked, "Toys-[\u042f]-Us");
+  assert.strictEqual(checkText("\u0408. Smith").marked, "[\u0408]. Smith");
+  assert.strictEqual(checkText("John \u0410. Smith").marked, "John [\u0410]. Smith");
+  assert.strictEqual(checkText("\u0410-1 Plumbing").marked, "[\u0410]-1 Plumbing");
+  assert.deepStrictEqual(checkText("\u0410\u043d\u043d\u0430 Petrova").odd, ["U+0410 Cyrillic", "U+043D Cyrillic", "U+0430 Cyrillic"]);
+  const circle = checkText("\u0421ir\u0441l\u0435");
+  assert.deepStrictEqual([circle.main, circle.marked], ["Latin", "[\u0421]ir[\u0441]l[\u0435]"]);
+  assert.deepStrictEqual(circle.odd, ["U+0421 Cyrillic", "U+0441 Cyrillic", "U+0435 Cyrillic"]);
+  for (const v of [null, undefined, "", 42, "Circle", "\u0410\u043d\u043d\u0430 \u041f\u0435\u0442\u0440\u043e\u0432\u0430", "\u0395\u03bb\u03ad\u03bd\u03b7"]) assert.strictEqual(checkText(v), null, v);
+});
+ok("lk: checkText allows Latin with Japanese, Korean and Chinese, but not more", () => {
+  for (const v of ["T\u30b7\u30e3\u30c4", "iPhone\u7528", "\u65e5\u672c\u8a9eabc", "\u30e4\u30de\u30c0taro", "\u5c71\u7530 \u592a\u90ce \u3084\u307e\u3060 \u30e4\u30de\u30c0\u3055\u3093", "K\ud31d", "\u3105\u3106\u6f22\u5b57abc"]) assert.strictEqual(checkText(v), null, v);
+  assert.deepStrictEqual(resolvedScripts("T\u30b7\u30e3\u30c4"), []);
+  assert.strictEqual(checkText("\u042f\u30b7").main, "Cyrillic");
+  assert.strictEqual(checkText("T\u30b7\u03b1").marked, "T\u30b7[\u03b1]");
+  assert(checkText("\ud55c\u3072")); // Korean with Japanese is mixed
+  assert.strictEqual(checkText("T\u30b7\u30e3\u30c4\u0430").marked, "T\u30b7\u30e3\u30c4[\u0430]");
+  assert.strictEqual(checkText("T\ud55c\u30b7").marked, "T[\ud55c]\u30b7");
+  // Digits from other scripts belong to that script.
+  assert.strictEqual(checkText("abc\u0660").marked, "abc[\u0660]");
+  assert.deepStrictEqual(checkText("abc\u0660").odd, ["U+0660 Arabic"]);
+});
+ok("lk: preferred decides the main script whenever the text uses it", () => {
+  const greek = checkText("\u0391\u0392C-123");
+  assert.deepStrictEqual([greek.main, greek.marked, greek.odd], ["Latin", "[\u0391][\u0392]C-123", ["U+0391 Greek", "U+0392 Greek"]]);
+  assert.strictEqual(checkText("\u0391\u0392C-123", "Greek").marked, "\u0391\u0392[C]-123");
+  assert.strictEqual(checkText("\u041co\u0441\u043a\u0432\u0430", "Cyrillic").marked, "\u041c[o]\u0441\u043a\u0432\u0430");
+  assert.strictEqual(checkText("\u041co\u0441\u043a\u0432\u0430").marked, "[\u041c]o[\u0441][\u043a][\u0432][\u0430]");
+  assert.strictEqual(checkText("\u0410\u043d\u043d\u0430 Petrova", "Cyrillic").marked, "\u0410\u043d\u043d\u0430 [P][e][t][r][o][v][a]");
+  // No character in preferred: the majority wins.
+  assert.strictEqual(checkText("\u0391\u0392\u0393\u0416").main, "Greek");
+  assert.strictEqual(checkText("\u0421ir\u0441l\u0435", "Cyrillic").marked, "\u0421[i][r]\u0441[l]\u0435");
+});
+ok("lk: checkId flags every character that is not ASCII", () => {
+  for (const v of ["ana@example.com", "AB-123", "", null, undefined, 12345]) assert.strictEqual(checkId(v), null, v);
+  assert.deepStrictEqual(checkId("p\u0430yp\u0430l"), { marked: "p[\u0430]yp[\u0430]l", odd: ["U+0430 Cyrillic"] });
+  assert.deepStrictEqual(checkId("AB\u201312").odd, ["U+2013 Common"]);
+  assert.deepStrictEqual(checkId("anna@m\u00fcnchen.de").odd, ["U+00FC Latin"]);
+  assert.deepStrictEqual(checkId("\u3006\u5207").odd, ["U+3006 Han", "U+5207 Han"]);
+  assert.deepStrictEqual(checkId("a\u{1F600}").marked, "a[\u{1F600}]");
+  assert.deepStrictEqual(checkId("\ua4ee1").odd, ["U+A4EE Other"]);
+  assert.deepStrictEqual(checkId("Jose\u0301").odd, ["U+0301 combining mark"]);
+  // Control characters are not above U+007F, so they pass.
+  assert.strictEqual(checkId("a\tb\u0000"), null);
+  // Latin M in a Cyrillic word: with the default, the Cyrillic letters are marked.
+  assert.strictEqual(checkText("M\u043e\u0441\u043a\u0432\u0430").marked, "M[\u043e][\u0441][\u043a][\u0432][\u0430]");
+  // Full-width letters are Latin but not ASCII: NFKC first, then they pass.
+  assert(checkId("\uff21\uff22-1"));
+  assert.strictEqual(checkId("\uff21\uff22-1".normalize("NFKC")), null);
+});
+ok("lk: NFKC composes accents and styled letters, and leaves the lookalikes alone", () => {
+  assert.strictEqual("Jose\u0301".normalize("NFKC"), "Jos\u00e9");
+  assert.strictEqual("\u{1D400}pple".normalize("NFKC"), "Apple");
+  assert.strictEqual(checkText("\u{1D400}pple"), null);
+  for (const s of ["bo@ex\u0430mple.com", "\u0410cme", "\u039a\u039c-7", "p\u0430yp\u0430l", "\u0421ir\u0441l\u0435", "\u0408. Smith"]) assert.strictEqual(s.normalize("NFKC"), s);
+});
+ok("lk: checkRecords skips unlisted columns and missing values", () => {
+  assert.deepStrictEqual(checkRecords([{ rowNumber: 2, email: "ana@example.com", note: "p\u0430yp\u0430l" }, { rowNumber: 3 }]), []);
+  assert.deepStrictEqual(checkRecords([{ rowNumber: 7, name: "\u041co\u0441\u043a\u0432\u0430" }], "Cyrillic"), ['Row 7, name: "\u041c[o]\u0441\u043a\u0432\u0430" mixes Cyrillic with U+006F Latin.']);
+});
+ok("lk: the Unicode version the post names", () => assert.strictEqual(process.versions.unicode, "17.0"));
+ok("lk: snippets have no invisible characters", () => {
+  for (const s of %%LK_ALL_JSON%%) assert(!/[\u00a0\u00ad\u200b-\u200f\u2028\u2029\u202f\u2060\u3000\ufeff]/.test(s));
+  // The lookalike letters in code are written as escapes, so the code shows them.
+  for (const s of %%LK_ALL_JSON%%) assert(!/[\u0370-\u04ff]/.test(s.split("\n").filter((l) => !l.startsWith("//")).join("\n")));
+});
+}
+"""
+for _k in _lk_names:
+    LK_TESTS = LK_TESTS.replace("%%" + _k + "%%", globals()[_k])
+    LK_TESTS = LK_TESTS.replace("%%" + _k + "_JSON%%", _json.dumps(globals()[_k]))
+LK_TESTS = LK_TESTS.replace("%%LK_TABLE_JSON%%", _json.dumps(_lk_table))
+LK_TESTS = LK_TESTS.replace("%%LK_ALL_JSON%%", _json.dumps([globals()[k] for k in _lk_names]))
+out += LK_TESTS
 open(sys.argv[1] if len(sys.argv) > 1 else "/dev/stdout", "w").write(out)

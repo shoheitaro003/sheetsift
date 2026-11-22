@@ -1213,3 +1213,145 @@ function readRecords(bytes, headers) {
   return records;
 }
 '''
+
+LK_PROBLEM = r'''const typed = "paypal";
+const imported = "p\u0430yp\u0430l"; // both a's are CYRILLIC SMALL LETTER A (U+0430)
+
+imported === typed;                   // false
+imported.toLowerCase() === typed;     // false
+imported.normalize("NFKC") === typed; // false: NFKC does not touch it
+/^[\x20-\x7E]+$/.test(imported);      // false: an ASCII-only rule does catch it
+'''
+
+LK_SCRIPTS = r'''// Scripts to tell apart. A letter in a script that is not listed counts as "Other".
+const SCRIPTS = ["Latin", "Greek", "Cyrillic", "Armenian", "Georgian", "Cherokee", "Hebrew",
+  "Arabic", "Devanagari", "Thai", "Han", "Hiragana", "Katakana", "Hangul", "Bopomofo"];
+const SCRIPT_TESTS = SCRIPTS.map((name) =>
+  [name, new RegExp(`\\p{Script_Extensions=${name}}`, "u")]);
+
+// Writing systems that mix scripts on purpose (UTS #39 calls them Hanb, Jpan and Kore).
+const WRITING_SYSTEMS = {
+  Han: ["Han with Bopomofo", "Japanese", "Korean"],
+  Hiragana: ["Japanese"],
+  Katakana: ["Japanese"],
+  Hangul: ["Korean"],
+  Bopomofo: ["Han with Bopomofo"],
+};
+
+// Most digits, punctuation, spaces, emoji and combining marks belong to every script.
+const ANY_SCRIPT = /[\p{Script_Extensions=Common}\p{Script_Extensions=Inherited}]/u;
+
+// The scripts one character can belong to, or null for "any script".
+// Cached, because a regular expression per script is slow on large files.
+const scriptCache = new Map();
+function scriptsOf(char) {
+  if (!scriptCache.has(char)) scriptCache.set(char, findScripts(char));
+  return scriptCache.get(char);
+}
+function findScripts(char) {
+  if (ANY_SCRIPT.test(char)) return null;
+  const found = SCRIPT_TESTS.filter(([, test]) => test.test(char)).map(([name]) => name);
+  if (found.length === 0) return ["Other"];
+  return [...found, ...new Set(found.flatMap((name) => WRITING_SYSTEMS[name] ?? []))];
+}
+
+// The scripts that every character in text can belong to.
+// null: no letters at all. []: the text mixes scripts.
+function resolvedScripts(text) {
+  let common = null;
+  for (const char of text) {
+    const scripts = scriptsOf(char);
+    if (scripts === null) continue;
+    common = common === null ? scripts : common.filter((name) => scripts.includes(name));
+  }
+  return common;
+}
+'''
+
+LK_CHECK = r'''const codeOf = (char) =>
+  "U+" + char.codePointAt(0).toString(16).toUpperCase().padStart(4, "0");
+const SYSTEM_NAMES = new Set(Object.values(WRITING_SYSTEMS).flat());
+// "U+0430 Cyrillic", for messages: scripts only, not the writing systems.
+function label(char) {
+  if (/\p{M}/u.test(char)) return `${codeOf(char)} combining mark`;
+  const scripts = scriptsOf(char)?.filter((name) => !SYSTEM_NAMES.has(name)) ?? ["Common"];
+  return `${codeOf(char)} ${scripts.join("/")}`;
+}
+// Puts square brackets around the characters isOdd picks out.
+function describe(chars, isOdd) {
+  const marked = chars.map((char) => (isOdd(char) ? `[${char}]` : char)).join("");
+  return { marked, odd: [...new Set(chars.filter(isOdd).map(label))] };
+}
+
+// UTS #39 "Highly Restrictive" also allows Latin with Japanese, Korean or Chinese.
+const WITH_LATIN = ["Japanese", "Korean", "Han with Bopomofo"];
+function isMixed(text) {
+  const scripts = resolvedScripts(text);
+  if (scripts === null || scripts.length > 0) return false;
+  const rest = [...text].filter((char) => !scriptsOf(char)?.includes("Latin")).join("");
+  return !resolvedScripts(rest)?.some((name) => WITH_LATIN.includes(name));
+}
+
+// Names and other text: null, or the characters that are not in the main script.
+// preferred: the script your users write. It is the main one whenever the text uses it.
+function checkText(text, preferred = "Latin") {
+  const chars = [...String(text ?? "")];
+  if (!isMixed(chars.join(""))) return null;
+  const counts = new Map();
+  for (const char of chars) {
+    for (const name of scriptsOf(char) ?? []) counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  const top = Math.max(...counts.values());
+  const main = counts.has(preferred) ? preferred : [...counts].find(([, n]) => n === top)[0];
+  // Next to Latin, the Japanese, Korean or Chinese part most characters share is allowed.
+  const partner = main === "Latin"
+    ? WITH_LATIN.filter((name) => counts.has(name)).sort((a, b) => counts.get(b) - counts.get(a))[0]
+    : undefined;
+  const isOdd = (char) => {
+    const scripts = scriptsOf(char);
+    return scripts !== null && !scripts.includes(main) && !scripts.includes(partner);
+  };
+  return { main, ...describe(chars, isOdd) };
+}
+
+// IDs such as emails, SKUs and customer numbers: null, or the characters that are not ASCII.
+function checkId(value) {
+  const chars = [...String(value ?? "")];
+  const isOdd = (char) => char.codePointAt(0) > 0x7f;
+  return chars.some(isOdd) ? describe(chars, isOdd) : null;
+}
+'''
+
+LK_USE = r'''const COLUMN_KINDS = { email: "id", sku: "id", name: "text", company: "text" };
+
+// records: objects from your parser, after cleaning invisible characters. Each has
+// rowNumber, the row in the file, so messages still point to the right row
+// when the parser skips blank rows or the header is not on row 1.
+function checkRecords(records, preferred = "Latin") {
+  const warnings = [];
+  for (const record of records) {
+    for (const [column, kind] of Object.entries(COLUMN_KINDS)) {
+      const found = kind === "id" ? checkId(record[column]) : checkText(record[column], preferred);
+      if (!found) continue;
+      const problem = kind === "id" ? "is not plain ASCII:" : `mixes ${found.main} with`;
+      const where = `Row ${record.rowNumber}, ${column}`;
+      warnings.push(`${where}: "${found.marked}" ${problem} ${found.odd.join(", ")}.`);
+    }
+  }
+  return warnings;
+}
+'''
+
+LK_EXAMPLE = r'''checkRecords([
+  { rowNumber: 2, email: "ana@example.com", sku: "AB-123",
+    name: "Ana Petrova", company: "Acme" },
+  { rowNumber: 3, email: "bo@ex\u0430mple.com", sku: "AB-124",
+    name: "Bo Chen", company: "\u0410cme" },
+  { rowNumber: 5, email: "chloe@example.com", sku: "\u039a\u039c-7",
+    name: "Chlo\u00eb \u041c. Martin", company: "Zeta" },
+]);
+// [ 'Row 3, email: "bo@ex[а]mple.com" is not plain ASCII: U+0430 Cyrillic.',
+//   'Row 3, company: "[А]cme" mixes Latin with U+0410 Cyrillic.',
+//   'Row 5, sku: "[Κ][Μ]-7" is not plain ASCII: U+039A Greek, U+039C Greek.',
+//   'Row 5, name: "Chloë [М]. Martin" mixes Latin with U+041C Cyrillic.' ]
+'''
