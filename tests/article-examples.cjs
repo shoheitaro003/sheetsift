@@ -2236,9 +2236,15 @@ function readSheet(bytes) {
   // FF FE and FE FF are UTF-16 BOMs, as in Excel's "Unicode Text" export.
   const binary = starts(0x50, 0x4b) || starts(0xd0, 0xcf);
   const encoding = starts(0xff, 0xfe) ? "utf-16le" : starts(0xfe, 0xff) ? "utf-16be" : "utf-8";
-  const workbook = binary
-    ? XLSX.read(data, { raw: true })
-    : XLSX.read(new TextDecoder(encoding, { fatal: true }).decode(data), { type: "string", raw: true });
+  let workbook;
+  if (binary) workbook = XLSX.read(data, { raw: true });
+  else {
+    // fatal: true throws a TypeError on bytes that are not valid in this encoding.
+    const text = new TextDecoder(encoding, { fatal: true }).decode(data);
+    // UTF-16 without a BOM is valid UTF-8 full of zero bytes: refuse it too.
+    if (text.includes("\0")) throw new TypeError("zero bytes: UTF-16 without a BOM, or not a text file");
+    workbook = XLSX.read(text, { type: "string", raw: true });
+  }
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   if (!sheet || !sheet["!ref"]) return { rows: [], merges: [], origin: { r: 0, c: 0 } };
   const origin = XLSX.utils.decode_range(sheet["!ref"]).s;
@@ -2320,14 +2326,20 @@ function fillMerges(rows, merges, firstData, width, origin) {
   for (const m of merges) {
     if (m.bottom < firstData) continue; // inside the header: headerNames used it
     if (m.top >= rows.length) continue;  // below the last row: nothing to read
+    if (m.left >= width) continue;       // right of the last named column: not in the table
     if (m.top < firstData) {
-      problems.push({ range: m.address, reason: "runs from the header into the data" });
+      // A header label merged down into blank rows only ("Region" over A1:A3, row 3
+      // empty) is harmless: blank rows are skipped. Anything else is reported.
+      const into = rows.slice(firstData, m.bottom + 1);
+      if (!into.every((row) => row.every(isEmpty))) {
+        problems.push({ range: m.address, reason: "runs from the header into the data" });
+      }
       continue;
     }
     const value = rows[m.top]?.[m.left] ?? "";
     const last = Math.min(m.bottom, rows.length - 1);
-    // Excel shows only the first cell of a merge. A value stored under it is invisible
-    // to the user, so it is reported and not imported.
+    // A merged range shows only its first cell's value. A value stored under it is
+    // hidden from the user, so it is reported and not imported.
     for (let r = m.top; r <= last; r++) {
       for (let c = m.left; c <= m.right; c++) {
         if ((r === m.top && c === m.left) || isEmpty(rows[r][c])) continue;
@@ -2364,8 +2376,9 @@ function fillMerges(rows, merges, firstData, width, origin) {
       // Text is a title or a footnote. A number across the table (a total?) is reported.
       const list = isLabel(value) || isEmpty(value) ? notes : problems;
       list.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });
-    } else {
+    } else if (!isEmpty(value)) {
       // Across columns: the value belongs to one of them, and only the user knows which.
+      // An empty merge (kept for layout) needs nothing.
       const size = height > 1 ? `${height} rows and ${span} columns` : `${span} columns`;
       problems.push({ range: m.address, reason: `covers ${size}; its value is read into ${first} only` });
     }
@@ -2373,75 +2386,91 @@ function fillMerges(rows, merges, firstData, width, origin) {
   return { notes, problems, titleRows };
 }
 
-// headerTop: index of the first header row in rows (0, or what your header detection found).
+// Was a lower header row really the first record? Two signs, both reported:
+// a value under a header cell that is not merged ("Ana" under "Name"), or a first
+// data row with text in the same columns as the lower header row.
+function checkLowerHeaderRows(rows, merges, headerTop, firstData, width, origin) {
+  const problems = [];
+  const next = rows.slice(firstData).find((row) => !row.every(isEmpty)) ?? [];
+  for (let r = headerTop + 1; r < firstData; r++) {
+    const row = origin.r + r + 1;
+    const used = rows[r].flatMap((value, c) => (isEmpty(value) ? [] : [c]));
+    // Is column c under a header merge that starts above row r? ("Q1" over C1:D1)
+    const underMerge = (c) =>
+      merges.some((m) => m.top >= headerTop && m.top < r && c >= m.left && c <= m.right);
+    const loose = used.filter((c) => !underMerge(c));
+    for (const c of loose) {
+      const cell = XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });
+      problems.push({ range: cell, reason: `${JSON.stringify(rows[r][c])} is under a header cell that is not merged; row ${row} may be data` });
+    }
+    if (loose.length === 0 && used.length > 0 && used.every((c) => isLabel(next[c]))) {
+      const range = XLSX.utils.encode_range({
+        s: { r: origin.r + r, c: origin.c }, e: { r: origin.r + r, c: origin.c + width - 1 } });
+      problems.push({ range, reason: `row ${row} was read as a header row, but the first data row has text in the same columns; check whether row ${row} is data` });
+    }
+  }
+  return problems;
+}
+
+// A repeated name gets a number ("Amount (2)"), so its values are not overwritten.
+// "Email" and "EMAIL" count as the same name. Changes columns in place.
+function renameRepeats(columns, cellOf) {
+  const problems = [];
+  const taken = new Set(columns.map((name) => name.toLowerCase()));
+  const seen = new Set();
+  columns.forEach((name, c) => {
+    if (name === "") return;
+    if (seen.has(name.toLowerCase())) {
+      let n = 2;
+      while (taken.has(`${name} (${n})`.toLowerCase())) n++;
+      columns[c] = `${name} (${n})`;
+      taken.add(columns[c].toLowerCase());
+      problems.push({ range: cellOf(c), reason: `repeats the column name ${JSON.stringify(name)}; read as ${JSON.stringify(columns[c])}` });
+    }
+    seen.add(columns[c].toLowerCase());
+  });
+  return problems;
+}
+
+// headerTop: index into rows, counted from the first row of the stored range
+// (0, or what your header detection found). Its Excel row is origin.r + headerTop + 1.
 function readMergedTable(bytes, headerTop = 0) {
   const { rows, merges, origin } = readSheet(bytes);
+  const cellOf = (c) => XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });
   if (rows.length <= headerTop) {
     const problems = [{ range: null, reason: "the sheet has no header row" }];
     return { columns: [], records: [], notes: [], problems };
   }
+  // 1. Name the columns.
   const depth = headerDepth(rows, merges, headerTop);
   const columns = headerNames(rows, merges, headerTop, depth);
   const firstData = headerTop + depth;
   // The table ends at the last named column; a stray cell further right does not widen it.
   const width = columns.findLastIndex((name) => name !== "") + 1;
   if (width === 0) {
-    const cell = XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c });
     const reason = `row ${origin.r + headerTop + 1} has no column names; if the header is lower, pass its index as headerTop`;
-    return { columns: [], records: [], notes: [], problems: [{ range: cell, reason }] };
+    return { columns: [], records: [], notes: [], problems: [{ range: cellOf(0), reason }] };
   }
-  // Rows that are empty in the file are skipped.
-  const blank = new Set(rows.flatMap((row, r) => (row.every(isEmpty) ? [r] : [])));
+  // 2. Fill or flag the merges in the data.
   const { notes, problems, titleRows } = fillMerges(rows, merges, firstData, width, origin);
+  // 3. Check the header.
   if (depth > 1) {
     const range = XLSX.utils.encode_range({
-      s: { r: origin.r + headerTop, c: origin.c },
-      e: { r: origin.r + firstData - 1, c: origin.c + Math.max(width, 1) - 1 },
-    });
+      s: { r: origin.r + headerTop, c: origin.c }, e: { r: origin.r + firstData - 1, c: origin.c + width - 1 } });
     notes.unshift({ range, reason: `${depth} header rows combined into one name per column` });
-    // Was a lower header row really the first record? Two signs, both reported:
-    // a value under a header cell that is not merged ("Ana" under "Name"; in a real
-    // header that cell is empty), or a first data row with text in the same columns.
-    const next = rows.slice(firstData).find((row) => !row.every(isEmpty)) ?? [];
-    for (let r = headerTop + 1; r < firstData; r++) {
-      const row = origin.r + r + 1;
-      const used = rows[r].flatMap((value, c) => (isEmpty(value) ? [] : [c]));
-      const loose = used.filter((c) =>
-        !merges.some((m) => m.top >= headerTop && m.top < r && covers(m, m.top, c)));
-      for (const c of loose) {
-        const cell = XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });
-        problems.push({ range: cell, reason: `${JSON.stringify(rows[r][c])} is under a header cell that is not merged; row ${row} may be data` });
-      }
-      if (loose.length === 0 && used.length > 0 && used.every((c) => isLabel(next[c]))) {
-        const rowRange = XLSX.utils.encode_range({
-          s: { r: origin.r + r, c: origin.c }, e: { r: origin.r + r, c: origin.c + width - 1 } });
-        problems.push({ range: rowRange, reason: `row ${row} was read as a header row, but the first data row has text in the same columns; check whether row ${row} is data` });
-      }
-    }
+    problems.push(...checkLowerHeaderRows(rows, merges, headerTop, firstData, width, origin));
   }
-
-  const isData = (r) => r >= firstData && !titleRows.has(r) && !blank.has(r);
-  // A repeated name gets a number ("Amount (2)"), so its values are not overwritten
-  // in the records. "Email" and "EMAIL" count as the same name.
-  const used = new Set(columns.map((name) => name.toLowerCase()));
-  const seen = new Set();
+  // Data rows: below the header, not a title, not empty (checked after fillMerges,
+  // which clears hidden values).
+  const isData = (r) => r >= firstData && !titleRows.has(r) && !rows[r].every(isEmpty);
   columns.forEach((name, c) => {
-    const cell = XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });
-    if (name === "") {
-      const hasData = rows.some((row, r) => isData(r) && !isEmpty(row[c]));
-      if (hasData) problems.push({ range: cell, reason: "has data but no column name" });
-      return;
+    if (name === "" && rows.some((row, r) => isData(r) && !isEmpty(row[c]))) {
+      problems.push({ range: cellOf(c), reason: "has data but no column name" });
     }
-    if (seen.has(name.toLowerCase())) {
-      let n = 2;
-      while (used.has(`${name} (${n})`.toLowerCase())) n++;
-      columns[c] = `${name} (${n})`;
-      used.add(columns[c].toLowerCase());
-      problems.push({ range: cell, reason: `repeats the column name ${JSON.stringify(name)}; read as ${JSON.stringify(columns[c])}` });
-    }
-    seen.add(columns[c].toLowerCase());
   });
+  problems.push(...renameRepeats(columns, cellOf));
 
+  // 4. Build one record per data row.
   const records = [];
   rows.forEach((row, r) => {
     if (!isData(r)) return;
@@ -2500,8 +2529,8 @@ ok("mg: SheetJS 0.20.3: the problem lines give what the comments say", () => {
 });
 ok("mg: SheetJS 0.20.3: the example gives the output in its comments", async () => {
   const file = { arrayBuffer: async () => salesBytes };
-  const src = "const { columns, records, notes, problems } = readMergedTable(await file.arrayBuffer());\ncolumns;\n// [ 'Region', 'Rep', 'Q1 Revenue', 'Q1 Cost', 'Q2 Revenue', 'Q2 Cost' ]\nrecords[1];\n// { row: 4,\n//   values: { Region: 'North', Rep: 'Bo', 'Q1 Revenue': 90, 'Q1 Cost': 30,\n//             'Q2 Revenue': 95, 'Q2 Cost': 35 } }\nnotes.map((n) => `${n.range}: ${n.reason}`);\n// [ 'A1:F2: 2 header rows combined into one name per column',\n//   'A3:A4: \"North\" copied into A4',\n//   'A6:F6: row 6 skipped: \"Note: figures in EUR\" spans the table' ]\nproblems; // []\n";
-  const body = src.split("\n").filter((l) => l.startsWith("const ")).join("\n");
+  const src = "let table;\ntry {\n  table = readMergedTable(await file.arrayBuffer());\n} catch (error) {\n  // A text file that is not UTF-8 or UTF-16 throws a TypeError in readSheet,\n  // and SheetJS throws for a damaged .xlsx. Either way, ask for another export.\n  const reason = \"the file could not be read; save it as .xlsx or CSV UTF-8\";\n  table = { columns: [], records: [], notes: [], problems: [{ range: null, reason }] };\n}\nconst { columns, records, notes, problems } = table;\n\ncolumns;\n// [ 'Region', 'Rep', 'Q1 Revenue', 'Q1 Cost', 'Q2 Revenue', 'Q2 Cost' ]\nrecords[1];\n// { row: 4,\n//   values: { Region: 'North', Rep: 'Bo', 'Q1 Revenue': 90, 'Q1 Cost': 30,\n//             'Q2 Revenue': 95, 'Q2 Cost': 35 } }\nnotes.map((n) => `${n.range}: ${n.reason}`);\n// [ 'A1:F2: 2 header rows combined into one name per column',\n//   'A3:A4: \"North\" copied into A4',\n//   'A6:F6: row 6 skipped: \"Note: figures in EUR\" spans the table' ]\nproblems; // []\n";
+  const body = src.slice(0, src.indexOf("\n\ncolumns;"));
   const got = await new Function("readMergedTable", "file", "return (async () => {" + body + "\nreturn { columns, records, notes, problems }; })();")(readMergedTable, file);
   assert.deepStrictEqual(got.columns, ["Region", "Rep", "Q1 Revenue", "Q1 Cost", "Q2 Revenue", "Q2 Cost"]);
   assert.deepStrictEqual(got.records[1], { row: 4, values: { Region: "North", Rep: "Bo", "Q1 Revenue": 90, "Q1 Cost": 30, "Q2 Revenue": 95, "Q2 Cost": 35 } });
@@ -2643,7 +2672,7 @@ ok("mg: a sheet that does not start at A1 keeps Excel addresses and row numbers"
 });
 ok("mg: duplicate and empty column names", () => {
   const t = readMergedTable(mgBook([["Name", "name", "", "", "Email"], ["Ana", "x", "", "y", "a@b.co"]], []));
-  assert.deepStrictEqual(text(t.problems), ['B1: repeats the column name "name"; read as "name (2)"', "D1: has data but no column name"]);
+  assert.deepStrictEqual(text(t.problems), ["D1: has data but no column name", 'B1: repeats the column name "name"; read as "name (2)"']);
   assert.deepStrictEqual(Object.keys(t.records[0].values), ["Name", "name (2)", "Email"]);
   // A blank column without data is dropped quietly.
   assert.deepStrictEqual(readMergedTable(mgBook([["Name", "", "Email"], ["Ana", "", "a@b.co"]], [])).problems, []);
@@ -2778,7 +2807,332 @@ ok("mg: a header that is not in the first row gives unnamed columns (headerTop)"
   assert.strictEqual(readMergedTable(Buffer.alloc(0)).problems.length, 1);
   assert.deepStrictEqual(readMergedTable(mgBook([["", ""], ["Name", "City"], ["Ana", "Paris"]], []), 1).columns, ["Name", "City"]);
 });
+ok("mg: a header label merged down into a blank row is not reported", () => {
+  // Region over A1:A3, Q1 over C1:D1, row 3 empty, data from row 4.
+  const t = readMergedTable(mgBook([["Region", "Rep", "Q1", ""], ["", "", "Revenue", "Cost"], ["", "", "", ""], ["North", "Ana", 1, 2]],
+    ["A1:A3", "B1:B2", "C1:D1"]));
+  assert.deepStrictEqual(t.columns, ["Region", "Rep", "Q1 Revenue", "Q1 Cost"]);
+  assert.deepStrictEqual(t.problems, []);
+  assert.deepStrictEqual(t.records, [{ row: 4, values: { Region: "North", Rep: "Ana", "Q1 Revenue": 1, "Q1 Cost": 2 } }]);
+  // The same merge reaching a row with data is still reported.
+  const d = readMergedTable(mgBook([["Region", "Rep", "Q1", ""], ["", "", "Revenue", "Cost"], ["", "Bo", 3, 4]],
+    ["A1:A3", "B1:B2", "C1:D1"]));
+  assert.deepStrictEqual(text(d.problems), ["A1:A3: runs from the header into the data"]);
+});
+ok("mg: SheetJS 0.20.3: raw: true gives stored numbers, not formatted text", () => {
+  const sheet = XLSX.utils.aoa_to_sheet([["Share", "Price"], [0.12, 1234.5]]);
+  sheet.A2.z = "0%";
+  sheet.B2.z = "#,##0.00";
+  const book = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(book, sheet, "S");
+  const bytes = XLSX.write(book, { type: "buffer", bookType: "xlsx" });
+  // Without raw, SheetJS returns what Excel displays.
+  const shownRows = XLSX.utils.sheet_to_json(XLSX.read(bytes).Sheets.S, { header: 1, raw: false });
+  assert.deepStrictEqual(shownRows[1], ["12%", "1,234.50"]);
+  const t = readMergedTable(bytes);
+  assert.deepStrictEqual(t.records[0].values, { Share: 0.12, Price: 1234.5 });
+});
+ok("mg: text merged down in a value column is filled like a label", () => {
+  const t = readMergedTable(mgBook([["Rep", "Amount"], ["Ana", "TBD"], ["Bo", ""]], ["B2:B3"]));
+  assert.deepStrictEqual(t.records.map((r) => r.values.Amount), ["TBD", "TBD"]);
+  assert.deepStrictEqual(text(t.notes), ['B2:B3: "TBD" copied into B3']);
+});
+ok("mg: unreadable files throw, and the example turns that into a problem", () => {
+  const latin1 = Buffer.from([0x43, 0x69, 0x74, 0x79, 0x0a, 0x4d, 0xfc, 0x6e, 0x63, 0x68, 0x65, 0x6e, 0x0a]); // "City\nMünchen" in Windows-1252
+  assert.throws(() => readMergedTable(latin1), TypeError);
+  const example = "let table;\ntry {\n  table = readMergedTable(await file.arrayBuffer());\n} catch (error) {\n  // A text file that is not UTF-8 or UTF-16 throws a TypeError in readSheet,\n  // and SheetJS throws for a damaged .xlsx. Either way, ask for another export.\n  const reason = \"the file could not be read; save it as .xlsx or CSV UTF-8\";\n  table = { columns: [], records: [], notes: [], problems: [{ range: null, reason }] };\n}\nconst { columns, records, notes, problems } = table;\n\ncolumns;\n// [ 'Region', 'Rep', 'Q1 Revenue', 'Q1 Cost', 'Q2 Revenue', 'Q2 Cost' ]\nrecords[1];\n// { row: 4,\n//   values: { Region: 'North', Rep: 'Bo', 'Q1 Revenue': 90, 'Q1 Cost': 30,\n//             'Q2 Revenue': 95, 'Q2 Cost': 35 } }\nnotes.map((n) => `${n.range}: ${n.reason}`);\n// [ 'A1:F2: 2 header rows combined into one name per column',\n//   'A3:A4: \"North\" copied into A4',\n//   'A6:F6: row 6 skipped: \"Note: figures in EUR\" spans the table' ]\nproblems; // []\n";
+  assert(example.includes("try {") && example.includes("catch (error)"));
+  assert.throws(() => readMergedTable(Buffer.from("PK\x03\x04garbagegarbage")));
+  // The example's catch turns both into one problem.
+  const body = example.slice(0, example.indexOf("\n\ncolumns;"));
+  const run = (bytes) => new Function("readMergedTable", "file", "return (async () => {" + body + "\nreturn problems; })();")(readMergedTable, { arrayBuffer: async () => bytes });
+  return Promise.all([run(latin1), run(Buffer.from("PK\x03\x04garbagegarbage"))]).then((all) => {
+    for (const p of all) assert.deepStrictEqual(text(p), ["null: the file could not be read; save it as .xlsx or CSV UTF-8"]);
+  });
+});
+ok("mg: the post's text-only header examples are read as headers and reported", () => {
+  const contact = readMergedTable(mgBook([["Name", "Contact", ""], ["Ana", "ana@example.com", "555-0100"], ["Bo", "bo@example.com", "555-0101"]], ["B1:C1"]));
+  assert.deepStrictEqual(contact.columns, ["Name Ana", "Contact ana@example.com", "Contact 555-0100"]);
+  assert(contact.problems.length > 0);
+  const city = readMergedTable(mgBook([["Name", "City"], ["", "Berlin"], ["Ana", "Paris"]], ["A1:A2"]));
+  assert.deepStrictEqual(city.columns, ["Name", "City Berlin"]);
+  assert.deepStrictEqual(text(city.problems), ['B2: "Berlin" is under a header cell that is not merged; row 2 may be data']);
+});
+ok("mg: review fixes: empty layout merges, merges right of the table, hidden-only rows, UTF-16 without BOM", () => {
+  // An empty merge across columns (layout) is not a problem.
+  const empty = readMergedTable(mgBook([["Name", "Note", "Amount"], ["Ana", "", ""], ["Bo", "x", 2]], ["B2:C2"]));
+  assert.deepStrictEqual(empty.problems, []);
+  // Merges right of the last named column are ignored, filled or not.
+  const right = readMergedTable(mgBook([["Name", "Amount", "", "", ""], ["Ana", 1, "", "Logo", ""], ["Bo", 2, "", "", ""], ["Cy", 3, "", "Box", ""]], ["D2:E2", "D4:D5"]));
+  assert.deepStrictEqual(right.columns.slice(0, 2), ["Name", "Amount"]);
+  assert.deepStrictEqual(right.notes, []);
+  assert.deepStrictEqual(right.problems.filter((p) => /^D\d+:/.test(p.range)), []);
+  // A row whose only content is a value hidden under a merge is not a record.
+  const sheet = XLSX.utils.aoa_to_sheet([["Region", "Rep"], ["North", "Ana"], ["South", ""]]);
+  sheet["!merges"] = [XLSX.utils.decode_range("A2:A3")];
+  const book = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(book, sheet, "S");
+  const hidden = readMergedTable(XLSX.write(book, { type: "buffer", bookType: "xlsx" }));
+  assert.deepStrictEqual(hidden.records, [{ row: 2, values: { Region: "North", Rep: "Ana" } }]);
+  assert.deepStrictEqual(text(hidden.problems), ['A2:A3: hides "South" in A3']);
+  // UTF-16 without a BOM is refused, with a TypeError.
+  const utf16 = Buffer.from("Name,City\nAna,Paris\n", "utf16le");
+  assert.throws(() => readMergedTable(utf16), /zero bytes/);
+});
+ok("mg: the sheet grid in the post matches the fixture", () => {
+  const post = fs.readFileSync(path.join(__dirname, "..", "content", "posts", "merged-cells-excel-sheetjs.html"), "utf8");
+  const grid = /<table class="grid"[^>]*>([\s\S]*?)<\/table>/.exec(post)[1];
+  const { rows, merges } = readSheet(salesBytes);
+  // Each <td> gives its address in data-cell and its merge in data-merge.
+  const cells = [...grid.matchAll(/<td data-cell="([A-Z]+\d+)"(?: data-merge="([A-Z0-9:]+)")?[^>]*>([^<]*)<\/td>/g)];
+  assert(cells.length >= 20);
+  for (const [, cell, merge, content] of cells) {
+    const { r, c } = XLSX.utils.decode_cell(cell);
+    assert.strictEqual(content, String(rows[r][c]), cell);
+    if (merge) assert(merges.some((m) => m.address === merge && m.top === r && m.left === c), merge);
+  }
+  assert.deepStrictEqual(cells.filter((x) => x[2]).map((x) => x[2]).sort(), merges.map((m) => m.address).sort());
+  // Every non-empty cell in the fixture is in the grid.
+  let filled = 0;
+  rows.forEach((row) => row.forEach((v) => { if (v !== "") filled++; }));
+  assert.strictEqual(cells.filter((x) => x[3] !== "").length, filled);
+});
 ok("mg: snippets have no invisible characters", () => {
-  for (const s of ["// Sales.xlsx, six merges: \"Region\" over A1:A2, \"Rep\" over B1:B2, \"Q1\" over C1:D1,\n// \"Q2\" over E1:F1, \"North\" over A3:A4, \"Note: figures in EUR\" over A6:F6.\nconst sheet = workbook.Sheets[workbook.SheetNames[0]];\nconst records = XLSX.utils.sheet_to_json(sheet, { defval: \"\" });\nObject.keys(records[0]); // [ 'Region', 'Rep', 'Q1', '__EMPTY', 'Q2', '__EMPTY_1' ]\nrecords[0].Q1;           // 'Revenue'  (the second header row, read as data)\nrecords[2].Region;       // ''         (Bo's row: \"North\" is only in A3)\nsheet[\"!merges\"].length; // 6\n", "// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz\nimport * as XLSX from \"xlsx\";\n\n// rows: arrays of cells from the first sheet. merges: the sheet's merged ranges.\n// Both count from 0 at the top-left cell of the sheet's stored range (origin).\nfunction readSheet(bytes) {\n  const data = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;\n  const starts = (a, b) => data[0] === a && data[1] === b;\n  // .xlsx files are zip archives (they start with \"PK\"); .xls files start with D0 CF.\n  // Anything else is text. Decode it yourself: without a byte order mark (BOM),\n  // SheetJS does not assume UTF-8, and \"M\u00fcnchen\" would arrive as \"M\u00c3\u00bcnchen\".\n  // FF FE and FE FF are UTF-16 BOMs, as in Excel's \"Unicode Text\" export.\n  const binary = starts(0x50, 0x4b) || starts(0xd0, 0xcf);\n  const encoding = starts(0xff, 0xfe) ? \"utf-16le\" : starts(0xfe, 0xff) ? \"utf-16be\" : \"utf-8\";\n  const workbook = binary\n    ? XLSX.read(data, { raw: true })\n    : XLSX.read(new TextDecoder(encoding, { fatal: true }).decode(data), { type: \"string\", raw: true });\n  const sheet = workbook.Sheets[workbook.SheetNames[0]];\n  if (!sheet || !sheet[\"!ref\"]) return { rows: [], merges: [], origin: { r: 0, c: 0 } };\n  const origin = XLSX.utils.decode_range(sheet[\"!ref\"]).s;\n  const rows = XLSX.utils.sheet_to_json(sheet, {\n    header: 1, defval: \"\", blankrows: true, raw: true });\n  const merges = (sheet[\"!merges\"] ?? []).map((m) => ({\n    address: XLSX.utils.encode_range(m), // \"C1:D1\", for messages\n    top: m.s.r - origin.r, bottom: m.e.r - origin.r,\n    left: m.s.c - origin.c, right: m.e.c - origin.c,\n  }));\n  return { rows, merges, origin };\n}\n", "const isEmpty = (value) => String(value ?? \"\").trim() === \"\";\nconst isLabel = (value) => typeof value === \"string\" && value.trim() !== \"\";\nconst covers = (m, r, c) => r >= m.top && r <= m.bottom && c >= m.left && c <= m.right;\n// What the user sees in a cell: a cell under a merge shows the merge's value.\nconst shown = (rows, merges, r, c) => {\n  const m = merges.find((range) => covers(range, r, c));\n  return m ? rows[m.top]?.[m.left] : rows[r]?.[c];\n};\n\n// A row can be part of the header only if it has labels and no numbers, dates or booleans.\nconst labelRow = (row = []) => row.some(isLabel) && row.every((v) => isEmpty(v) || isLabel(v));\n\n// How many rows the header has, starting at row `top`. A label merged down (\"Region\"\n// over two rows) covers the rows below it. A label merged across (\"Q1\" over two\n// columns) names a group, so the row below belongs to the header if it has a label\n// under every column of the group. maxDepth keeps a stray merge from eating the data.\nfunction headerDepth(rows, merges, top, maxDepth = 3) {\n  let bottom = top;\n  for (let changed = true; changed; ) {\n    changed = false;\n    for (const m of merges) {\n      if (m.top < top || m.top > bottom) continue;\n      // last: the lowest row this merge pulls into the header.\n      let last = m.bottom;\n      const below = [];\n      for (let c = m.left; c <= m.right; c++) below.push(shown(rows, merges, m.bottom + 1, c));\n      if (m.right > m.left && below.every(isLabel)) last = m.bottom + 1;\n      if (last <= bottom || last >= top + maxDepth) continue;\n      if (!rows.slice(bottom + 1, last + 1).every((row) => labelRow(row))) continue;\n      bottom = last;\n      changed = true;\n    }\n  }\n  return bottom - top + 1;\n}\n\n// One name per column: \"Q1\" above \"Revenue\" becomes \"Q1 Revenue\".\n// A merged cell gives its value to every column it covers, once per column.\nfunction headerNames(rows, merges, top, depth) {\n  const width = Math.max(0, ...rows.slice(top, top + depth).map((row) => row.length));\n  const names = [];\n  for (let c = 0; c < width; c++) {\n    const parts = [];\n    let previous = null;\n    for (let r = top; r < top + depth; r++) {\n      const m = merges.find((range) => covers(range, r, c)) ?? null;\n      if (m && m === previous) continue; // a label merged down counts once\n      previous = m;\n      const value = m ? rows[m.top]?.[m.left] : rows[r]?.[c];\n      if (!isEmpty(value)) parts.push(String(value).trim());\n    }\n    names.push(parts.join(\" \"));\n  }\n  return names;\n}\n", "// Copies each merged value down its column; reports the merges it will not fill.\n// Changes rows in place. firstData: index of the first row under the header.\n// width: number of named columns in the table.\nfunction fillMerges(rows, merges, firstData, width, origin) {\n  const notes = [];\n  const problems = [];\n  const titleRows = new Set();\n  const address = (r1, c1, r2, c2) => XLSX.utils.encode_range({\n    s: { r: origin.r + r1, c: origin.c + c1 }, e: { r: origin.r + r2, c: origin.c + c2 } });\n  for (const m of merges) {\n    if (m.bottom < firstData) continue; // inside the header: headerNames used it\n    if (m.top >= rows.length) continue;  // below the last row: nothing to read\n    if (m.top < firstData) {\n      problems.push({ range: m.address, reason: \"runs from the header into the data\" });\n      continue;\n    }\n    const value = rows[m.top]?.[m.left] ?? \"\";\n    const last = Math.min(m.bottom, rows.length - 1);\n    // Excel shows only the first cell of a merge. A value stored under it is invisible\n    // to the user, so it is reported and not imported.\n    for (let r = m.top; r <= last; r++) {\n      for (let c = m.left; c <= m.right; c++) {\n        if ((r === m.top && c === m.left) || isEmpty(rows[r][c])) continue;\n        problems.push({ range: m.address, reason: `hides ${JSON.stringify(rows[r][c])} in ${address(r, c, r, c)}` });\n        rows[r][c] = \"\";\n      }\n    }\n    const height = m.bottom - m.top + 1;\n    const span = m.right - m.left + 1;\n    const first = address(m.top, m.left, m.top, m.left);\n    if (span === 1 && isLabel(value)) {\n      // One column, several rows, with text: a group label such as a region. Fill it down,\n      // except into rows that are empty in the file: those are skipped later.\n      const filled = [];\n      for (let r = m.top + 1; r <= last; r++) {\n        if (rows[r].every(isEmpty)) continue;\n        rows[r][m.left] = value;\n        filled.push(address(r, m.left, r, m.left));\n      }\n      if (filled.length > 0) {\n        notes.push({ range: m.address, reason: `${JSON.stringify(value)} copied into ${filled.join(\", \")}` });\n      }\n    } else if (span === 1) {\n      // A number, date or boolean merged down: copying 100 into two invoice lines\n      // would double it. Empty merges need nothing.\n      if (!isEmpty(value) && last > m.top) {\n        problems.push({ range: m.address, reason: `covers ${height} rows; its value ${JSON.stringify(value)} is read into ${first} only` });\n      }\n    } else if (m.left <= 0 && m.right >= width - 1) {\n      // One cell across the whole table: a title or a note, not a record.\n      for (let r = m.top; r <= last; r++) titleRows.add(r);\n      const row = origin.r + m.top + 1;\n      const where = last > m.top ? `rows ${row}-${origin.r + last + 1}` : `row ${row}`;\n      // Text is a title or a footnote. A number across the table (a total?) is reported.\n      const list = isLabel(value) || isEmpty(value) ? notes : problems;\n      list.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });\n    } else {\n      // Across columns: the value belongs to one of them, and only the user knows which.\n      const size = height > 1 ? `${height} rows and ${span} columns` : `${span} columns`;\n      problems.push({ range: m.address, reason: `covers ${size}; its value is read into ${first} only` });\n    }\n  }\n  return { notes, problems, titleRows };\n}\n", "// headerTop: index of the first header row in rows (0, or what your header detection found).\nfunction readMergedTable(bytes, headerTop = 0) {\n  const { rows, merges, origin } = readSheet(bytes);\n  if (rows.length <= headerTop) {\n    const problems = [{ range: null, reason: \"the sheet has no header row\" }];\n    return { columns: [], records: [], notes: [], problems };\n  }\n  const depth = headerDepth(rows, merges, headerTop);\n  const columns = headerNames(rows, merges, headerTop, depth);\n  const firstData = headerTop + depth;\n  // The table ends at the last named column; a stray cell further right does not widen it.\n  const width = columns.findLastIndex((name) => name !== \"\") + 1;\n  if (width === 0) {\n    const cell = XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c });\n    const reason = `row ${origin.r + headerTop + 1} has no column names; if the header is lower, pass its index as headerTop`;\n    return { columns: [], records: [], notes: [], problems: [{ range: cell, reason }] };\n  }\n  // Rows that are empty in the file are skipped.\n  const blank = new Set(rows.flatMap((row, r) => (row.every(isEmpty) ? [r] : [])));\n  const { notes, problems, titleRows } = fillMerges(rows, merges, firstData, width, origin);\n  if (depth > 1) {\n    const range = XLSX.utils.encode_range({\n      s: { r: origin.r + headerTop, c: origin.c },\n      e: { r: origin.r + firstData - 1, c: origin.c + Math.max(width, 1) - 1 },\n    });\n    notes.unshift({ range, reason: `${depth} header rows combined into one name per column` });\n    // Was a lower header row really the first record? Two signs, both reported:\n    // a value under a header cell that is not merged (\"Ana\" under \"Name\"; in a real\n    // header that cell is empty), or a first data row with text in the same columns.\n    const next = rows.slice(firstData).find((row) => !row.every(isEmpty)) ?? [];\n    for (let r = headerTop + 1; r < firstData; r++) {\n      const row = origin.r + r + 1;\n      const used = rows[r].flatMap((value, c) => (isEmpty(value) ? [] : [c]));\n      const loose = used.filter((c) =>\n        !merges.some((m) => m.top >= headerTop && m.top < r && covers(m, m.top, c)));\n      for (const c of loose) {\n        const cell = XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });\n        problems.push({ range: cell, reason: `${JSON.stringify(rows[r][c])} is under a header cell that is not merged; row ${row} may be data` });\n      }\n      if (loose.length === 0 && used.length > 0 && used.every((c) => isLabel(next[c]))) {\n        const rowRange = XLSX.utils.encode_range({\n          s: { r: origin.r + r, c: origin.c }, e: { r: origin.r + r, c: origin.c + width - 1 } });\n        problems.push({ range: rowRange, reason: `row ${row} was read as a header row, but the first data row has text in the same columns; check whether row ${row} is data` });\n      }\n    }\n  }\n\n  const isData = (r) => r >= firstData && !titleRows.has(r) && !blank.has(r);\n  // A repeated name gets a number (\"Amount (2)\"), so its values are not overwritten\n  // in the records. \"Email\" and \"EMAIL\" count as the same name.\n  const used = new Set(columns.map((name) => name.toLowerCase()));\n  const seen = new Set();\n  columns.forEach((name, c) => {\n    const cell = XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });\n    if (name === \"\") {\n      const hasData = rows.some((row, r) => isData(r) && !isEmpty(row[c]));\n      if (hasData) problems.push({ range: cell, reason: \"has data but no column name\" });\n      return;\n    }\n    if (seen.has(name.toLowerCase())) {\n      let n = 2;\n      while (used.has(`${name} (${n})`.toLowerCase())) n++;\n      columns[c] = `${name} (${n})`;\n      used.add(columns[c].toLowerCase());\n      problems.push({ range: cell, reason: `repeats the column name ${JSON.stringify(name)}; read as ${JSON.stringify(columns[c])}` });\n    }\n    seen.add(columns[c].toLowerCase());\n  });\n\n  const records = [];\n  rows.forEach((row, r) => {\n    if (!isData(r)) return;\n    // fromEntries defines own properties, so a column named \"__proto__\" is safe.\n    const values = Object.fromEntries(\n      columns.flatMap((name, c) => (name ? [[name, row[c] ?? \"\"]] : [])));\n    records.push({ row: origin.r + r + 1, values }); // the row number the user sees in Excel\n  });\n  return { columns, records, notes, problems };\n}\n", "const { columns, records, notes, problems } = readMergedTable(await file.arrayBuffer());\ncolumns;\n// [ 'Region', 'Rep', 'Q1 Revenue', 'Q1 Cost', 'Q2 Revenue', 'Q2 Cost' ]\nrecords[1];\n// { row: 4,\n//   values: { Region: 'North', Rep: 'Bo', 'Q1 Revenue': 90, 'Q1 Cost': 30,\n//             'Q2 Revenue': 95, 'Q2 Cost': 35 } }\nnotes.map((n) => `${n.range}: ${n.reason}`);\n// [ 'A1:F2: 2 header rows combined into one name per column',\n//   'A3:A4: \"North\" copied into A4',\n//   'A6:F6: row 6 skipped: \"Note: figures in EUR\" spans the table' ]\nproblems; // []\n", "// A CSV keeps no merges: \"North\" merged over three rows arrives as \"North\", \"\", \"\".\n// Fill a column only after the user says it is grouped this way, and after\n// title and footnote rows are removed: in a CSV they arrive as records.\nfunction fillDown(records, column) {\n  let last = \"\";\n  for (const record of records) {\n    if (isEmpty(record.values[column])) record.values[column] = last;\n    else last = record.values[column];\n  }\n  return records;\n}\n"]) assert(!/[\u00A0\u00AD\u200B-\u200F\u2028\u2029\u202F\u2060\u3000\uFEFF]/.test(s));
+  for (const s of ["// Sales.xlsx, six merges: \"Region\" over A1:A2, \"Rep\" over B1:B2, \"Q1\" over C1:D1,\n// \"Q2\" over E1:F1, \"North\" over A3:A4, \"Note: figures in EUR\" over A6:F6.\nconst sheet = workbook.Sheets[workbook.SheetNames[0]];\nconst records = XLSX.utils.sheet_to_json(sheet, { defval: \"\" });\nObject.keys(records[0]); // [ 'Region', 'Rep', 'Q1', '__EMPTY', 'Q2', '__EMPTY_1' ]\nrecords[0].Q1;           // 'Revenue'  (the second header row, read as data)\nrecords[2].Region;       // ''         (Bo's row: \"North\" is only in A3)\nsheet[\"!merges\"].length; // 6\n", "// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz\nimport * as XLSX from \"xlsx\";\n\n// rows: arrays of cells from the first sheet. merges: the sheet's merged ranges.\n// Both count from 0 at the top-left cell of the sheet's stored range (origin).\nfunction readSheet(bytes) {\n  const data = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;\n  const starts = (a, b) => data[0] === a && data[1] === b;\n  // .xlsx files are zip archives (they start with \"PK\"); .xls files start with D0 CF.\n  // Anything else is text. Decode it yourself: without a byte order mark (BOM),\n  // SheetJS does not assume UTF-8, and \"M\u00fcnchen\" would arrive as \"M\u00c3\u00bcnchen\".\n  // FF FE and FE FF are UTF-16 BOMs, as in Excel's \"Unicode Text\" export.\n  const binary = starts(0x50, 0x4b) || starts(0xd0, 0xcf);\n  const encoding = starts(0xff, 0xfe) ? \"utf-16le\" : starts(0xfe, 0xff) ? \"utf-16be\" : \"utf-8\";\n  let workbook;\n  if (binary) workbook = XLSX.read(data, { raw: true });\n  else {\n    // fatal: true throws a TypeError on bytes that are not valid in this encoding.\n    const text = new TextDecoder(encoding, { fatal: true }).decode(data);\n    // UTF-16 without a BOM is valid UTF-8 full of zero bytes: refuse it too.\n    if (text.includes(\"\\0\")) throw new TypeError(\"zero bytes: UTF-16 without a BOM, or not a text file\");\n    workbook = XLSX.read(text, { type: \"string\", raw: true });\n  }\n  const sheet = workbook.Sheets[workbook.SheetNames[0]];\n  if (!sheet || !sheet[\"!ref\"]) return { rows: [], merges: [], origin: { r: 0, c: 0 } };\n  const origin = XLSX.utils.decode_range(sheet[\"!ref\"]).s;\n  const rows = XLSX.utils.sheet_to_json(sheet, {\n    header: 1, defval: \"\", blankrows: true, raw: true });\n  const merges = (sheet[\"!merges\"] ?? []).map((m) => ({\n    address: XLSX.utils.encode_range(m), // \"C1:D1\", for messages\n    top: m.s.r - origin.r, bottom: m.e.r - origin.r,\n    left: m.s.c - origin.c, right: m.e.c - origin.c,\n  }));\n  return { rows, merges, origin };\n}\n", "const isEmpty = (value) => String(value ?? \"\").trim() === \"\";\nconst isLabel = (value) => typeof value === \"string\" && value.trim() !== \"\";\nconst covers = (m, r, c) => r >= m.top && r <= m.bottom && c >= m.left && c <= m.right;\n// What the user sees in a cell: a cell under a merge shows the merge's value.\nconst shown = (rows, merges, r, c) => {\n  const m = merges.find((range) => covers(range, r, c));\n  return m ? rows[m.top]?.[m.left] : rows[r]?.[c];\n};\n\n// A row can be part of the header only if it has labels and no numbers, dates or booleans.\nconst labelRow = (row = []) => row.some(isLabel) && row.every((v) => isEmpty(v) || isLabel(v));\n\n// How many rows the header has, starting at row `top`. A label merged down (\"Region\"\n// over two rows) covers the rows below it. A label merged across (\"Q1\" over two\n// columns) names a group, so the row below belongs to the header if it has a label\n// under every column of the group. maxDepth keeps a stray merge from eating the data.\nfunction headerDepth(rows, merges, top, maxDepth = 3) {\n  let bottom = top;\n  for (let changed = true; changed; ) {\n    changed = false;\n    for (const m of merges) {\n      if (m.top < top || m.top > bottom) continue;\n      // last: the lowest row this merge pulls into the header.\n      let last = m.bottom;\n      const below = [];\n      for (let c = m.left; c <= m.right; c++) below.push(shown(rows, merges, m.bottom + 1, c));\n      if (m.right > m.left && below.every(isLabel)) last = m.bottom + 1;\n      if (last <= bottom || last >= top + maxDepth) continue;\n      if (!rows.slice(bottom + 1, last + 1).every((row) => labelRow(row))) continue;\n      bottom = last;\n      changed = true;\n    }\n  }\n  return bottom - top + 1;\n}\n\n// One name per column: \"Q1\" above \"Revenue\" becomes \"Q1 Revenue\".\n// A merged cell gives its value to every column it covers, once per column.\nfunction headerNames(rows, merges, top, depth) {\n  const width = Math.max(0, ...rows.slice(top, top + depth).map((row) => row.length));\n  const names = [];\n  for (let c = 0; c < width; c++) {\n    const parts = [];\n    let previous = null;\n    for (let r = top; r < top + depth; r++) {\n      const m = merges.find((range) => covers(range, r, c)) ?? null;\n      if (m && m === previous) continue; // a label merged down counts once\n      previous = m;\n      const value = m ? rows[m.top]?.[m.left] : rows[r]?.[c];\n      if (!isEmpty(value)) parts.push(String(value).trim());\n    }\n    names.push(parts.join(\" \"));\n  }\n  return names;\n}\n", "// Copies each merged value down its column; reports the merges it will not fill.\n// Changes rows in place. firstData: index of the first row under the header.\n// width: number of named columns in the table.\nfunction fillMerges(rows, merges, firstData, width, origin) {\n  const notes = [];\n  const problems = [];\n  const titleRows = new Set();\n  const address = (r1, c1, r2, c2) => XLSX.utils.encode_range({\n    s: { r: origin.r + r1, c: origin.c + c1 }, e: { r: origin.r + r2, c: origin.c + c2 } });\n  for (const m of merges) {\n    if (m.bottom < firstData) continue; // inside the header: headerNames used it\n    if (m.top >= rows.length) continue;  // below the last row: nothing to read\n    if (m.left >= width) continue;       // right of the last named column: not in the table\n    if (m.top < firstData) {\n      // A header label merged down into blank rows only (\"Region\" over A1:A3, row 3\n      // empty) is harmless: blank rows are skipped. Anything else is reported.\n      const into = rows.slice(firstData, m.bottom + 1);\n      if (!into.every((row) => row.every(isEmpty))) {\n        problems.push({ range: m.address, reason: \"runs from the header into the data\" });\n      }\n      continue;\n    }\n    const value = rows[m.top]?.[m.left] ?? \"\";\n    const last = Math.min(m.bottom, rows.length - 1);\n    // A merged range shows only its first cell's value. A value stored under it is\n    // hidden from the user, so it is reported and not imported.\n    for (let r = m.top; r <= last; r++) {\n      for (let c = m.left; c <= m.right; c++) {\n        if ((r === m.top && c === m.left) || isEmpty(rows[r][c])) continue;\n        problems.push({ range: m.address, reason: `hides ${JSON.stringify(rows[r][c])} in ${address(r, c, r, c)}` });\n        rows[r][c] = \"\";\n      }\n    }\n    const height = m.bottom - m.top + 1;\n    const span = m.right - m.left + 1;\n    const first = address(m.top, m.left, m.top, m.left);\n    if (span === 1 && isLabel(value)) {\n      // One column, several rows, with text: a group label such as a region. Fill it down,\n      // except into rows that are empty in the file: those are skipped later.\n      const filled = [];\n      for (let r = m.top + 1; r <= last; r++) {\n        if (rows[r].every(isEmpty)) continue;\n        rows[r][m.left] = value;\n        filled.push(address(r, m.left, r, m.left));\n      }\n      if (filled.length > 0) {\n        notes.push({ range: m.address, reason: `${JSON.stringify(value)} copied into ${filled.join(\", \")}` });\n      }\n    } else if (span === 1) {\n      // A number, date or boolean merged down: copying 100 into two invoice lines\n      // would double it. Empty merges need nothing.\n      if (!isEmpty(value) && last > m.top) {\n        problems.push({ range: m.address, reason: `covers ${height} rows; its value ${JSON.stringify(value)} is read into ${first} only` });\n      }\n    } else if (m.left <= 0 && m.right >= width - 1) {\n      // One cell across the whole table: a title or a note, not a record.\n      for (let r = m.top; r <= last; r++) titleRows.add(r);\n      const row = origin.r + m.top + 1;\n      const where = last > m.top ? `rows ${row}-${origin.r + last + 1}` : `row ${row}`;\n      // Text is a title or a footnote. A number across the table (a total?) is reported.\n      const list = isLabel(value) || isEmpty(value) ? notes : problems;\n      list.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });\n    } else if (!isEmpty(value)) {\n      // Across columns: the value belongs to one of them, and only the user knows which.\n      // An empty merge (kept for layout) needs nothing.\n      const size = height > 1 ? `${height} rows and ${span} columns` : `${span} columns`;\n      problems.push({ range: m.address, reason: `covers ${size}; its value is read into ${first} only` });\n    }\n  }\n  return { notes, problems, titleRows };\n}\n", "// Was a lower header row really the first record? Two signs, both reported:\n// a value under a header cell that is not merged (\"Ana\" under \"Name\"), or a first\n// data row with text in the same columns as the lower header row.\nfunction checkLowerHeaderRows(rows, merges, headerTop, firstData, width, origin) {\n  const problems = [];\n  const next = rows.slice(firstData).find((row) => !row.every(isEmpty)) ?? [];\n  for (let r = headerTop + 1; r < firstData; r++) {\n    const row = origin.r + r + 1;\n    const used = rows[r].flatMap((value, c) => (isEmpty(value) ? [] : [c]));\n    // Is column c under a header merge that starts above row r? (\"Q1\" over C1:D1)\n    const underMerge = (c) =>\n      merges.some((m) => m.top >= headerTop && m.top < r && c >= m.left && c <= m.right);\n    const loose = used.filter((c) => !underMerge(c));\n    for (const c of loose) {\n      const cell = XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });\n      problems.push({ range: cell, reason: `${JSON.stringify(rows[r][c])} is under a header cell that is not merged; row ${row} may be data` });\n    }\n    if (loose.length === 0 && used.length > 0 && used.every((c) => isLabel(next[c]))) {\n      const range = XLSX.utils.encode_range({\n        s: { r: origin.r + r, c: origin.c }, e: { r: origin.r + r, c: origin.c + width - 1 } });\n      problems.push({ range, reason: `row ${row} was read as a header row, but the first data row has text in the same columns; check whether row ${row} is data` });\n    }\n  }\n  return problems;\n}\n\n// A repeated name gets a number (\"Amount (2)\"), so its values are not overwritten.\n// \"Email\" and \"EMAIL\" count as the same name. Changes columns in place.\nfunction renameRepeats(columns, cellOf) {\n  const problems = [];\n  const taken = new Set(columns.map((name) => name.toLowerCase()));\n  const seen = new Set();\n  columns.forEach((name, c) => {\n    if (name === \"\") return;\n    if (seen.has(name.toLowerCase())) {\n      let n = 2;\n      while (taken.has(`${name} (${n})`.toLowerCase())) n++;\n      columns[c] = `${name} (${n})`;\n      taken.add(columns[c].toLowerCase());\n      problems.push({ range: cellOf(c), reason: `repeats the column name ${JSON.stringify(name)}; read as ${JSON.stringify(columns[c])}` });\n    }\n    seen.add(columns[c].toLowerCase());\n  });\n  return problems;\n}\n\n// headerTop: index into rows, counted from the first row of the stored range\n// (0, or what your header detection found). Its Excel row is origin.r + headerTop + 1.\nfunction readMergedTable(bytes, headerTop = 0) {\n  const { rows, merges, origin } = readSheet(bytes);\n  const cellOf = (c) => XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });\n  if (rows.length <= headerTop) {\n    const problems = [{ range: null, reason: \"the sheet has no header row\" }];\n    return { columns: [], records: [], notes: [], problems };\n  }\n  // 1. Name the columns.\n  const depth = headerDepth(rows, merges, headerTop);\n  const columns = headerNames(rows, merges, headerTop, depth);\n  const firstData = headerTop + depth;\n  // The table ends at the last named column; a stray cell further right does not widen it.\n  const width = columns.findLastIndex((name) => name !== \"\") + 1;\n  if (width === 0) {\n    const reason = `row ${origin.r + headerTop + 1} has no column names; if the header is lower, pass its index as headerTop`;\n    return { columns: [], records: [], notes: [], problems: [{ range: cellOf(0), reason }] };\n  }\n  // 2. Fill or flag the merges in the data.\n  const { notes, problems, titleRows } = fillMerges(rows, merges, firstData, width, origin);\n  // 3. Check the header.\n  if (depth > 1) {\n    const range = XLSX.utils.encode_range({\n      s: { r: origin.r + headerTop, c: origin.c }, e: { r: origin.r + firstData - 1, c: origin.c + width - 1 } });\n    notes.unshift({ range, reason: `${depth} header rows combined into one name per column` });\n    problems.push(...checkLowerHeaderRows(rows, merges, headerTop, firstData, width, origin));\n  }\n  // Data rows: below the header, not a title, not empty (checked after fillMerges,\n  // which clears hidden values).\n  const isData = (r) => r >= firstData && !titleRows.has(r) && !rows[r].every(isEmpty);\n  columns.forEach((name, c) => {\n    if (name === \"\" && rows.some((row, r) => isData(r) && !isEmpty(row[c]))) {\n      problems.push({ range: cellOf(c), reason: \"has data but no column name\" });\n    }\n  });\n  problems.push(...renameRepeats(columns, cellOf));\n\n  // 4. Build one record per data row.\n  const records = [];\n  rows.forEach((row, r) => {\n    if (!isData(r)) return;\n    // fromEntries defines own properties, so a column named \"__proto__\" is safe.\n    const values = Object.fromEntries(\n      columns.flatMap((name, c) => (name ? [[name, row[c] ?? \"\"]] : [])));\n    records.push({ row: origin.r + r + 1, values }); // the row number the user sees in Excel\n  });\n  return { columns, records, notes, problems };\n}\n", "let table;\ntry {\n  table = readMergedTable(await file.arrayBuffer());\n} catch (error) {\n  // A text file that is not UTF-8 or UTF-16 throws a TypeError in readSheet,\n  // and SheetJS throws for a damaged .xlsx. Either way, ask for another export.\n  const reason = \"the file could not be read; save it as .xlsx or CSV UTF-8\";\n  table = { columns: [], records: [], notes: [], problems: [{ range: null, reason }] };\n}\nconst { columns, records, notes, problems } = table;\n\ncolumns;\n// [ 'Region', 'Rep', 'Q1 Revenue', 'Q1 Cost', 'Q2 Revenue', 'Q2 Cost' ]\nrecords[1];\n// { row: 4,\n//   values: { Region: 'North', Rep: 'Bo', 'Q1 Revenue': 90, 'Q1 Cost': 30,\n//             'Q2 Revenue': 95, 'Q2 Cost': 35 } }\nnotes.map((n) => `${n.range}: ${n.reason}`);\n// [ 'A1:F2: 2 header rows combined into one name per column',\n//   'A3:A4: \"North\" copied into A4',\n//   'A6:F6: row 6 skipped: \"Note: figures in EUR\" spans the table' ]\nproblems; // []\n", "// A CSV keeps no merges: \"North\" merged over three rows arrives as \"North\", \"\", \"\".\n// Fill a column only after the user says it is grouped this way, and after\n// title and footnote rows are removed: in a CSV they arrive as records.\nfunction fillDown(records, column) {\n  let last = \"\";\n  for (const record of records) {\n    if (isEmpty(record.values[column])) record.values[column] = last;\n    else last = record.values[column];\n  }\n  return records;\n}\n"]) assert(!/[\u00A0\u00AD\u200B-\u200F\u2028\u2029\u202F\u2060\u3000\uFEFF]/.test(s));
+});
+}
+
+// --- blog/detect-lookalike-cyrillic-greek-letters-javascript ---
+{
+// Scripts to tell apart. A letter in a script that is not listed counts as "Other".
+const SCRIPTS = ["Latin", "Greek", "Cyrillic", "Armenian", "Georgian", "Cherokee", "Hebrew",
+  "Arabic", "Devanagari", "Thai", "Han", "Hiragana", "Katakana", "Hangul", "Bopomofo"];
+const SCRIPT_TESTS = SCRIPTS.map((name) =>
+  [name, new RegExp(`\\p{Script_Extensions=${name}}`, "u")]);
+
+// Writing systems that mix scripts on purpose (UTS #39 calls them Hanb, Jpan and Kore).
+const WRITING_SYSTEMS = {
+  Han: ["Han with Bopomofo", "Japanese", "Korean"],
+  Hiragana: ["Japanese"],
+  Katakana: ["Japanese"],
+  Hangul: ["Korean"],
+  Bopomofo: ["Han with Bopomofo"],
+};
+
+// Most digits, punctuation, spaces, emoji and combining marks belong to every script.
+const ANY_SCRIPT = /[\p{Script_Extensions=Common}\p{Script_Extensions=Inherited}]/u;
+
+// The scripts one character can belong to, or null for "any script".
+// Cached, because a regular expression per script is slow on large files.
+const scriptCache = new Map();
+function scriptsOf(char) {
+  if (!scriptCache.has(char)) scriptCache.set(char, findScripts(char));
+  return scriptCache.get(char);
+}
+function findScripts(char) {
+  if (ANY_SCRIPT.test(char)) return null;
+  const found = SCRIPT_TESTS.filter(([, test]) => test.test(char)).map(([name]) => name);
+  if (found.length === 0) return ["Other"];
+  return [...found, ...new Set(found.flatMap((name) => WRITING_SYSTEMS[name] ?? []))];
+}
+
+// The scripts that every character in text can belong to.
+// null: no letters at all. []: the text mixes scripts.
+function resolvedScripts(text) {
+  let common = null;
+  for (const char of text) {
+    const scripts = scriptsOf(char);
+    if (scripts === null) continue;
+    common = common === null ? scripts : common.filter((name) => scripts.includes(name));
+  }
+  return common;
+}
+
+const codeOf = (char) =>
+  "U+" + char.codePointAt(0).toString(16).toUpperCase().padStart(4, "0");
+const SYSTEM_NAMES = new Set(Object.values(WRITING_SYSTEMS).flat());
+// "U+0430 Cyrillic", for messages: scripts only, not the writing systems.
+function label(char) {
+  if (/\p{M}/u.test(char)) return `${codeOf(char)} combining mark`;
+  const scripts = scriptsOf(char)?.filter((name) => !SYSTEM_NAMES.has(name)) ?? ["Common"];
+  return `${codeOf(char)} ${scripts.join("/")}`;
+}
+// Puts square brackets around the characters isOdd picks out.
+function describe(chars, isOdd) {
+  const marked = chars.map((char) => (isOdd(char) ? `[${char}]` : char)).join("");
+  return { marked, odd: [...new Set(chars.filter(isOdd).map(label))] };
+}
+
+// UTS #39 "Highly Restrictive" also allows Latin with Japanese, Korean or Chinese.
+const WITH_LATIN = ["Japanese", "Korean", "Han with Bopomofo"];
+function isMixed(text) {
+  const scripts = resolvedScripts(text);
+  if (scripts === null || scripts.length > 0) return false;
+  const rest = [...text].filter((char) => !scriptsOf(char)?.includes("Latin")).join("");
+  return !resolvedScripts(rest)?.some((name) => WITH_LATIN.includes(name));
+}
+
+// Names and other text: null, or the characters that are not in the main script.
+// preferred: the script your users write. It is the main one whenever the text uses it.
+function checkText(text, preferred = "Latin") {
+  const chars = [...String(text ?? "")];
+  if (!isMixed(chars.join(""))) return null;
+  const counts = new Map();
+  for (const char of chars) {
+    for (const name of scriptsOf(char) ?? []) counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  const top = Math.max(...counts.values());
+  const main = counts.has(preferred) ? preferred : [...counts].find(([, n]) => n === top)[0];
+  // Next to Latin, the Japanese, Korean or Chinese part most characters share is allowed.
+  const partner = main === "Latin"
+    ? WITH_LATIN.filter((name) => counts.has(name)).sort((a, b) => counts.get(b) - counts.get(a))[0]
+    : undefined;
+  const isOdd = (char) => {
+    const scripts = scriptsOf(char);
+    return scripts !== null && !scripts.includes(main) && !scripts.includes(partner);
+  };
+  return { main, ...describe(chars, isOdd) };
+}
+
+// IDs such as emails, SKUs and customer numbers: null, or the characters that are not ASCII.
+function checkId(value) {
+  const chars = [...String(value ?? "")];
+  const isOdd = (char) => char.codePointAt(0) > 0x7f;
+  return chars.some(isOdd) ? describe(chars, isOdd) : null;
+}
+
+const COLUMN_KINDS = { email: "id", sku: "id", name: "text", company: "text" };
+
+// records: objects from your parser, after cleaning invisible characters. Each has
+// rowNumber, the row in the file, so messages still point to the right row
+// when the parser skips blank rows or the header is not on row 1.
+function checkRecords(records, preferred = "Latin") {
+  const warnings = [];
+  for (const record of records) {
+    for (const [column, kind] of Object.entries(COLUMN_KINDS)) {
+      const found = kind === "id" ? checkId(record[column]) : checkText(record[column], preferred);
+      if (!found) continue;
+      const problem = kind === "id" ? "is not plain ASCII:" : `mixes ${found.main} with`;
+      const where = `Row ${record.rowNumber}, ${column}`;
+      warnings.push(`${where}: "${found.marked}" ${problem} ${found.odd.join(", ")}.`);
+    }
+  }
+  return warnings;
+}
+
+const evalLine = (line) => new Function("typed", "imported", "return " + line.split(";")[0])("paypal", "p\u0430yp\u0430l");
+ok("lk: the problem lines give what the comments say", () => {
+  const lines = "const typed = \"paypal\";\nconst imported = \"p\\u0430yp\\u0430l\"; // both a's are CYRILLIC SMALL LETTER A (U+0430)\n\nimported === typed;                   // false\nimported.toLowerCase() === typed;     // false\nimported.normalize(\"NFKC\") === typed; // false: NFKC does not touch it\n/^[\\x20-\\x7E]+$/.test(imported);      // false: an ASCII-only rule does catch it\n".split("\n").filter((l) => /^(imported|\/)/.test(l));
+  assert.strictEqual(lines.length, 4);
+  for (const line of lines) assert.strictEqual(evalLine(line), / \/\/ true/.test(line), line);
+});
+ok("lk: the table in the post matches the functions", () => {
+  for (const [input, [shown, , resolved, text, id]] of [["Circle", ["Circle", "Latin", "Latin", "ok", "ok"]], ["\u0421ir\u0441l\u0435", ["\u0421ir\u0441l\u0435", "Latin with three Cyrillic letters", "none: mixed", "[\u0421]ir[\u0441]l[\u0435]", "flagged"]], ["p\u0430yp\u0430l", ["p\u0430yp\u0430l", "Latin with two Cyrillic \u0430", "none: mixed", "p[\u0430]yp[\u0430]l", "flagged"]], ["\u0391\u0392C-123", ["\u0391\u0392C-123", "two Greek capitals, then Latin", "none: mixed", "[\u0391][\u0392]C-123", "flagged"]], ["\u0408. Smith", ["\u0408. Smith", "Cyrillic initial, Latin name", "none: mixed", "[\u0408]. Smith", "flagged"]], ["\u0421\u0456\u0433\u0441\u04cf\u0435", ["\u0421\u0456\u0433\u0441\u04cf\u0435", "all Cyrillic, looks like \"Circle\"", "Cyrillic", "ok", "flagged"]], ["\u0410\u043d\u043d\u0430 Petrova", ["\u0410\u043d\u043d\u0430 Petrova", "a name in two alphabets", "none: mixed", "[\u0410][\u043d][\u043d][\u0430] Petrova", "flagged"]], ["Jos\u00e9", ["Jos\u00e9", "Latin with an accent", "Latin", "ok", "flagged"]], ["\u306d\u30ac", ["\u306d\u30ac", "Hiragana and Katakana", "Japanese", "ok", "flagged"]], ["T\u30b7\u30e3\u30c4", ["T\u30b7\u30e3\u30c4", "Latin and Katakana (allowed together)", "none: mixed", "ok", "flagged"]], ["AB\u201312", ["AB\u201312", "Latin with an en dash", "Latin", "ok", "flagged"]], ["123-45", ["123-45", "no letters", "any", "ok", "ok"]]]) {
+    assert.strictEqual(shown, input);
+    const r = resolvedScripts(input);
+    assert.strictEqual(resolved, r === null ? "any" : r.length === 0 ? "none: mixed" : r.join(", "), input);
+    assert.strictEqual(text, checkText(input)?.marked ?? "ok", input);
+    assert.strictEqual(id, checkId(input) ? "flagged" : "ok", input);
+  }
+});
+ok("lk: the example prints what its comment says", () => {
+  const src = "checkRecords([\n  { rowNumber: 2, email: \"ana@example.com\", sku: \"AB-123\",\n    name: \"Ana Petrova\", company: \"Acme\" },\n  { rowNumber: 3, email: \"bo@ex\\u0430mple.com\", sku: \"AB-124\",\n    name: \"Bo Chen\", company: \"\\u0410cme\" },\n  { rowNumber: 5, email: \"chloe@example.com\", sku: \"\\u039a\\u039c-7\",\n    name: \"Chlo\\u00eb \\u041c. Martin\", company: \"Zeta\" },\n]);\n// [ 'Row 3, email: \"bo@ex[\u0430]mple.com\" is not plain ASCII: U+0430 Cyrillic.',\n//   'Row 3, company: \"[\u0410]cme\" mixes Latin with U+0410 Cyrillic.',\n//   'Row 5, sku: \"[\u039a][\u039c]-7\" is not plain ASCII: U+039A Greek, U+039C Greek.',\n//   'Row 5, name: \"Chlo\u00eb [\u041c]. Martin\" mixes Latin with U+041C Cyrillic.' ]\n";
+  const got = new Function("checkRecords", "return " + src.split("\n// [")[0].trim().replace(/;$/, ""))(checkRecords);
+  const comment = src.split("\n").filter((l) => l.startsWith("//")).map((l) => l.slice(3)).join("\n");
+  assert.deepStrictEqual(got, eval(comment));
+  assert.strictEqual(got.length, 4);
+});
+ok("lk: UTS #39 table 1a examples and the cases in the text", () => {
+  assert.deepStrictEqual(resolvedScripts("Circle"), ["Latin"]);
+  assert.deepStrictEqual(resolvedScripts("\u0421ir\u0441l\u0435"), []);
+  assert.deepStrictEqual(resolvedScripts("\u0421\u0456\u0433\u0441\u04c0\u0435"), ["Cyrillic"]);
+  assert.deepStrictEqual(resolvedScripts("Circ1e"), ["Latin"]);
+  assert.deepStrictEqual(resolvedScripts("\u3006\u5207"), ["Han", "Han with Bopomofo", "Japanese", "Korean"]);
+  assert.deepStrictEqual(resolvedScripts("\u306d\u30ac"), ["Japanese"]);
+  assert.strictEqual(resolvedScripts("123-45"), null);
+  assert.strictEqual(resolvedScripts(""), null);
+  // Digits, punctuation, spaces and emoji count as any script.
+  for (const c of ["1", "-", " ", "!", "\u{1F600}", "\u2013"]) assert.strictEqual(scriptsOf(c), null, c);
+  // The long vowel mark: Script is Common, Script_Extensions Hiragana and Katakana.
+  assert(/\p{Script=Common}/u.test("\u30fc") && !/\p{Script=Hiragana}/u.test("\u30fc"));
+  assert(/\p{Script_Extensions=Hiragana}/u.test("\u30fc") && /\p{Script_Extensions=Katakana}/u.test("\u30fc"));
+  assert.deepStrictEqual(scriptsOf("\u30fc"), ["Hiragana", "Katakana", "Japanese"]);
+  assert.deepStrictEqual(resolvedScripts("\u30bf\u30fc\u30e0"), ["Katakana", "Japanese"]);
+  // A script that is not listed is Other, and mixed next to Latin.
+  assert(/\p{Script=Lisu}/u.test("\ua4ee"));
+  assert.deepStrictEqual(scriptsOf("\ua4ee"), ["Other"]);
+  assert.strictEqual(checkText("\ua4eepple").marked, "[\ua4ee]pple");
+  // Two different unlisted scripts are taken as one (the limit the post states).
+  assert(/\p{Script=Ethiopic}/u.test("\u1200"));
+  assert.strictEqual(checkText("\u1200\ua4ee"), null);
+  // The cache returns the same answer.
+  assert.strictEqual(scriptsOf("\u0430"), scriptsOf("\u0430"));
+});
+ok("lk: checkText checks the whole value", () => {
+  assert.strictEqual(checkText("Toys-\u042f-Us").marked, "Toys-[\u042f]-Us");
+  assert.strictEqual(checkText("\u0408. Smith").marked, "[\u0408]. Smith");
+  assert.strictEqual(checkText("John \u0410. Smith").marked, "John [\u0410]. Smith");
+  assert.strictEqual(checkText("\u0410-1 Plumbing").marked, "[\u0410]-1 Plumbing");
+  assert.deepStrictEqual(checkText("\u0410\u043d\u043d\u0430 Petrova").odd, ["U+0410 Cyrillic", "U+043D Cyrillic", "U+0430 Cyrillic"]);
+  const circle = checkText("\u0421ir\u0441l\u0435");
+  assert.deepStrictEqual([circle.main, circle.marked], ["Latin", "[\u0421]ir[\u0441]l[\u0435]"]);
+  assert.deepStrictEqual(circle.odd, ["U+0421 Cyrillic", "U+0441 Cyrillic", "U+0435 Cyrillic"]);
+  for (const v of [null, undefined, "", 42, "Circle", "\u0410\u043d\u043d\u0430 \u041f\u0435\u0442\u0440\u043e\u0432\u0430", "\u0395\u03bb\u03ad\u03bd\u03b7"]) assert.strictEqual(checkText(v), null, v);
+});
+ok("lk: checkText allows Latin with Japanese, Korean and Chinese, but not more", () => {
+  for (const v of ["T\u30b7\u30e3\u30c4", "iPhone\u7528", "\u65e5\u672c\u8a9eabc", "\u30e4\u30de\u30c0taro", "\u5c71\u7530 \u592a\u90ce \u3084\u307e\u3060 \u30e4\u30de\u30c0\u3055\u3093", "K\ud31d", "\u3105\u3106\u6f22\u5b57abc"]) assert.strictEqual(checkText(v), null, v);
+  assert.deepStrictEqual(resolvedScripts("T\u30b7\u30e3\u30c4"), []);
+  assert.strictEqual(checkText("\u042f\u30b7").main, "Cyrillic");
+  assert.strictEqual(checkText("T\u30b7\u03b1").marked, "T\u30b7[\u03b1]");
+  assert(checkText("\ud55c\u3072")); // Korean with Japanese is mixed
+  assert.strictEqual(checkText("T\u30b7\u30e3\u30c4\u0430").marked, "T\u30b7\u30e3\u30c4[\u0430]");
+  assert.strictEqual(checkText("T\ud55c\u30b7").marked, "T[\ud55c]\u30b7");
+  // Digits from other scripts belong to that script.
+  assert.strictEqual(checkText("abc\u0660").marked, "abc[\u0660]");
+  assert.deepStrictEqual(checkText("abc\u0660").odd, ["U+0660 Arabic"]);
+});
+ok("lk: preferred decides the main script whenever the text uses it", () => {
+  const greek = checkText("\u0391\u0392C-123");
+  assert.deepStrictEqual([greek.main, greek.marked, greek.odd], ["Latin", "[\u0391][\u0392]C-123", ["U+0391 Greek", "U+0392 Greek"]]);
+  assert.strictEqual(checkText("\u0391\u0392C-123", "Greek").marked, "\u0391\u0392[C]-123");
+  assert.strictEqual(checkText("\u041co\u0441\u043a\u0432\u0430", "Cyrillic").marked, "\u041c[o]\u0441\u043a\u0432\u0430");
+  assert.strictEqual(checkText("\u041co\u0441\u043a\u0432\u0430").marked, "[\u041c]o[\u0441][\u043a][\u0432][\u0430]");
+  assert.strictEqual(checkText("\u0410\u043d\u043d\u0430 Petrova", "Cyrillic").marked, "\u0410\u043d\u043d\u0430 [P][e][t][r][o][v][a]");
+  // No character in preferred: the majority wins.
+  assert.strictEqual(checkText("\u0391\u0392\u0393\u0416").main, "Greek");
+  assert.strictEqual(checkText("\u0421ir\u0441l\u0435", "Cyrillic").marked, "\u0421[i][r]\u0441[l]\u0435");
+});
+ok("lk: checkId flags every character that is not ASCII", () => {
+  for (const v of ["ana@example.com", "AB-123", "", null, undefined, 12345]) assert.strictEqual(checkId(v), null, v);
+  assert.deepStrictEqual(checkId("p\u0430yp\u0430l"), { marked: "p[\u0430]yp[\u0430]l", odd: ["U+0430 Cyrillic"] });
+  assert.deepStrictEqual(checkId("AB\u201312").odd, ["U+2013 Common"]);
+  assert.deepStrictEqual(checkId("anna@m\u00fcnchen.de").odd, ["U+00FC Latin"]);
+  assert.deepStrictEqual(checkId("\u3006\u5207").odd, ["U+3006 Han", "U+5207 Han"]);
+  assert.deepStrictEqual(checkId("a\u{1F600}").marked, "a[\u{1F600}]");
+  assert.deepStrictEqual(checkId("\ua4ee1").odd, ["U+A4EE Other"]);
+  assert.deepStrictEqual(checkId("Jose\u0301").odd, ["U+0301 combining mark"]);
+  // Control characters are not above U+007F, so they pass.
+  assert.strictEqual(checkId("a\tb\u0000"), null);
+  // Latin M in a Cyrillic word: with the default, the Cyrillic letters are marked.
+  assert.strictEqual(checkText("M\u043e\u0441\u043a\u0432\u0430").marked, "M[\u043e][\u0441][\u043a][\u0432][\u0430]");
+  // Full-width letters are Latin but not ASCII: NFKC first, then they pass.
+  assert(checkId("\uff21\uff22-1"));
+  assert.strictEqual(checkId("\uff21\uff22-1".normalize("NFKC")), null);
+});
+ok("lk: NFKC composes accents and styled letters, and leaves the lookalikes alone", () => {
+  assert.strictEqual("Jose\u0301".normalize("NFKC"), "Jos\u00e9");
+  assert.strictEqual("\u{1D400}pple".normalize("NFKC"), "Apple");
+  assert.strictEqual(checkText("\u{1D400}pple"), null);
+  for (const s of ["bo@ex\u0430mple.com", "\u0410cme", "\u039a\u039c-7", "p\u0430yp\u0430l", "\u0421ir\u0441l\u0435", "\u0408. Smith"]) assert.strictEqual(s.normalize("NFKC"), s);
+});
+ok("lk: checkRecords skips unlisted columns and missing values", () => {
+  assert.deepStrictEqual(checkRecords([{ rowNumber: 2, email: "ana@example.com", note: "p\u0430yp\u0430l" }, { rowNumber: 3 }]), []);
+  assert.deepStrictEqual(checkRecords([{ rowNumber: 7, name: "\u041co\u0441\u043a\u0432\u0430" }], "Cyrillic"), ['Row 7, name: "\u041c[o]\u0441\u043a\u0432\u0430" mixes Cyrillic with U+006F Latin.']);
+});
+ok("lk: the Unicode version the post names", () => assert.strictEqual(process.versions.unicode, "17.0"));
+ok("lk: snippets have no invisible characters", () => {
+  for (const s of ["const typed = \"paypal\";\nconst imported = \"p\\u0430yp\\u0430l\"; // both a's are CYRILLIC SMALL LETTER A (U+0430)\n\nimported === typed;                   // false\nimported.toLowerCase() === typed;     // false\nimported.normalize(\"NFKC\") === typed; // false: NFKC does not touch it\n/^[\\x20-\\x7E]+$/.test(imported);      // false: an ASCII-only rule does catch it\n", "// Scripts to tell apart. A letter in a script that is not listed counts as \"Other\".\nconst SCRIPTS = [\"Latin\", \"Greek\", \"Cyrillic\", \"Armenian\", \"Georgian\", \"Cherokee\", \"Hebrew\",\n  \"Arabic\", \"Devanagari\", \"Thai\", \"Han\", \"Hiragana\", \"Katakana\", \"Hangul\", \"Bopomofo\"];\nconst SCRIPT_TESTS = SCRIPTS.map((name) =>\n  [name, new RegExp(`\\\\p{Script_Extensions=${name}}`, \"u\")]);\n\n// Writing systems that mix scripts on purpose (UTS #39 calls them Hanb, Jpan and Kore).\nconst WRITING_SYSTEMS = {\n  Han: [\"Han with Bopomofo\", \"Japanese\", \"Korean\"],\n  Hiragana: [\"Japanese\"],\n  Katakana: [\"Japanese\"],\n  Hangul: [\"Korean\"],\n  Bopomofo: [\"Han with Bopomofo\"],\n};\n\n// Most digits, punctuation, spaces, emoji and combining marks belong to every script.\nconst ANY_SCRIPT = /[\\p{Script_Extensions=Common}\\p{Script_Extensions=Inherited}]/u;\n\n// The scripts one character can belong to, or null for \"any script\".\n// Cached, because a regular expression per script is slow on large files.\nconst scriptCache = new Map();\nfunction scriptsOf(char) {\n  if (!scriptCache.has(char)) scriptCache.set(char, findScripts(char));\n  return scriptCache.get(char);\n}\nfunction findScripts(char) {\n  if (ANY_SCRIPT.test(char)) return null;\n  const found = SCRIPT_TESTS.filter(([, test]) => test.test(char)).map(([name]) => name);\n  if (found.length === 0) return [\"Other\"];\n  return [...found, ...new Set(found.flatMap((name) => WRITING_SYSTEMS[name] ?? []))];\n}\n\n// The scripts that every character in text can belong to.\n// null: no letters at all. []: the text mixes scripts.\nfunction resolvedScripts(text) {\n  let common = null;\n  for (const char of text) {\n    const scripts = scriptsOf(char);\n    if (scripts === null) continue;\n    common = common === null ? scripts : common.filter((name) => scripts.includes(name));\n  }\n  return common;\n}\n", "const codeOf = (char) =>\n  \"U+\" + char.codePointAt(0).toString(16).toUpperCase().padStart(4, \"0\");\nconst SYSTEM_NAMES = new Set(Object.values(WRITING_SYSTEMS).flat());\n// \"U+0430 Cyrillic\", for messages: scripts only, not the writing systems.\nfunction label(char) {\n  if (/\\p{M}/u.test(char)) return `${codeOf(char)} combining mark`;\n  const scripts = scriptsOf(char)?.filter((name) => !SYSTEM_NAMES.has(name)) ?? [\"Common\"];\n  return `${codeOf(char)} ${scripts.join(\"/\")}`;\n}\n// Puts square brackets around the characters isOdd picks out.\nfunction describe(chars, isOdd) {\n  const marked = chars.map((char) => (isOdd(char) ? `[${char}]` : char)).join(\"\");\n  return { marked, odd: [...new Set(chars.filter(isOdd).map(label))] };\n}\n\n// UTS #39 \"Highly Restrictive\" also allows Latin with Japanese, Korean or Chinese.\nconst WITH_LATIN = [\"Japanese\", \"Korean\", \"Han with Bopomofo\"];\nfunction isMixed(text) {\n  const scripts = resolvedScripts(text);\n  if (scripts === null || scripts.length > 0) return false;\n  const rest = [...text].filter((char) => !scriptsOf(char)?.includes(\"Latin\")).join(\"\");\n  return !resolvedScripts(rest)?.some((name) => WITH_LATIN.includes(name));\n}\n\n// Names and other text: null, or the characters that are not in the main script.\n// preferred: the script your users write. It is the main one whenever the text uses it.\nfunction checkText(text, preferred = \"Latin\") {\n  const chars = [...String(text ?? \"\")];\n  if (!isMixed(chars.join(\"\"))) return null;\n  const counts = new Map();\n  for (const char of chars) {\n    for (const name of scriptsOf(char) ?? []) counts.set(name, (counts.get(name) ?? 0) + 1);\n  }\n  const top = Math.max(...counts.values());\n  const main = counts.has(preferred) ? preferred : [...counts].find(([, n]) => n === top)[0];\n  // Next to Latin, the Japanese, Korean or Chinese part most characters share is allowed.\n  const partner = main === \"Latin\"\n    ? WITH_LATIN.filter((name) => counts.has(name)).sort((a, b) => counts.get(b) - counts.get(a))[0]\n    : undefined;\n  const isOdd = (char) => {\n    const scripts = scriptsOf(char);\n    return scripts !== null && !scripts.includes(main) && !scripts.includes(partner);\n  };\n  return { main, ...describe(chars, isOdd) };\n}\n\n// IDs such as emails, SKUs and customer numbers: null, or the characters that are not ASCII.\nfunction checkId(value) {\n  const chars = [...String(value ?? \"\")];\n  const isOdd = (char) => char.codePointAt(0) > 0x7f;\n  return chars.some(isOdd) ? describe(chars, isOdd) : null;\n}\n", "const COLUMN_KINDS = { email: \"id\", sku: \"id\", name: \"text\", company: \"text\" };\n\n// records: objects from your parser, after cleaning invisible characters. Each has\n// rowNumber, the row in the file, so messages still point to the right row\n// when the parser skips blank rows or the header is not on row 1.\nfunction checkRecords(records, preferred = \"Latin\") {\n  const warnings = [];\n  for (const record of records) {\n    for (const [column, kind] of Object.entries(COLUMN_KINDS)) {\n      const found = kind === \"id\" ? checkId(record[column]) : checkText(record[column], preferred);\n      if (!found) continue;\n      const problem = kind === \"id\" ? \"is not plain ASCII:\" : `mixes ${found.main} with`;\n      const where = `Row ${record.rowNumber}, ${column}`;\n      warnings.push(`${where}: \"${found.marked}\" ${problem} ${found.odd.join(\", \")}.`);\n    }\n  }\n  return warnings;\n}\n", "checkRecords([\n  { rowNumber: 2, email: \"ana@example.com\", sku: \"AB-123\",\n    name: \"Ana Petrova\", company: \"Acme\" },\n  { rowNumber: 3, email: \"bo@ex\\u0430mple.com\", sku: \"AB-124\",\n    name: \"Bo Chen\", company: \"\\u0410cme\" },\n  { rowNumber: 5, email: \"chloe@example.com\", sku: \"\\u039a\\u039c-7\",\n    name: \"Chlo\\u00eb \\u041c. Martin\", company: \"Zeta\" },\n]);\n// [ 'Row 3, email: \"bo@ex[\u0430]mple.com\" is not plain ASCII: U+0430 Cyrillic.',\n//   'Row 3, company: \"[\u0410]cme\" mixes Latin with U+0410 Cyrillic.',\n//   'Row 5, sku: \"[\u039a][\u039c]-7\" is not plain ASCII: U+039A Greek, U+039C Greek.',\n//   'Row 5, name: \"Chlo\u00eb [\u041c]. Martin\" mixes Latin with U+041C Cyrillic.' ]\n"]) assert(!/[\u00a0\u00ad\u200b-\u200f\u2028\u2029\u202f\u2060\u3000\ufeff]/.test(s));
+  // The lookalike letters in code are written as escapes, so the code shows them.
+  for (const s of ["const typed = \"paypal\";\nconst imported = \"p\\u0430yp\\u0430l\"; // both a's are CYRILLIC SMALL LETTER A (U+0430)\n\nimported === typed;                   // false\nimported.toLowerCase() === typed;     // false\nimported.normalize(\"NFKC\") === typed; // false: NFKC does not touch it\n/^[\\x20-\\x7E]+$/.test(imported);      // false: an ASCII-only rule does catch it\n", "// Scripts to tell apart. A letter in a script that is not listed counts as \"Other\".\nconst SCRIPTS = [\"Latin\", \"Greek\", \"Cyrillic\", \"Armenian\", \"Georgian\", \"Cherokee\", \"Hebrew\",\n  \"Arabic\", \"Devanagari\", \"Thai\", \"Han\", \"Hiragana\", \"Katakana\", \"Hangul\", \"Bopomofo\"];\nconst SCRIPT_TESTS = SCRIPTS.map((name) =>\n  [name, new RegExp(`\\\\p{Script_Extensions=${name}}`, \"u\")]);\n\n// Writing systems that mix scripts on purpose (UTS #39 calls them Hanb, Jpan and Kore).\nconst WRITING_SYSTEMS = {\n  Han: [\"Han with Bopomofo\", \"Japanese\", \"Korean\"],\n  Hiragana: [\"Japanese\"],\n  Katakana: [\"Japanese\"],\n  Hangul: [\"Korean\"],\n  Bopomofo: [\"Han with Bopomofo\"],\n};\n\n// Most digits, punctuation, spaces, emoji and combining marks belong to every script.\nconst ANY_SCRIPT = /[\\p{Script_Extensions=Common}\\p{Script_Extensions=Inherited}]/u;\n\n// The scripts one character can belong to, or null for \"any script\".\n// Cached, because a regular expression per script is slow on large files.\nconst scriptCache = new Map();\nfunction scriptsOf(char) {\n  if (!scriptCache.has(char)) scriptCache.set(char, findScripts(char));\n  return scriptCache.get(char);\n}\nfunction findScripts(char) {\n  if (ANY_SCRIPT.test(char)) return null;\n  const found = SCRIPT_TESTS.filter(([, test]) => test.test(char)).map(([name]) => name);\n  if (found.length === 0) return [\"Other\"];\n  return [...found, ...new Set(found.flatMap((name) => WRITING_SYSTEMS[name] ?? []))];\n}\n\n// The scripts that every character in text can belong to.\n// null: no letters at all. []: the text mixes scripts.\nfunction resolvedScripts(text) {\n  let common = null;\n  for (const char of text) {\n    const scripts = scriptsOf(char);\n    if (scripts === null) continue;\n    common = common === null ? scripts : common.filter((name) => scripts.includes(name));\n  }\n  return common;\n}\n", "const codeOf = (char) =>\n  \"U+\" + char.codePointAt(0).toString(16).toUpperCase().padStart(4, \"0\");\nconst SYSTEM_NAMES = new Set(Object.values(WRITING_SYSTEMS).flat());\n// \"U+0430 Cyrillic\", for messages: scripts only, not the writing systems.\nfunction label(char) {\n  if (/\\p{M}/u.test(char)) return `${codeOf(char)} combining mark`;\n  const scripts = scriptsOf(char)?.filter((name) => !SYSTEM_NAMES.has(name)) ?? [\"Common\"];\n  return `${codeOf(char)} ${scripts.join(\"/\")}`;\n}\n// Puts square brackets around the characters isOdd picks out.\nfunction describe(chars, isOdd) {\n  const marked = chars.map((char) => (isOdd(char) ? `[${char}]` : char)).join(\"\");\n  return { marked, odd: [...new Set(chars.filter(isOdd).map(label))] };\n}\n\n// UTS #39 \"Highly Restrictive\" also allows Latin with Japanese, Korean or Chinese.\nconst WITH_LATIN = [\"Japanese\", \"Korean\", \"Han with Bopomofo\"];\nfunction isMixed(text) {\n  const scripts = resolvedScripts(text);\n  if (scripts === null || scripts.length > 0) return false;\n  const rest = [...text].filter((char) => !scriptsOf(char)?.includes(\"Latin\")).join(\"\");\n  return !resolvedScripts(rest)?.some((name) => WITH_LATIN.includes(name));\n}\n\n// Names and other text: null, or the characters that are not in the main script.\n// preferred: the script your users write. It is the main one whenever the text uses it.\nfunction checkText(text, preferred = \"Latin\") {\n  const chars = [...String(text ?? \"\")];\n  if (!isMixed(chars.join(\"\"))) return null;\n  const counts = new Map();\n  for (const char of chars) {\n    for (const name of scriptsOf(char) ?? []) counts.set(name, (counts.get(name) ?? 0) + 1);\n  }\n  const top = Math.max(...counts.values());\n  const main = counts.has(preferred) ? preferred : [...counts].find(([, n]) => n === top)[0];\n  // Next to Latin, the Japanese, Korean or Chinese part most characters share is allowed.\n  const partner = main === \"Latin\"\n    ? WITH_LATIN.filter((name) => counts.has(name)).sort((a, b) => counts.get(b) - counts.get(a))[0]\n    : undefined;\n  const isOdd = (char) => {\n    const scripts = scriptsOf(char);\n    return scripts !== null && !scripts.includes(main) && !scripts.includes(partner);\n  };\n  return { main, ...describe(chars, isOdd) };\n}\n\n// IDs such as emails, SKUs and customer numbers: null, or the characters that are not ASCII.\nfunction checkId(value) {\n  const chars = [...String(value ?? \"\")];\n  const isOdd = (char) => char.codePointAt(0) > 0x7f;\n  return chars.some(isOdd) ? describe(chars, isOdd) : null;\n}\n", "const COLUMN_KINDS = { email: \"id\", sku: \"id\", name: \"text\", company: \"text\" };\n\n// records: objects from your parser, after cleaning invisible characters. Each has\n// rowNumber, the row in the file, so messages still point to the right row\n// when the parser skips blank rows or the header is not on row 1.\nfunction checkRecords(records, preferred = \"Latin\") {\n  const warnings = [];\n  for (const record of records) {\n    for (const [column, kind] of Object.entries(COLUMN_KINDS)) {\n      const found = kind === \"id\" ? checkId(record[column]) : checkText(record[column], preferred);\n      if (!found) continue;\n      const problem = kind === \"id\" ? \"is not plain ASCII:\" : `mixes ${found.main} with`;\n      const where = `Row ${record.rowNumber}, ${column}`;\n      warnings.push(`${where}: \"${found.marked}\" ${problem} ${found.odd.join(\", \")}.`);\n    }\n  }\n  return warnings;\n}\n", "checkRecords([\n  { rowNumber: 2, email: \"ana@example.com\", sku: \"AB-123\",\n    name: \"Ana Petrova\", company: \"Acme\" },\n  { rowNumber: 3, email: \"bo@ex\\u0430mple.com\", sku: \"AB-124\",\n    name: \"Bo Chen\", company: \"\\u0410cme\" },\n  { rowNumber: 5, email: \"chloe@example.com\", sku: \"\\u039a\\u039c-7\",\n    name: \"Chlo\\u00eb \\u041c. Martin\", company: \"Zeta\" },\n]);\n// [ 'Row 3, email: \"bo@ex[\u0430]mple.com\" is not plain ASCII: U+0430 Cyrillic.',\n//   'Row 3, company: \"[\u0410]cme\" mixes Latin with U+0410 Cyrillic.',\n//   'Row 5, sku: \"[\u039a][\u039c]-7\" is not plain ASCII: U+039A Greek, U+039C Greek.',\n//   'Row 5, name: \"Chlo\u00eb [\u041c]. Martin\" mixes Latin with U+041C Cyrillic.' ]\n"]) assert(!/[\u0370-\u04ff]/.test(s.split("\n").filter((l) => !l.startsWith("//")).join("\n")));
 });
 }

@@ -1370,7 +1370,7 @@ ok("mg: SheetJS %%XLSX_VERSION%%: the problem lines give what the comments say",
 ok("mg: SheetJS %%XLSX_VERSION%%: the example gives the output in its comments", async () => {
   const file = { arrayBuffer: async () => salesBytes };
   const src = %%MG_EXAMPLE_JSON%%;
-  const body = src.split("\n").filter((l) => l.startsWith("const ")).join("\n");
+  const body = src.slice(0, src.indexOf("\n\ncolumns;"));
   const got = await new Function("readMergedTable", "file", "return (async () => {" + body + "\nreturn { columns, records, notes, problems }; })();")(readMergedTable, file);
   assert.deepStrictEqual(got.columns, ["Region", "Rep", "Q1 Revenue", "Q1 Cost", "Q2 Revenue", "Q2 Cost"]);
   assert.deepStrictEqual(got.records[1], { row: 4, values: { Region: "North", Rep: "Bo", "Q1 Revenue": 90, "Q1 Cost": 30, "Q2 Revenue": 95, "Q2 Cost": 35 } });
@@ -1512,7 +1512,7 @@ ok("mg: a sheet that does not start at A1 keeps Excel addresses and row numbers"
 });
 ok("mg: duplicate and empty column names", () => {
   const t = readMergedTable(mgBook([["Name", "name", "", "", "Email"], ["Ana", "x", "", "y", "a@b.co"]], []));
-  assert.deepStrictEqual(text(t.problems), ['B1: repeats the column name "name"; read as "name (2)"', "D1: has data but no column name"]);
+  assert.deepStrictEqual(text(t.problems), ["D1: has data but no column name", 'B1: repeats the column name "name"; read as "name (2)"']);
   assert.deepStrictEqual(Object.keys(t.records[0].values), ["Name", "name (2)", "Email"]);
   // A blank column without data is dropped quietly.
   assert.deepStrictEqual(readMergedTable(mgBook([["Name", "", "Email"], ["Ana", "", "a@b.co"]], [])).problems, []);
@@ -1647,6 +1647,96 @@ ok("mg: a header that is not in the first row gives unnamed columns (headerTop)"
   assert.strictEqual(readMergedTable(Buffer.alloc(0)).problems.length, 1);
   assert.deepStrictEqual(readMergedTable(mgBook([["", ""], ["Name", "City"], ["Ana", "Paris"]], []), 1).columns, ["Name", "City"]);
 });
+ok("mg: a header label merged down into a blank row is not reported", () => {
+  // Region over A1:A3, Q1 over C1:D1, row 3 empty, data from row 4.
+  const t = readMergedTable(mgBook([["Region", "Rep", "Q1", ""], ["", "", "Revenue", "Cost"], ["", "", "", ""], ["North", "Ana", 1, 2]],
+    ["A1:A3", "B1:B2", "C1:D1"]));
+  assert.deepStrictEqual(t.columns, ["Region", "Rep", "Q1 Revenue", "Q1 Cost"]);
+  assert.deepStrictEqual(t.problems, []);
+  assert.deepStrictEqual(t.records, [{ row: 4, values: { Region: "North", Rep: "Ana", "Q1 Revenue": 1, "Q1 Cost": 2 } }]);
+  // The same merge reaching a row with data is still reported.
+  const d = readMergedTable(mgBook([["Region", "Rep", "Q1", ""], ["", "", "Revenue", "Cost"], ["", "Bo", 3, 4]],
+    ["A1:A3", "B1:B2", "C1:D1"]));
+  assert.deepStrictEqual(text(d.problems), ["A1:A3: runs from the header into the data"]);
+});
+ok("mg: SheetJS %%XLSX_VERSION%%: raw: true gives stored numbers, not formatted text", () => {
+  const sheet = XLSX.utils.aoa_to_sheet([["Share", "Price"], [0.12, 1234.5]]);
+  sheet.A2.z = "0%";
+  sheet.B2.z = "#,##0.00";
+  const book = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(book, sheet, "S");
+  const bytes = XLSX.write(book, { type: "buffer", bookType: "xlsx" });
+  // Without raw, SheetJS returns what Excel displays.
+  const shownRows = XLSX.utils.sheet_to_json(XLSX.read(bytes).Sheets.S, { header: 1, raw: false });
+  assert.deepStrictEqual(shownRows[1], ["12%", "1,234.50"]);
+  const t = readMergedTable(bytes);
+  assert.deepStrictEqual(t.records[0].values, { Share: 0.12, Price: 1234.5 });
+});
+ok("mg: text merged down in a value column is filled like a label", () => {
+  const t = readMergedTable(mgBook([["Rep", "Amount"], ["Ana", "TBD"], ["Bo", ""]], ["B2:B3"]));
+  assert.deepStrictEqual(t.records.map((r) => r.values.Amount), ["TBD", "TBD"]);
+  assert.deepStrictEqual(text(t.notes), ['B2:B3: "TBD" copied into B3']);
+});
+ok("mg: unreadable files throw, and the example turns that into a problem", () => {
+  const latin1 = Buffer.from([0x43, 0x69, 0x74, 0x79, 0x0a, 0x4d, 0xfc, 0x6e, 0x63, 0x68, 0x65, 0x6e, 0x0a]); // "City\nMünchen" in Windows-1252
+  assert.throws(() => readMergedTable(latin1), TypeError);
+  const example = %%MG_EXAMPLE_JSON%%;
+  assert(example.includes("try {") && example.includes("catch (error)"));
+  assert.throws(() => readMergedTable(Buffer.from("PK\x03\x04garbagegarbage")));
+  // The example's catch turns both into one problem.
+  const body = example.slice(0, example.indexOf("\n\ncolumns;"));
+  const run = (bytes) => new Function("readMergedTable", "file", "return (async () => {" + body + "\nreturn problems; })();")(readMergedTable, { arrayBuffer: async () => bytes });
+  return Promise.all([run(latin1), run(Buffer.from("PK\x03\x04garbagegarbage"))]).then((all) => {
+    for (const p of all) assert.deepStrictEqual(text(p), ["null: the file could not be read; save it as .xlsx or CSV UTF-8"]);
+  });
+});
+ok("mg: the post's text-only header examples are read as headers and reported", () => {
+  const contact = readMergedTable(mgBook([["Name", "Contact", ""], ["Ana", "ana@example.com", "555-0100"], ["Bo", "bo@example.com", "555-0101"]], ["B1:C1"]));
+  assert.deepStrictEqual(contact.columns, ["Name Ana", "Contact ana@example.com", "Contact 555-0100"]);
+  assert(contact.problems.length > 0);
+  const city = readMergedTable(mgBook([["Name", "City"], ["", "Berlin"], ["Ana", "Paris"]], ["A1:A2"]));
+  assert.deepStrictEqual(city.columns, ["Name", "City Berlin"]);
+  assert.deepStrictEqual(text(city.problems), ['B2: "Berlin" is under a header cell that is not merged; row 2 may be data']);
+});
+ok("mg: review fixes: empty layout merges, merges right of the table, hidden-only rows, UTF-16 without BOM", () => {
+  // An empty merge across columns (layout) is not a problem.
+  const empty = readMergedTable(mgBook([["Name", "Note", "Amount"], ["Ana", "", ""], ["Bo", "x", 2]], ["B2:C2"]));
+  assert.deepStrictEqual(empty.problems, []);
+  // Merges right of the last named column are ignored, filled or not.
+  const right = readMergedTable(mgBook([["Name", "Amount", "", "", ""], ["Ana", 1, "", "Logo", ""], ["Bo", 2, "", "", ""], ["Cy", 3, "", "Box", ""]], ["D2:E2", "D4:D5"]));
+  assert.deepStrictEqual(right.columns.slice(0, 2), ["Name", "Amount"]);
+  assert.deepStrictEqual(right.notes, []);
+  assert.deepStrictEqual(right.problems.filter((p) => /^D\d+:/.test(p.range)), []);
+  // A row whose only content is a value hidden under a merge is not a record.
+  const sheet = XLSX.utils.aoa_to_sheet([["Region", "Rep"], ["North", "Ana"], ["South", ""]]);
+  sheet["!merges"] = [XLSX.utils.decode_range("A2:A3")];
+  const book = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(book, sheet, "S");
+  const hidden = readMergedTable(XLSX.write(book, { type: "buffer", bookType: "xlsx" }));
+  assert.deepStrictEqual(hidden.records, [{ row: 2, values: { Region: "North", Rep: "Ana" } }]);
+  assert.deepStrictEqual(text(hidden.problems), ['A2:A3: hides "South" in A3']);
+  // UTF-16 without a BOM is refused, with a TypeError.
+  const utf16 = Buffer.from("Name,City\nAna,Paris\n", "utf16le");
+  assert.throws(() => readMergedTable(utf16), /zero bytes/);
+});
+ok("mg: the sheet grid in the post matches the fixture", () => {
+  const post = fs.readFileSync(path.join(__dirname, "..", "content", "posts", "merged-cells-excel-sheetjs.html"), "utf8");
+  const grid = /<table class="grid"[^>]*>([\s\S]*?)<\/table>/.exec(post)[1];
+  const { rows, merges } = readSheet(salesBytes);
+  // Each <td> gives its address in data-cell and its merge in data-merge.
+  const cells = [...grid.matchAll(/<td data-cell="([A-Z]+\d+)"(?: data-merge="([A-Z0-9:]+)")?[^>]*>([^<]*)<\/td>/g)];
+  assert(cells.length >= 20);
+  for (const [, cell, merge, content] of cells) {
+    const { r, c } = XLSX.utils.decode_cell(cell);
+    assert.strictEqual(content, String(rows[r][c]), cell);
+    if (merge) assert(merges.some((m) => m.address === merge && m.top === r && m.left === c), merge);
+  }
+  assert.deepStrictEqual(cells.filter((x) => x[2]).map((x) => x[2]).sort(), merges.map((m) => m.address).sort());
+  // Every non-empty cell in the fixture is in the grid.
+  let filled = 0;
+  rows.forEach((row) => row.forEach((v) => { if (v !== "") filled++; }));
+  assert.strictEqual(cells.filter((x) => x[3] !== "").length, filled);
+});
 ok("mg: snippets have no invisible characters", () => {
   for (const s of %%MG_ALL_JSON%%) assert(!/[\u00A0\u00AD\u200B-\u200F\u2028\u2029\u202F\u2060\u3000\uFEFF]/.test(s));
 });
@@ -1661,4 +1751,149 @@ for _k in _mg_names:
 MG_TESTS = MG_TESTS.replace("%%MG_ALL_JSON%%", _json.dumps([globals()[k] for k in _mg_names]))
 MG_TESTS = MG_TESTS.replace("%%XLSX_VERSION%%", "0.20.3")
 out += MG_TESTS
+
+# --- blog/detect-lookalike-cyrillic-greek-letters-javascript ---
+_lk_names = ["LK_PROBLEM", "LK_SCRIPTS", "LK_CHECK", "LK_USE", "LK_EXAMPLE"]
+_lk_post = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "content/posts/detect-lookalike-cyrillic-greek-letters-javascript.html")).read()
+# The table in the post: data-input holds the value as JS escapes; the cells hold what the post claims.
+_lk_table = []
+for _inp, _row in _re.findall(r'<tr class="lk" data-input="([^"]*)">(.*?)</tr>', _lk_post, _re.S):
+    _cells = [_html.unescape(_re.sub(r"<[^>]+>", "", c)).strip() for c in _re.findall(r"<td>(.*?)</td>", _row, _re.S)]
+    _lk_table.append([_inp.encode().decode("unicode_escape"), _cells])
+assert len(_lk_table) == 12, len(_lk_table)
+# Character names the post relies on.
+assert _ud.name("\u0430") == "CYRILLIC SMALL LETTER A" and _ud.name("\u0410") == "CYRILLIC CAPITAL LETTER A"
+assert _ud.name("\u0408") == "CYRILLIC CAPITAL LETTER JE" and _ud.name("\u042f") == "CYRILLIC CAPITAL LETTER YA"
+assert _ud.name("\u039a") == "GREEK CAPITAL LETTER KAPPA" and _ud.name("\u039c") == "GREEK CAPITAL LETTER MU"
+assert _ud.name("\ua4ee") == "LISU LETTER A" and _ud.name("\u2013") == "EN DASH" and _ud.name("\u0301") == "COMBINING ACUTE ACCENT"
+assert _ud.name("\u30fc") == "KATAKANA-HIRAGANA PROLONGED SOUND MARK" and _ud.name("\U0001D400") == "MATHEMATICAL BOLD CAPITAL A"
+LK_TESTS = r"""
+// --- blog/detect-lookalike-cyrillic-greek-letters-javascript ---
+{
+%%LK_SCRIPTS%%
+%%LK_CHECK%%
+%%LK_USE%%
+const evalLine = (line) => new Function("typed", "imported", "return " + line.split(";")[0])("paypal", "p\u0430yp\u0430l");
+ok("lk: the problem lines give what the comments say", () => {
+  const lines = %%LK_PROBLEM_JSON%%.split("\n").filter((l) => /^(imported|\/)/.test(l));
+  assert.strictEqual(lines.length, 4);
+  for (const line of lines) assert.strictEqual(evalLine(line), / \/\/ true/.test(line), line);
+});
+ok("lk: the table in the post matches the functions", () => {
+  for (const [input, [shown, , resolved, text, id]] of %%LK_TABLE_JSON%%) {
+    assert.strictEqual(shown, input);
+    const r = resolvedScripts(input);
+    assert.strictEqual(resolved, r === null ? "any" : r.length === 0 ? "none: mixed" : r.join(", "), input);
+    assert.strictEqual(text, checkText(input)?.marked ?? "ok", input);
+    assert.strictEqual(id, checkId(input) ? "flagged" : "ok", input);
+  }
+});
+ok("lk: the example prints what its comment says", () => {
+  const src = %%LK_EXAMPLE_JSON%%;
+  const got = new Function("checkRecords", "return " + src.split("\n// [")[0].trim().replace(/;$/, ""))(checkRecords);
+  const comment = src.split("\n").filter((l) => l.startsWith("//")).map((l) => l.slice(3)).join("\n");
+  assert.deepStrictEqual(got, eval(comment));
+  assert.strictEqual(got.length, 4);
+});
+ok("lk: UTS #39 table 1a examples and the cases in the text", () => {
+  assert.deepStrictEqual(resolvedScripts("Circle"), ["Latin"]);
+  assert.deepStrictEqual(resolvedScripts("\u0421ir\u0441l\u0435"), []);
+  assert.deepStrictEqual(resolvedScripts("\u0421\u0456\u0433\u0441\u04c0\u0435"), ["Cyrillic"]);
+  assert.deepStrictEqual(resolvedScripts("Circ1e"), ["Latin"]);
+  assert.deepStrictEqual(resolvedScripts("\u3006\u5207"), ["Han", "Han with Bopomofo", "Japanese", "Korean"]);
+  assert.deepStrictEqual(resolvedScripts("\u306d\u30ac"), ["Japanese"]);
+  assert.strictEqual(resolvedScripts("123-45"), null);
+  assert.strictEqual(resolvedScripts(""), null);
+  // Digits, punctuation, spaces and emoji count as any script.
+  for (const c of ["1", "-", " ", "!", "\u{1F600}", "\u2013"]) assert.strictEqual(scriptsOf(c), null, c);
+  // The long vowel mark: Script is Common, Script_Extensions Hiragana and Katakana.
+  assert(/\p{Script=Common}/u.test("\u30fc") && !/\p{Script=Hiragana}/u.test("\u30fc"));
+  assert(/\p{Script_Extensions=Hiragana}/u.test("\u30fc") && /\p{Script_Extensions=Katakana}/u.test("\u30fc"));
+  assert.deepStrictEqual(scriptsOf("\u30fc"), ["Hiragana", "Katakana", "Japanese"]);
+  assert.deepStrictEqual(resolvedScripts("\u30bf\u30fc\u30e0"), ["Katakana", "Japanese"]);
+  // A script that is not listed is Other, and mixed next to Latin.
+  assert(/\p{Script=Lisu}/u.test("\ua4ee"));
+  assert.deepStrictEqual(scriptsOf("\ua4ee"), ["Other"]);
+  assert.strictEqual(checkText("\ua4eepple").marked, "[\ua4ee]pple");
+  // Two different unlisted scripts are taken as one (the limit the post states).
+  assert(/\p{Script=Ethiopic}/u.test("\u1200"));
+  assert.strictEqual(checkText("\u1200\ua4ee"), null);
+  // The cache returns the same answer.
+  assert.strictEqual(scriptsOf("\u0430"), scriptsOf("\u0430"));
+});
+ok("lk: checkText checks the whole value", () => {
+  assert.strictEqual(checkText("Toys-\u042f-Us").marked, "Toys-[\u042f]-Us");
+  assert.strictEqual(checkText("\u0408. Smith").marked, "[\u0408]. Smith");
+  assert.strictEqual(checkText("John \u0410. Smith").marked, "John [\u0410]. Smith");
+  assert.strictEqual(checkText("\u0410-1 Plumbing").marked, "[\u0410]-1 Plumbing");
+  assert.deepStrictEqual(checkText("\u0410\u043d\u043d\u0430 Petrova").odd, ["U+0410 Cyrillic", "U+043D Cyrillic", "U+0430 Cyrillic"]);
+  const circle = checkText("\u0421ir\u0441l\u0435");
+  assert.deepStrictEqual([circle.main, circle.marked], ["Latin", "[\u0421]ir[\u0441]l[\u0435]"]);
+  assert.deepStrictEqual(circle.odd, ["U+0421 Cyrillic", "U+0441 Cyrillic", "U+0435 Cyrillic"]);
+  for (const v of [null, undefined, "", 42, "Circle", "\u0410\u043d\u043d\u0430 \u041f\u0435\u0442\u0440\u043e\u0432\u0430", "\u0395\u03bb\u03ad\u03bd\u03b7"]) assert.strictEqual(checkText(v), null, v);
+});
+ok("lk: checkText allows Latin with Japanese, Korean and Chinese, but not more", () => {
+  for (const v of ["T\u30b7\u30e3\u30c4", "iPhone\u7528", "\u65e5\u672c\u8a9eabc", "\u30e4\u30de\u30c0taro", "\u5c71\u7530 \u592a\u90ce \u3084\u307e\u3060 \u30e4\u30de\u30c0\u3055\u3093", "K\ud31d", "\u3105\u3106\u6f22\u5b57abc"]) assert.strictEqual(checkText(v), null, v);
+  assert.deepStrictEqual(resolvedScripts("T\u30b7\u30e3\u30c4"), []);
+  assert.strictEqual(checkText("\u042f\u30b7").main, "Cyrillic");
+  assert.strictEqual(checkText("T\u30b7\u03b1").marked, "T\u30b7[\u03b1]");
+  assert(checkText("\ud55c\u3072")); // Korean with Japanese is mixed
+  assert.strictEqual(checkText("T\u30b7\u30e3\u30c4\u0430").marked, "T\u30b7\u30e3\u30c4[\u0430]");
+  assert.strictEqual(checkText("T\ud55c\u30b7").marked, "T[\ud55c]\u30b7");
+  // Digits from other scripts belong to that script.
+  assert.strictEqual(checkText("abc\u0660").marked, "abc[\u0660]");
+  assert.deepStrictEqual(checkText("abc\u0660").odd, ["U+0660 Arabic"]);
+});
+ok("lk: preferred decides the main script whenever the text uses it", () => {
+  const greek = checkText("\u0391\u0392C-123");
+  assert.deepStrictEqual([greek.main, greek.marked, greek.odd], ["Latin", "[\u0391][\u0392]C-123", ["U+0391 Greek", "U+0392 Greek"]]);
+  assert.strictEqual(checkText("\u0391\u0392C-123", "Greek").marked, "\u0391\u0392[C]-123");
+  assert.strictEqual(checkText("\u041co\u0441\u043a\u0432\u0430", "Cyrillic").marked, "\u041c[o]\u0441\u043a\u0432\u0430");
+  assert.strictEqual(checkText("\u041co\u0441\u043a\u0432\u0430").marked, "[\u041c]o[\u0441][\u043a][\u0432][\u0430]");
+  assert.strictEqual(checkText("\u0410\u043d\u043d\u0430 Petrova", "Cyrillic").marked, "\u0410\u043d\u043d\u0430 [P][e][t][r][o][v][a]");
+  // No character in preferred: the majority wins.
+  assert.strictEqual(checkText("\u0391\u0392\u0393\u0416").main, "Greek");
+  assert.strictEqual(checkText("\u0421ir\u0441l\u0435", "Cyrillic").marked, "\u0421[i][r]\u0441[l]\u0435");
+});
+ok("lk: checkId flags every character that is not ASCII", () => {
+  for (const v of ["ana@example.com", "AB-123", "", null, undefined, 12345]) assert.strictEqual(checkId(v), null, v);
+  assert.deepStrictEqual(checkId("p\u0430yp\u0430l"), { marked: "p[\u0430]yp[\u0430]l", odd: ["U+0430 Cyrillic"] });
+  assert.deepStrictEqual(checkId("AB\u201312").odd, ["U+2013 Common"]);
+  assert.deepStrictEqual(checkId("anna@m\u00fcnchen.de").odd, ["U+00FC Latin"]);
+  assert.deepStrictEqual(checkId("\u3006\u5207").odd, ["U+3006 Han", "U+5207 Han"]);
+  assert.deepStrictEqual(checkId("a\u{1F600}").marked, "a[\u{1F600}]");
+  assert.deepStrictEqual(checkId("\ua4ee1").odd, ["U+A4EE Other"]);
+  assert.deepStrictEqual(checkId("Jose\u0301").odd, ["U+0301 combining mark"]);
+  // Control characters are not above U+007F, so they pass.
+  assert.strictEqual(checkId("a\tb\u0000"), null);
+  // Latin M in a Cyrillic word: with the default, the Cyrillic letters are marked.
+  assert.strictEqual(checkText("M\u043e\u0441\u043a\u0432\u0430").marked, "M[\u043e][\u0441][\u043a][\u0432][\u0430]");
+  // Full-width letters are Latin but not ASCII: NFKC first, then they pass.
+  assert(checkId("\uff21\uff22-1"));
+  assert.strictEqual(checkId("\uff21\uff22-1".normalize("NFKC")), null);
+});
+ok("lk: NFKC composes accents and styled letters, and leaves the lookalikes alone", () => {
+  assert.strictEqual("Jose\u0301".normalize("NFKC"), "Jos\u00e9");
+  assert.strictEqual("\u{1D400}pple".normalize("NFKC"), "Apple");
+  assert.strictEqual(checkText("\u{1D400}pple"), null);
+  for (const s of ["bo@ex\u0430mple.com", "\u0410cme", "\u039a\u039c-7", "p\u0430yp\u0430l", "\u0421ir\u0441l\u0435", "\u0408. Smith"]) assert.strictEqual(s.normalize("NFKC"), s);
+});
+ok("lk: checkRecords skips unlisted columns and missing values", () => {
+  assert.deepStrictEqual(checkRecords([{ rowNumber: 2, email: "ana@example.com", note: "p\u0430yp\u0430l" }, { rowNumber: 3 }]), []);
+  assert.deepStrictEqual(checkRecords([{ rowNumber: 7, name: "\u041co\u0441\u043a\u0432\u0430" }], "Cyrillic"), ['Row 7, name: "\u041c[o]\u0441\u043a\u0432\u0430" mixes Cyrillic with U+006F Latin.']);
+});
+ok("lk: the Unicode version the post names", () => assert.strictEqual(process.versions.unicode, "17.0"));
+ok("lk: snippets have no invisible characters", () => {
+  for (const s of %%LK_ALL_JSON%%) assert(!/[\u00a0\u00ad\u200b-\u200f\u2028\u2029\u202f\u2060\u3000\ufeff]/.test(s));
+  // The lookalike letters in code are written as escapes, so the code shows them.
+  for (const s of %%LK_ALL_JSON%%) assert(!/[\u0370-\u04ff]/.test(s.split("\n").filter((l) => !l.startsWith("//")).join("\n")));
+});
+}
+"""
+for _k in _lk_names:
+    LK_TESTS = LK_TESTS.replace("%%" + _k + "%%", globals()[_k])
+    LK_TESTS = LK_TESTS.replace("%%" + _k + "_JSON%%", _json.dumps(globals()[_k]))
+LK_TESTS = LK_TESTS.replace("%%LK_TABLE_JSON%%", _json.dumps(_lk_table))
+LK_TESTS = LK_TESTS.replace("%%LK_ALL_JSON%%", _json.dumps([globals()[k] for k in _lk_names]))
+out += LK_TESTS
 open(sys.argv[1] if len(sys.argv) > 1 else "/dev/stdout", "w").write(out)

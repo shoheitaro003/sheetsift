@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Detect lookalike Cyrillic and Greek letters in JavaScript | SheetSift</title>
+<meta name="description" content="An email with a Cyrillic &quot;а&quot; looks right but never matches. Tested JavaScript that flags mixed-script names and non-ASCII IDs in CSV and Excel imports.">
+<link rel="canonical" href="https://shoheitaro003.github.io/sheetsift/blog/detect-lookalike-cyrillic-greek-letters-javascript/">
+<meta property="og:title" content="Detect lookalike Cyrillic and Greek letters in JavaScript | SheetSift">
+<meta property="og:description" content="An email with a Cyrillic &quot;а&quot; looks right but never matches. Tested JavaScript that flags mixed-script names and non-ASCII IDs in CSV and Excel imports.">
+<meta property="og:url" content="https://shoheitaro003.github.io/sheetsift/blog/detect-lookalike-cyrillic-greek-letters-javascript/">
+<meta property="og:site_name" content="SheetSift">
+<meta name="twitter:card" content="summary">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400&display=swap">
+<link rel="stylesheet" href="../../blog.css">
+<meta property="og:type" content="article">
+<meta property="article:published_time" content="2026-11-22">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "Detect lookalike Cyrillic and Greek letters in JavaScript", "description": "An email with a Cyrillic \"\u0430\" looks right but never matches. Tested JavaScript that flags mixed-script names and non-ASCII IDs in CSV and Excel imports.", "datePublished": "2026-11-22", "dateModified": "2026-11-22", "mainEntityOfPage": "https://shoheitaro003.github.io/sheetsift/blog/detect-lookalike-cyrillic-greek-letters-javascript/", "publisher": {"@type": "Organization", "name": "SheetSift"}}</script>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="logo" href="../../"><svg width="24" height="24" viewBox="0 0 26 26" aria-hidden="true"><rect x="1" y="1" width="24" height="24" rx="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M1 9h24M9 9v16" stroke="currentColor" stroke-width="2"/><rect x="11" y="12" width="12" height="4" fill="var(--mark)"/></svg> SheetSift</a>
+  <nav class="nav"><a href="../../blog/">Blog</a><a class="btn" href="../../#try">Try the demo</a></nav>
+</div></header>
+<main><div class="wrap">
+<article>
+<h1>Detect lookalike Cyrillic and Greek letters in JavaScript</h1>
+<p class="meta"><time datetime="2026-11-22">2026-11-22</time></p>
+<p>A customer imports a file, and one row has the email <code>bo@exаmple.com</code>. It looks like <code>bo@example.com</code>, but the second <code>a</code> is the Cyrillic letter U+0430. The lookup fails, the duplicate check misses it, and nothing on the screen shows why.</p>
+<p>By the end of this post you will have <code>checkId(value)</code>, which flags every character that is not ASCII in emails, SKUs and other IDs, and <code>checkText(text)</code>, which flags names and other text that mix scripts, such as Latin and Cyrillic. Both put the suspect characters in square brackets and name their code and script, so your import preview can show them. The script rules follow Unicode's own definition of mixed-script text. Every function and every result quoted below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> in Node 22.</p>
+
+<h2>Why equality, lowercase and NFKC miss it</h2>
+<pre><code>const typed = &quot;paypal&quot;;
+const imported = &quot;p\u0430yp\u0430l&quot;; // both a&#x27;s are CYRILLIC SMALL LETTER A (U+0430)
+
+imported === typed;                   // false
+imported.toLowerCase() === typed;     // false
+imported.normalize(&quot;NFKC&quot;) === typed; // false: NFKC does not touch it
+/^[\x20-\x7E]+$/.test(imported);      // false: an ASCII-only rule does catch it
+</code></pre>
+<p>The Cyrillic <code>а</code> is not a hidden or decorated form of the Latin <code>a</code>. It is a different letter that looks the same, so no normalization turns one into the other. NFKC, Unicode's compatibility normalization, maps full-width and other variant forms to their plain letters, but not one alphabet to another. Unicode's security standard, UTS #39, uses this very case as its example: "paypal" and "pаypаl", where the second word has U+0430 (<a href="https://www.unicode.org/reports/tr39/tr39-31.html">UTS #39, section 4</a>).</p>
+<p>Every Unicode character has a <em>script</em> property: Latin, Cyrillic, Greek, Han and so on. A lookalike from another script shows up either as text that mixes scripts, or as an ID that is not ASCII, and both can be checked with regular expressions.</p>
+
+<h2>Step 1: find which scripts a value belongs to</h2>
+<p>A regular expression with the <code>u</code> flag can test a character's script with <code>\p{Script=Cyrillic}</code>. Some characters are used in several scripts, and <code>Script</code> only matches the main one. <code>Script_Extensions</code> matches all of them (<a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Regular_expressions/Unicode_character_class_escape">MDN, Unicode character class escape</a>, last modified 2026-11-06). For example, the Japanese long vowel mark <code>ー</code> has the script Common, but its script extensions are Hiragana and Katakana, which is what we want when checking a Japanese name.</p>
+<pre><code>// Scripts to tell apart. A letter in a script that is not listed counts as &quot;Other&quot;.
+const SCRIPTS = [&quot;Latin&quot;, &quot;Greek&quot;, &quot;Cyrillic&quot;, &quot;Armenian&quot;, &quot;Georgian&quot;, &quot;Cherokee&quot;, &quot;Hebrew&quot;,
+  &quot;Arabic&quot;, &quot;Devanagari&quot;, &quot;Thai&quot;, &quot;Han&quot;, &quot;Hiragana&quot;, &quot;Katakana&quot;, &quot;Hangul&quot;, &quot;Bopomofo&quot;];
+const SCRIPT_TESTS = SCRIPTS.map((name) =&gt;
+  [name, new RegExp(`\\p{Script_Extensions=${name}}`, &quot;u&quot;)]);
+
+// Writing systems that mix scripts on purpose (UTS #39 calls them Hanb, Jpan and Kore).
+const WRITING_SYSTEMS = {
+  Han: [&quot;Han with Bopomofo&quot;, &quot;Japanese&quot;, &quot;Korean&quot;],
+  Hiragana: [&quot;Japanese&quot;],
+  Katakana: [&quot;Japanese&quot;],
+  Hangul: [&quot;Korean&quot;],
+  Bopomofo: [&quot;Han with Bopomofo&quot;],
+};
+
+// Most digits, punctuation, spaces, emoji and combining marks belong to every script.
+const ANY_SCRIPT = /[\p{Script_Extensions=Common}\p{Script_Extensions=Inherited}]/u;
+
+// The scripts one character can belong to, or null for &quot;any script&quot;.
+// Cached, because a regular expression per script is slow on large files.
+const scriptCache = new Map();
+function scriptsOf(char) {
+  if (!scriptCache.has(char)) scriptCache.set(char, findScripts(char));
+  return scriptCache.get(char);
+}
+function findScripts(char) {
+  if (ANY_SCRIPT.test(char)) return null;
+  const found = SCRIPT_TESTS.filter(([, test]) =&gt; test.test(char)).map(([name]) =&gt; name);
+  if (found.length === 0) return [&quot;Other&quot;];
+  return [...found, ...new Set(found.flatMap((name) =&gt; WRITING_SYSTEMS[name] ?? []))];
+}
+
+// The scripts that every character in text can belong to.
+// null: no letters at all. []: the text mixes scripts.
+function resolvedScripts(text) {
+  let common = null;
+  for (const char of text) {
+    const scripts = scriptsOf(char);
+    if (scripts === null) continue;
+    common = common === null ? scripts : common.filter((name) =&gt; scripts.includes(name));
+  }
+  return common;
+}
+</code></pre>
+<p>The rules come from UTS #39, section 5.1, which calls a string <em>mixed-script</em> when no script is shared by all its characters:</p>
+<ul>
+<li><strong>Characters in Common or Inherited count as any script.</strong> Most digits, punctuation, spaces and emoji are Common, so <code>Circ1e</code> is still Latin. Digits that belong to one script count as that script: the Arabic-Indic <code>٠</code> (U+0660) makes <code>abc٠</code> mixed.</li>
+<li><strong>Japanese, Korean and Chinese mix scripts on purpose.</strong> A Japanese name can hold Han, Hiragana and Katakana. UTS #39 adds a writing system to each such character's set (Japanese to Han, Hiragana and Katakana, for example), so <code>ねガ</code> resolves to Japanese and is not mixed.</li>
+<li><strong>The resolved scripts are the ones every character shares.</strong> <code>resolvedScripts</code> returns an empty list for mixed text and <code>null</code> for text with no letters at all, such as <code>123-45</code>.</li>
+</ul>
+<p>The rules are quoted from revision 31 of UTS #39 (the draft for Unicode 17, dated 2025-08-12, read 2026-11-22). They are unchanged since <a href="https://www.unicode.org/reports/tr39/tr39-25.html">revision 25</a> (2022).</p>
+<p>Only the 15 scripts in <code>SCRIPTS</code> are told apart. A letter from any other script, such as the Lisu letter <code>ꓮ</code> (U+A4EE), counts as "Other", which still makes text mixed when it stands next to Latin letters: <code>ꓮpple</code> is flagged. Add the scripts your users write.</p>
+
+<h2>Step 2: check IDs and text differently</h2>
+<p>An email, SKU or customer number is compared by your code, not read by people, so it can follow the strictest rule: every character must be ASCII. UTS #39 calls this level "ASCII-Only" (<a href="https://www.unicode.org/reports/tr39/tr39-31.html">section 5.2</a>). Names, company names and notes are read by people and can be in any script, so they only get the mixed-script check.</p>
+<pre><code>const codeOf = (char) =&gt;
+  &quot;U+&quot; + char.codePointAt(0).toString(16).toUpperCase().padStart(4, &quot;0&quot;);
+const SYSTEM_NAMES = new Set(Object.values(WRITING_SYSTEMS).flat());
+// &quot;U+0430 Cyrillic&quot;, for messages: scripts only, not the writing systems.
+function label(char) {
+  if (/\p{M}/u.test(char)) return `${codeOf(char)} combining mark`;
+  const scripts = scriptsOf(char)?.filter((name) =&gt; !SYSTEM_NAMES.has(name)) ?? [&quot;Common&quot;];
+  return `${codeOf(char)} ${scripts.join(&quot;/&quot;)}`;
+}
+// Puts square brackets around the characters isOdd picks out.
+function describe(chars, isOdd) {
+  const marked = chars.map((char) =&gt; (isOdd(char) ? `[${char}]` : char)).join(&quot;&quot;);
+  return { marked, odd: [...new Set(chars.filter(isOdd).map(label))] };
+}
+
+// UTS #39 &quot;Highly Restrictive&quot; also allows Latin with Japanese, Korean or Chinese.
+const WITH_LATIN = [&quot;Japanese&quot;, &quot;Korean&quot;, &quot;Han with Bopomofo&quot;];
+function isMixed(text) {
+  const scripts = resolvedScripts(text);
+  if (scripts === null || scripts.length &gt; 0) return false;
+  const rest = [...text].filter((char) =&gt; !scriptsOf(char)?.includes(&quot;Latin&quot;)).join(&quot;&quot;);
+  return !resolvedScripts(rest)?.some((name) =&gt; WITH_LATIN.includes(name));
+}
+
+// Names and other text: null, or the characters that are not in the main script.
+// preferred: the script your users write. It is the main one whenever the text uses it.
+function checkText(text, preferred = &quot;Latin&quot;) {
+  const chars = [...String(text ?? &quot;&quot;)];
+  if (!isMixed(chars.join(&quot;&quot;))) return null;
+  const counts = new Map();
+  for (const char of chars) {
+    for (const name of scriptsOf(char) ?? []) counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  const top = Math.max(...counts.values());
+  const main = counts.has(preferred) ? preferred : [...counts].find(([, n]) =&gt; n === top)[0];
+  // Next to Latin, the Japanese, Korean or Chinese part most characters share is allowed.
+  const partner = main === &quot;Latin&quot;
+    ? WITH_LATIN.filter((name) =&gt; counts.has(name)).sort((a, b) =&gt; counts.get(b) - counts.get(a))[0]
+    : undefined;
+  const isOdd = (char) =&gt; {
+    const scripts = scriptsOf(char);
+    return scripts !== null &amp;&amp; !scripts.includes(main) &amp;&amp; !scripts.includes(partner);
+  };
+  return { main, ...describe(chars, isOdd) };
+}
+
+// IDs such as emails, SKUs and customer numbers: null, or the characters that are not ASCII.
+function checkId(value) {
+  const chars = [...String(value ?? &quot;&quot;)];
+  const isOdd = (char) =&gt; char.codePointAt(0) &gt; 0x7f;
+  return chars.some(isOdd) ? describe(chars, isOdd) : null;
+}
+</code></pre>
+<p>Three choices in <code>checkText</code>, and why:</p>
+<ul>
+<li><strong>It checks the whole value, not word by word.</strong> A lookalike is often a single letter, such as the initial in <code>Ј. Smith</code> (Cyrillic U+0408) or the <code>Я</code> in <code>Toys-Я-Us</code>, and a one-letter word is never mixed on its own. The cost is that a name written in two alphabets, such as <code>Анна Petrova</code>, is flagged too, so treat text results as warnings the user can dismiss.</li>
+<li><strong>Latin next to Japanese, Korean or Chinese is allowed.</strong> Product names such as <code>Tシャツ</code> (T-shirt) mix them all the time, and UTS #39's "Highly Restrictive" level allows it (section 5.2). A lookalike added to such text is still marked: <code>Tシャツа</code> gives <code>Tシャツ[а]</code>.</li>
+<li><strong>The script your users write is the main one.</strong> <code>preferred</code> defaults to Latin, so in <code>ΑΒC-123</code> the two Greek capitals are marked, not the Latin <code>C</code>. If the text has no character in <code>preferred</code>, the script most characters belong to is the main one. Pass <code>"Cyrillic"</code> if that is what your users write. The cost: when the one wrong letter is in your preferred script, everything else is marked instead. <code>Mосква</code> with a Latin <code>M</code> is flagged, but the five Cyrillic letters are marked, not the <code>M</code>.</li>
+</ul>
+<p>The brackets matter because a marked character still looks like the one it imitates. The code and script after it, such as <code>U+0430 Cyrillic</code>, tell the user which letter to retype. "Common" means a character shared by all scripts, such as the en dash in <code>AB–12</code>, and "Other" a script that is not in <code>SCRIPTS</code>.</p>
+
+<h2>What the checks say about some real cases</h2>
+<p>Each row is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our tests</a>. The <code>checkText</code> column shows its <code>marked</code> result.</p>
+<div class="table">
+<table>
+<thead><tr><th>Value</th><th>What it is</th><th><code>resolvedScripts</code></th><th><code>checkText</code></th><th><code>checkId</code></th></tr></thead>
+<tbody>
+<tr class="lk" data-input="Circle"><td><code>Circle</code></td><td>Latin</td><td>Latin</td><td>ok</td><td>ok</td></tr>
+<tr class="lk" data-input="\u0421ir\u0441l\u0435"><td><code>Сirсlе</code></td><td>Latin with three Cyrillic letters</td><td>none: mixed</td><td><code>[С]ir[с]l[е]</code></td><td>flagged</td></tr>
+<tr class="lk" data-input="p\u0430yp\u0430l"><td><code>pаypаl</code></td><td>Latin with two Cyrillic <code>а</code></td><td>none: mixed</td><td><code>p[а]yp[а]l</code></td><td>flagged</td></tr>
+<tr class="lk" data-input="\u0391\u0392C-123"><td><code>ΑΒC-123</code></td><td>two Greek capitals, then Latin</td><td>none: mixed</td><td><code>[Α][Β]C-123</code></td><td>flagged</td></tr>
+<tr class="lk" data-input="\u0408. Smith"><td><code>Ј. Smith</code></td><td>Cyrillic initial, Latin name</td><td>none: mixed</td><td><code>[Ј]. Smith</code></td><td>flagged</td></tr>
+<tr class="lk" data-input="\u0421\u0456\u0433\u0441\u04cf\u0435"><td><code>Сігсӏе</code></td><td>all Cyrillic, looks like "Circle"</td><td>Cyrillic</td><td>ok</td><td>flagged</td></tr>
+<tr class="lk" data-input="\u0410\u043d\u043d\u0430 Petrova"><td><code>Анна Petrova</code></td><td>a name in two alphabets</td><td>none: mixed</td><td><code>[А][н][н][а] Petrova</code></td><td>flagged</td></tr>
+<tr class="lk" data-input="Jos\u00e9"><td><code>José</code></td><td>Latin with an accent</td><td>Latin</td><td>ok</td><td>flagged</td></tr>
+<tr class="lk" data-input="\u306d\u30ac"><td><code>ねガ</code></td><td>Hiragana and Katakana</td><td>Japanese</td><td>ok</td><td>flagged</td></tr>
+<tr class="lk" data-input="T\u30b7\u30e3\u30c4"><td><code>Tシャツ</code></td><td>Latin and Katakana (allowed together)</td><td>none: mixed</td><td>ok</td><td>flagged</td></tr>
+<tr class="lk" data-input="AB\u201312"><td><code>AB–12</code></td><td>Latin with an en dash</td><td>Latin</td><td>ok</td><td>flagged</td></tr>
+<tr class="lk" data-input="123-45"><td><code>123-45</code></td><td>no letters</td><td>any</td><td>ok</td><td>ok</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>Сігсӏе</code> shows why IDs need their own rule: it is all Cyrillic, so no mixed-script check can catch it, but the ASCII rule does.</p>
+
+<h2>Step 3: report the problems by row</h2>
+<p><code>checkRecords</code> runs <code>checkId</code> or <code>checkText</code> on each column, by the kind you set in <code>COLUMN_KINDS</code>, and returns one message per problem. Columns that are not listed are not checked.</p>
+<pre><code>const COLUMN_KINDS = { email: &quot;id&quot;, sku: &quot;id&quot;, name: &quot;text&quot;, company: &quot;text&quot; };
+
+// records: objects from your parser, after cleaning invisible characters. Each has
+// rowNumber, the row in the file, so messages still point to the right row
+// when the parser skips blank rows or the header is not on row 1.
+function checkRecords(records, preferred = &quot;Latin&quot;) {
+  const warnings = [];
+  for (const record of records) {
+    for (const [column, kind] of Object.entries(COLUMN_KINDS)) {
+      const found = kind === &quot;id&quot; ? checkId(record[column]) : checkText(record[column], preferred);
+      if (!found) continue;
+      const problem = kind === &quot;id&quot; ? &quot;is not plain ASCII:&quot; : `mixes ${found.main} with`;
+      const where = `Row ${record.rowNumber}, ${column}`;
+      warnings.push(`${where}: &quot;${found.marked}&quot; ${problem} ${found.odd.join(&quot;, &quot;)}.`);
+    }
+  }
+  return warnings;
+}
+</code></pre>
+<p>Here it is on three rows. The Cyrillic and Greek letters are written as escapes such as <code>\u0430</code> so you can see them in the code; in a real file they are the letters themselves.</p>
+<pre><code>checkRecords([
+  { rowNumber: 2, email: &quot;ana@example.com&quot;, sku: &quot;AB-123&quot;,
+    name: &quot;Ana Petrova&quot;, company: &quot;Acme&quot; },
+  { rowNumber: 3, email: &quot;bo@ex\u0430mple.com&quot;, sku: &quot;AB-124&quot;,
+    name: &quot;Bo Chen&quot;, company: &quot;\u0410cme&quot; },
+  { rowNumber: 5, email: &quot;chloe@example.com&quot;, sku: &quot;\u039a\u039c-7&quot;,
+    name: &quot;Chlo\u00eb \u041c. Martin&quot;, company: &quot;Zeta&quot; },
+]);
+// [ &#x27;Row 3, email: &quot;bo@ex[а]mple.com&quot; is not plain ASCII: U+0430 Cyrillic.&#x27;,
+//   &#x27;Row 3, company: &quot;[А]cme&quot; mixes Latin with U+0410 Cyrillic.&#x27;,
+//   &#x27;Row 5, sku: &quot;[Κ][Μ]-7&quot; is not plain ASCII: U+039A Greek, U+039C Greek.&#x27;,
+//   &#x27;Row 5, name: &quot;Chloë [М]. Martin&quot; mixes Latin with U+041C Cyrillic.&#x27; ]
+</code></pre>
+<p>What to do with the messages is your choice. We would block the import on an ID message until the user fixes or confirms the cell, and show text messages in the preview without blocking, since a mixed name is sometimes intended.</p>
+<p>Run these checks after cleaning invisible characters and normalizing IDs with NFKC, as in our post on <a href="../find-invisible-characters-csv-excel-javascript/">invisible characters</a>. NFKC turns full-width letters such as <code>ＡＢ</code> into ASCII and joins an <code>e</code> and a combining accent (U+0301) into one <code>é</code>; it leaves the Cyrillic and Greek letters in the example unchanged.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Whole words in another script.</strong> An all-Cyrillic word that looks like a Latin one, such as <code>Сігсӏе</code>, passes <code>checkText</code>. UTS #39 calls these whole-script confusables. Detecting them needs Unicode's <code>confusables.txt</code> data file, which maps each character to the one it can be mistaken for (<a href="https://www.unicode.org/reports/tr39/tr39-31.html">section 4</a>); this post does not include it. The same file would let you suggest a fix, such as "did you mean a?".</li>
+<li><strong>Lookalikes inside one script.</strong> <code>l</code> and <code>I</code>, <code>0</code> and <code>O</code>, or <code>rn</code> and <code>m</code> are all ASCII and all Latin. So are styled letters such as the mathematical bold <code>𝐀</code> in a text column; NFKC turns them into plain letters, so normalize text with NFKC before comparing it if that matters to you.</li>
+<li><strong>Control characters.</strong> <code>checkId</code> only looks for characters above U+007F, so a tab or NUL passes it. Remove those first, as the invisible characters post does.</li>
+<li><strong>Internationalized emails and domains.</strong> <code>checkId</code> flags <code>anna@münchen.de</code> because it is not ASCII. If you accept such addresses, let the user confirm the message instead of blocking.</li>
+<li><strong>Scripts not in the list.</strong> Letters from two scripts that are both "Other" are taken as one script. Add every script you expect to <code>SCRIPTS</code>.</li>
+<li><strong>Unicode versions.</strong> <code>\p{Script_Extensions=...}</code> uses the Unicode data built into the JavaScript engine (in Node, <code>process.versions.unicode</code>; our tests ran with 17.0). A new version can change the extensions of a few characters, so test with your users' samples after upgrading.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer. The demo on our homepage finds the header row and reads each column's type, such as email, date or number, from its name and values. It runs in your browser: drop in a file and nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. Checking for lookalike letters as shown here is not in SheetSift yet; you are free to use the functions in this post in your own code.</p>
+
+</article>
+</div></main>
+<footer><div class="wrap"><span>SheetSift · a drop-in importer for messy Excel and CSV files</span><a href="../../#waitlist">Join the waitlist</a></div>
+<div class="wrap"><small>Visits are counted with <a href="https://www.goatcounter.com/">GoatCounter</a>, which does not track you across sites.</small></div></footer>
+<script>
+// Page view counter (GoatCounter). Only on the public site, so local runs and tests are never counted.
+if (location.hostname === "shoheitaro003.github.io") {
+  var gc = document.createElement("script");
+  gc.async = true; gc.src = "https://gc.zgo.at/count.js";
+  gc.setAttribute("data-goatcounter", "https://sheetsift.goatcounter.com/count");
+  document.body.appendChild(gc);
+}
+</script>
+</body>
+</html>

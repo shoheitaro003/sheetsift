@@ -1240,9 +1240,15 @@ function readSheet(bytes) {
   // FF FE and FE FF are UTF-16 BOMs, as in Excel's "Unicode Text" export.
   const binary = starts(0x50, 0x4b) || starts(0xd0, 0xcf);
   const encoding = starts(0xff, 0xfe) ? "utf-16le" : starts(0xfe, 0xff) ? "utf-16be" : "utf-8";
-  const workbook = binary
-    ? XLSX.read(data, { raw: true })
-    : XLSX.read(new TextDecoder(encoding, { fatal: true }).decode(data), { type: "string", raw: true });
+  let workbook;
+  if (binary) workbook = XLSX.read(data, { raw: true });
+  else {
+    // fatal: true throws a TypeError on bytes that are not valid in this encoding.
+    const text = new TextDecoder(encoding, { fatal: true }).decode(data);
+    // UTF-16 without a BOM is valid UTF-8 full of zero bytes: refuse it too.
+    if (text.includes("\0")) throw new TypeError("zero bytes: UTF-16 without a BOM, or not a text file");
+    workbook = XLSX.read(text, { type: "string", raw: true });
+  }
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   if (!sheet || !sheet["!ref"]) return { rows: [], merges: [], origin: { r: 0, c: 0 } };
   const origin = XLSX.utils.decode_range(sheet["!ref"]).s;
@@ -1326,14 +1332,20 @@ function fillMerges(rows, merges, firstData, width, origin) {
   for (const m of merges) {
     if (m.bottom < firstData) continue; // inside the header: headerNames used it
     if (m.top >= rows.length) continue;  // below the last row: nothing to read
+    if (m.left >= width) continue;       // right of the last named column: not in the table
     if (m.top < firstData) {
-      problems.push({ range: m.address, reason: "runs from the header into the data" });
+      // A header label merged down into blank rows only ("Region" over A1:A3, row 3
+      // empty) is harmless: blank rows are skipped. Anything else is reported.
+      const into = rows.slice(firstData, m.bottom + 1);
+      if (!into.every((row) => row.every(isEmpty))) {
+        problems.push({ range: m.address, reason: "runs from the header into the data" });
+      }
       continue;
     }
     const value = rows[m.top]?.[m.left] ?? "";
     const last = Math.min(m.bottom, rows.length - 1);
-    // Excel shows only the first cell of a merge. A value stored under it is invisible
-    // to the user, so it is reported and not imported.
+    // A merged range shows only its first cell's value. A value stored under it is
+    // hidden from the user, so it is reported and not imported.
     for (let r = m.top; r <= last; r++) {
       for (let c = m.left; c <= m.right; c++) {
         if ((r === m.top && c === m.left) || isEmpty(rows[r][c])) continue;
@@ -1370,8 +1382,9 @@ function fillMerges(rows, merges, firstData, width, origin) {
       // Text is a title or a footnote. A number across the table (a total?) is reported.
       const list = isLabel(value) || isEmpty(value) ? notes : problems;
       list.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });
-    } else {
+    } else if (!isEmpty(value)) {
       // Across columns: the value belongs to one of them, and only the user knows which.
+      // An empty merge (kept for layout) needs nothing.
       const size = height > 1 ? `${height} rows and ${span} columns` : `${span} columns`;
       problems.push({ range: m.address, reason: `covers ${size}; its value is read into ${first} only` });
     }
@@ -1380,75 +1393,91 @@ function fillMerges(rows, merges, firstData, width, origin) {
 }
 '''
 
-MG_TABLE = r'''// headerTop: index of the first header row in rows (0, or what your header detection found).
+MG_TABLE = r'''// Was a lower header row really the first record? Two signs, both reported:
+// a value under a header cell that is not merged ("Ana" under "Name"), or a first
+// data row with text in the same columns as the lower header row.
+function checkLowerHeaderRows(rows, merges, headerTop, firstData, width, origin) {
+  const problems = [];
+  const next = rows.slice(firstData).find((row) => !row.every(isEmpty)) ?? [];
+  for (let r = headerTop + 1; r < firstData; r++) {
+    const row = origin.r + r + 1;
+    const used = rows[r].flatMap((value, c) => (isEmpty(value) ? [] : [c]));
+    // Is column c under a header merge that starts above row r? ("Q1" over C1:D1)
+    const underMerge = (c) =>
+      merges.some((m) => m.top >= headerTop && m.top < r && c >= m.left && c <= m.right);
+    const loose = used.filter((c) => !underMerge(c));
+    for (const c of loose) {
+      const cell = XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });
+      problems.push({ range: cell, reason: `${JSON.stringify(rows[r][c])} is under a header cell that is not merged; row ${row} may be data` });
+    }
+    if (loose.length === 0 && used.length > 0 && used.every((c) => isLabel(next[c]))) {
+      const range = XLSX.utils.encode_range({
+        s: { r: origin.r + r, c: origin.c }, e: { r: origin.r + r, c: origin.c + width - 1 } });
+      problems.push({ range, reason: `row ${row} was read as a header row, but the first data row has text in the same columns; check whether row ${row} is data` });
+    }
+  }
+  return problems;
+}
+
+// A repeated name gets a number ("Amount (2)"), so its values are not overwritten.
+// "Email" and "EMAIL" count as the same name. Changes columns in place.
+function renameRepeats(columns, cellOf) {
+  const problems = [];
+  const taken = new Set(columns.map((name) => name.toLowerCase()));
+  const seen = new Set();
+  columns.forEach((name, c) => {
+    if (name === "") return;
+    if (seen.has(name.toLowerCase())) {
+      let n = 2;
+      while (taken.has(`${name} (${n})`.toLowerCase())) n++;
+      columns[c] = `${name} (${n})`;
+      taken.add(columns[c].toLowerCase());
+      problems.push({ range: cellOf(c), reason: `repeats the column name ${JSON.stringify(name)}; read as ${JSON.stringify(columns[c])}` });
+    }
+    seen.add(columns[c].toLowerCase());
+  });
+  return problems;
+}
+
+// headerTop: index into rows, counted from the first row of the stored range
+// (0, or what your header detection found). Its Excel row is origin.r + headerTop + 1.
 function readMergedTable(bytes, headerTop = 0) {
   const { rows, merges, origin } = readSheet(bytes);
+  const cellOf = (c) => XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });
   if (rows.length <= headerTop) {
     const problems = [{ range: null, reason: "the sheet has no header row" }];
     return { columns: [], records: [], notes: [], problems };
   }
+  // 1. Name the columns.
   const depth = headerDepth(rows, merges, headerTop);
   const columns = headerNames(rows, merges, headerTop, depth);
   const firstData = headerTop + depth;
   // The table ends at the last named column; a stray cell further right does not widen it.
   const width = columns.findLastIndex((name) => name !== "") + 1;
   if (width === 0) {
-    const cell = XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c });
     const reason = `row ${origin.r + headerTop + 1} has no column names; if the header is lower, pass its index as headerTop`;
-    return { columns: [], records: [], notes: [], problems: [{ range: cell, reason }] };
+    return { columns: [], records: [], notes: [], problems: [{ range: cellOf(0), reason }] };
   }
-  // Rows that are empty in the file are skipped.
-  const blank = new Set(rows.flatMap((row, r) => (row.every(isEmpty) ? [r] : [])));
+  // 2. Fill or flag the merges in the data.
   const { notes, problems, titleRows } = fillMerges(rows, merges, firstData, width, origin);
+  // 3. Check the header.
   if (depth > 1) {
     const range = XLSX.utils.encode_range({
-      s: { r: origin.r + headerTop, c: origin.c },
-      e: { r: origin.r + firstData - 1, c: origin.c + Math.max(width, 1) - 1 },
-    });
+      s: { r: origin.r + headerTop, c: origin.c }, e: { r: origin.r + firstData - 1, c: origin.c + width - 1 } });
     notes.unshift({ range, reason: `${depth} header rows combined into one name per column` });
-    // Was a lower header row really the first record? Two signs, both reported:
-    // a value under a header cell that is not merged ("Ana" under "Name"; in a real
-    // header that cell is empty), or a first data row with text in the same columns.
-    const next = rows.slice(firstData).find((row) => !row.every(isEmpty)) ?? [];
-    for (let r = headerTop + 1; r < firstData; r++) {
-      const row = origin.r + r + 1;
-      const used = rows[r].flatMap((value, c) => (isEmpty(value) ? [] : [c]));
-      const loose = used.filter((c) =>
-        !merges.some((m) => m.top >= headerTop && m.top < r && covers(m, m.top, c)));
-      for (const c of loose) {
-        const cell = XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });
-        problems.push({ range: cell, reason: `${JSON.stringify(rows[r][c])} is under a header cell that is not merged; row ${row} may be data` });
-      }
-      if (loose.length === 0 && used.length > 0 && used.every((c) => isLabel(next[c]))) {
-        const rowRange = XLSX.utils.encode_range({
-          s: { r: origin.r + r, c: origin.c }, e: { r: origin.r + r, c: origin.c + width - 1 } });
-        problems.push({ range: rowRange, reason: `row ${row} was read as a header row, but the first data row has text in the same columns; check whether row ${row} is data` });
-      }
-    }
+    problems.push(...checkLowerHeaderRows(rows, merges, headerTop, firstData, width, origin));
   }
-
-  const isData = (r) => r >= firstData && !titleRows.has(r) && !blank.has(r);
-  // A repeated name gets a number ("Amount (2)"), so its values are not overwritten
-  // in the records. "Email" and "EMAIL" count as the same name.
-  const used = new Set(columns.map((name) => name.toLowerCase()));
-  const seen = new Set();
+  // Data rows: below the header, not a title, not empty (checked after fillMerges,
+  // which clears hidden values).
+  const isData = (r) => r >= firstData && !titleRows.has(r) && !rows[r].every(isEmpty);
   columns.forEach((name, c) => {
-    const cell = XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });
-    if (name === "") {
-      const hasData = rows.some((row, r) => isData(r) && !isEmpty(row[c]));
-      if (hasData) problems.push({ range: cell, reason: "has data but no column name" });
-      return;
+    if (name === "" && rows.some((row, r) => isData(r) && !isEmpty(row[c]))) {
+      problems.push({ range: cellOf(c), reason: "has data but no column name" });
     }
-    if (seen.has(name.toLowerCase())) {
-      let n = 2;
-      while (used.has(`${name} (${n})`.toLowerCase())) n++;
-      columns[c] = `${name} (${n})`;
-      used.add(columns[c].toLowerCase());
-      problems.push({ range: cell, reason: `repeats the column name ${JSON.stringify(name)}; read as ${JSON.stringify(columns[c])}` });
-    }
-    seen.add(columns[c].toLowerCase());
   });
+  problems.push(...renameRepeats(columns, cellOf));
 
+  // 4. Build one record per data row.
   const records = [];
   rows.forEach((row, r) => {
     if (!isData(r)) return;
@@ -1461,7 +1490,17 @@ function readMergedTable(bytes, headerTop = 0) {
 }
 '''
 
-MG_EXAMPLE = r'''const { columns, records, notes, problems } = readMergedTable(await file.arrayBuffer());
+MG_EXAMPLE = r'''let table;
+try {
+  table = readMergedTable(await file.arrayBuffer());
+} catch (error) {
+  // A text file that is not UTF-8 or UTF-16 throws a TypeError in readSheet,
+  // and SheetJS throws for a damaged .xlsx. Either way, ask for another export.
+  const reason = "the file could not be read; save it as .xlsx or CSV UTF-8";
+  table = { columns: [], records: [], notes: [], problems: [{ range: null, reason }] };
+}
+const { columns, records, notes, problems } = table;
+
 columns;
 // [ 'Region', 'Rep', 'Q1 Revenue', 'Q1 Cost', 'Q2 Revenue', 'Q2 Cost' ]
 records[1];
@@ -1486,4 +1525,146 @@ function fillDown(records, column) {
   }
   return records;
 }
+'''
+
+LK_PROBLEM = r'''const typed = "paypal";
+const imported = "p\u0430yp\u0430l"; // both a's are CYRILLIC SMALL LETTER A (U+0430)
+
+imported === typed;                   // false
+imported.toLowerCase() === typed;     // false
+imported.normalize("NFKC") === typed; // false: NFKC does not touch it
+/^[\x20-\x7E]+$/.test(imported);      // false: an ASCII-only rule does catch it
+'''
+
+LK_SCRIPTS = r'''// Scripts to tell apart. A letter in a script that is not listed counts as "Other".
+const SCRIPTS = ["Latin", "Greek", "Cyrillic", "Armenian", "Georgian", "Cherokee", "Hebrew",
+  "Arabic", "Devanagari", "Thai", "Han", "Hiragana", "Katakana", "Hangul", "Bopomofo"];
+const SCRIPT_TESTS = SCRIPTS.map((name) =>
+  [name, new RegExp(`\\p{Script_Extensions=${name}}`, "u")]);
+
+// Writing systems that mix scripts on purpose (UTS #39 calls them Hanb, Jpan and Kore).
+const WRITING_SYSTEMS = {
+  Han: ["Han with Bopomofo", "Japanese", "Korean"],
+  Hiragana: ["Japanese"],
+  Katakana: ["Japanese"],
+  Hangul: ["Korean"],
+  Bopomofo: ["Han with Bopomofo"],
+};
+
+// Most digits, punctuation, spaces, emoji and combining marks belong to every script.
+const ANY_SCRIPT = /[\p{Script_Extensions=Common}\p{Script_Extensions=Inherited}]/u;
+
+// The scripts one character can belong to, or null for "any script".
+// Cached, because a regular expression per script is slow on large files.
+const scriptCache = new Map();
+function scriptsOf(char) {
+  if (!scriptCache.has(char)) scriptCache.set(char, findScripts(char));
+  return scriptCache.get(char);
+}
+function findScripts(char) {
+  if (ANY_SCRIPT.test(char)) return null;
+  const found = SCRIPT_TESTS.filter(([, test]) => test.test(char)).map(([name]) => name);
+  if (found.length === 0) return ["Other"];
+  return [...found, ...new Set(found.flatMap((name) => WRITING_SYSTEMS[name] ?? []))];
+}
+
+// The scripts that every character in text can belong to.
+// null: no letters at all. []: the text mixes scripts.
+function resolvedScripts(text) {
+  let common = null;
+  for (const char of text) {
+    const scripts = scriptsOf(char);
+    if (scripts === null) continue;
+    common = common === null ? scripts : common.filter((name) => scripts.includes(name));
+  }
+  return common;
+}
+'''
+
+LK_CHECK = r'''const codeOf = (char) =>
+  "U+" + char.codePointAt(0).toString(16).toUpperCase().padStart(4, "0");
+const SYSTEM_NAMES = new Set(Object.values(WRITING_SYSTEMS).flat());
+// "U+0430 Cyrillic", for messages: scripts only, not the writing systems.
+function label(char) {
+  if (/\p{M}/u.test(char)) return `${codeOf(char)} combining mark`;
+  const scripts = scriptsOf(char)?.filter((name) => !SYSTEM_NAMES.has(name)) ?? ["Common"];
+  return `${codeOf(char)} ${scripts.join("/")}`;
+}
+// Puts square brackets around the characters isOdd picks out.
+function describe(chars, isOdd) {
+  const marked = chars.map((char) => (isOdd(char) ? `[${char}]` : char)).join("");
+  return { marked, odd: [...new Set(chars.filter(isOdd).map(label))] };
+}
+
+// UTS #39 "Highly Restrictive" also allows Latin with Japanese, Korean or Chinese.
+const WITH_LATIN = ["Japanese", "Korean", "Han with Bopomofo"];
+function isMixed(text) {
+  const scripts = resolvedScripts(text);
+  if (scripts === null || scripts.length > 0) return false;
+  const rest = [...text].filter((char) => !scriptsOf(char)?.includes("Latin")).join("");
+  return !resolvedScripts(rest)?.some((name) => WITH_LATIN.includes(name));
+}
+
+// Names and other text: null, or the characters that are not in the main script.
+// preferred: the script your users write. It is the main one whenever the text uses it.
+function checkText(text, preferred = "Latin") {
+  const chars = [...String(text ?? "")];
+  if (!isMixed(chars.join(""))) return null;
+  const counts = new Map();
+  for (const char of chars) {
+    for (const name of scriptsOf(char) ?? []) counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  const top = Math.max(...counts.values());
+  const main = counts.has(preferred) ? preferred : [...counts].find(([, n]) => n === top)[0];
+  // Next to Latin, the Japanese, Korean or Chinese part most characters share is allowed.
+  const partner = main === "Latin"
+    ? WITH_LATIN.filter((name) => counts.has(name)).sort((a, b) => counts.get(b) - counts.get(a))[0]
+    : undefined;
+  const isOdd = (char) => {
+    const scripts = scriptsOf(char);
+    return scripts !== null && !scripts.includes(main) && !scripts.includes(partner);
+  };
+  return { main, ...describe(chars, isOdd) };
+}
+
+// IDs such as emails, SKUs and customer numbers: null, or the characters that are not ASCII.
+function checkId(value) {
+  const chars = [...String(value ?? "")];
+  const isOdd = (char) => char.codePointAt(0) > 0x7f;
+  return chars.some(isOdd) ? describe(chars, isOdd) : null;
+}
+'''
+
+LK_USE = r'''const COLUMN_KINDS = { email: "id", sku: "id", name: "text", company: "text" };
+
+// records: objects from your parser, after cleaning invisible characters. Each has
+// rowNumber, the row in the file, so messages still point to the right row
+// when the parser skips blank rows or the header is not on row 1.
+function checkRecords(records, preferred = "Latin") {
+  const warnings = [];
+  for (const record of records) {
+    for (const [column, kind] of Object.entries(COLUMN_KINDS)) {
+      const found = kind === "id" ? checkId(record[column]) : checkText(record[column], preferred);
+      if (!found) continue;
+      const problem = kind === "id" ? "is not plain ASCII:" : `mixes ${found.main} with`;
+      const where = `Row ${record.rowNumber}, ${column}`;
+      warnings.push(`${where}: "${found.marked}" ${problem} ${found.odd.join(", ")}.`);
+    }
+  }
+  return warnings;
+}
+'''
+
+LK_EXAMPLE = r'''checkRecords([
+  { rowNumber: 2, email: "ana@example.com", sku: "AB-123",
+    name: "Ana Petrova", company: "Acme" },
+  { rowNumber: 3, email: "bo@ex\u0430mple.com", sku: "AB-124",
+    name: "Bo Chen", company: "\u0410cme" },
+  { rowNumber: 5, email: "chloe@example.com", sku: "\u039a\u039c-7",
+    name: "Chlo\u00eb \u041c. Martin", company: "Zeta" },
+]);
+// [ 'Row 3, email: "bo@ex[а]mple.com" is not plain ASCII: U+0430 Cyrillic.',
+//   'Row 3, company: "[А]cme" mixes Latin with U+0410 Cyrillic.',
+//   'Row 5, sku: "[Κ][Μ]-7" is not plain ASCII: U+039A Greek, U+039C Greek.',
+//   'Row 5, name: "Chloë [М]. Martin" mixes Latin with U+041C Cyrillic.' ]
 '''
