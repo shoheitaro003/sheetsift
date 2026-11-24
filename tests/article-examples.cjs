@@ -2453,3 +2453,370 @@ ok("lk: snippets have no invisible characters", () => {
   for (const s of ["const typed = \"paypal\";\nconst imported = \"p\\u0430yp\\u0430l\"; // both a's are CYRILLIC SMALL LETTER A (U+0430)\n\nimported === typed;                   // false\nimported.toLowerCase() === typed;     // false\nimported.normalize(\"NFKC\") === typed; // false: NFKC does not touch it\n/^[\\x20-\\x7E]+$/.test(imported);      // false: an ASCII-only rule does catch it\n", "// Scripts to tell apart. A letter in a script that is not listed counts as \"Other\".\nconst SCRIPTS = [\"Latin\", \"Greek\", \"Cyrillic\", \"Armenian\", \"Georgian\", \"Cherokee\", \"Hebrew\",\n  \"Arabic\", \"Devanagari\", \"Thai\", \"Han\", \"Hiragana\", \"Katakana\", \"Hangul\", \"Bopomofo\"];\nconst SCRIPT_TESTS = SCRIPTS.map((name) =>\n  [name, new RegExp(`\\\\p{Script_Extensions=${name}}`, \"u\")]);\n\n// Writing systems that mix scripts on purpose (UTS #39 calls them Hanb, Jpan and Kore).\nconst WRITING_SYSTEMS = {\n  Han: [\"Han with Bopomofo\", \"Japanese\", \"Korean\"],\n  Hiragana: [\"Japanese\"],\n  Katakana: [\"Japanese\"],\n  Hangul: [\"Korean\"],\n  Bopomofo: [\"Han with Bopomofo\"],\n};\n\n// Most digits, punctuation, spaces, emoji and combining marks belong to every script.\nconst ANY_SCRIPT = /[\\p{Script_Extensions=Common}\\p{Script_Extensions=Inherited}]/u;\n\n// The scripts one character can belong to, or null for \"any script\".\n// Cached, because a regular expression per script is slow on large files.\nconst scriptCache = new Map();\nfunction scriptsOf(char) {\n  if (!scriptCache.has(char)) scriptCache.set(char, findScripts(char));\n  return scriptCache.get(char);\n}\nfunction findScripts(char) {\n  if (ANY_SCRIPT.test(char)) return null;\n  const found = SCRIPT_TESTS.filter(([, test]) => test.test(char)).map(([name]) => name);\n  if (found.length === 0) return [\"Other\"];\n  return [...found, ...new Set(found.flatMap((name) => WRITING_SYSTEMS[name] ?? []))];\n}\n\n// The scripts that every character in text can belong to.\n// null: no letters at all. []: the text mixes scripts.\nfunction resolvedScripts(text) {\n  let common = null;\n  for (const char of text) {\n    const scripts = scriptsOf(char);\n    if (scripts === null) continue;\n    common = common === null ? scripts : common.filter((name) => scripts.includes(name));\n  }\n  return common;\n}\n", "const codeOf = (char) =>\n  \"U+\" + char.codePointAt(0).toString(16).toUpperCase().padStart(4, \"0\");\nconst SYSTEM_NAMES = new Set(Object.values(WRITING_SYSTEMS).flat());\n// \"U+0430 Cyrillic\", for messages: scripts only, not the writing systems.\nfunction label(char) {\n  if (/\\p{M}/u.test(char)) return `${codeOf(char)} combining mark`;\n  const scripts = scriptsOf(char)?.filter((name) => !SYSTEM_NAMES.has(name)) ?? [\"Common\"];\n  return `${codeOf(char)} ${scripts.join(\"/\")}`;\n}\n// Puts square brackets around the characters isOdd picks out.\nfunction describe(chars, isOdd) {\n  const marked = chars.map((char) => (isOdd(char) ? `[${char}]` : char)).join(\"\");\n  return { marked, odd: [...new Set(chars.filter(isOdd).map(label))] };\n}\n\n// UTS #39 \"Highly Restrictive\" also allows Latin with Japanese, Korean or Chinese.\nconst WITH_LATIN = [\"Japanese\", \"Korean\", \"Han with Bopomofo\"];\nfunction isMixed(text) {\n  const scripts = resolvedScripts(text);\n  if (scripts === null || scripts.length > 0) return false;\n  const rest = [...text].filter((char) => !scriptsOf(char)?.includes(\"Latin\")).join(\"\");\n  return !resolvedScripts(rest)?.some((name) => WITH_LATIN.includes(name));\n}\n\n// Names and other text: null, or the characters that are not in the main script.\n// preferred: the script your users write. It is the main one whenever the text uses it.\nfunction checkText(text, preferred = \"Latin\") {\n  const chars = [...String(text ?? \"\")];\n  if (!isMixed(chars.join(\"\"))) return null;\n  const counts = new Map();\n  for (const char of chars) {\n    for (const name of scriptsOf(char) ?? []) counts.set(name, (counts.get(name) ?? 0) + 1);\n  }\n  const top = Math.max(...counts.values());\n  const main = counts.has(preferred) ? preferred : [...counts].find(([, n]) => n === top)[0];\n  // Next to Latin, the Japanese, Korean or Chinese part most characters share is allowed.\n  const partner = main === \"Latin\"\n    ? WITH_LATIN.filter((name) => counts.has(name)).sort((a, b) => counts.get(b) - counts.get(a))[0]\n    : undefined;\n  const isOdd = (char) => {\n    const scripts = scriptsOf(char);\n    return scripts !== null && !scripts.includes(main) && !scripts.includes(partner);\n  };\n  return { main, ...describe(chars, isOdd) };\n}\n\n// IDs such as emails, SKUs and customer numbers: null, or the characters that are not ASCII.\nfunction checkId(value) {\n  const chars = [...String(value ?? \"\")];\n  const isOdd = (char) => char.codePointAt(0) > 0x7f;\n  return chars.some(isOdd) ? describe(chars, isOdd) : null;\n}\n", "const COLUMN_KINDS = { email: \"id\", sku: \"id\", name: \"text\", company: \"text\" };\n\n// records: objects from your parser, after cleaning invisible characters. Each has\n// rowNumber, the row in the file, so messages still point to the right row\n// when the parser skips blank rows or the header is not on row 1.\nfunction checkRecords(records, preferred = \"Latin\") {\n  const warnings = [];\n  for (const record of records) {\n    for (const [column, kind] of Object.entries(COLUMN_KINDS)) {\n      const found = kind === \"id\" ? checkId(record[column]) : checkText(record[column], preferred);\n      if (!found) continue;\n      const problem = kind === \"id\" ? \"is not plain ASCII:\" : `mixes ${found.main} with`;\n      const where = `Row ${record.rowNumber}, ${column}`;\n      warnings.push(`${where}: \"${found.marked}\" ${problem} ${found.odd.join(\", \")}.`);\n    }\n  }\n  return warnings;\n}\n", "checkRecords([\n  { rowNumber: 2, email: \"ana@example.com\", sku: \"AB-123\",\n    name: \"Ana Petrova\", company: \"Acme\" },\n  { rowNumber: 3, email: \"bo@ex\\u0430mple.com\", sku: \"AB-124\",\n    name: \"Bo Chen\", company: \"\\u0410cme\" },\n  { rowNumber: 5, email: \"chloe@example.com\", sku: \"\\u039a\\u039c-7\",\n    name: \"Chlo\\u00eb \\u041c. Martin\", company: \"Zeta\" },\n]);\n// [ 'Row 3, email: \"bo@ex[\u0430]mple.com\" is not plain ASCII: U+0430 Cyrillic.',\n//   'Row 3, company: \"[\u0410]cme\" mixes Latin with U+0410 Cyrillic.',\n//   'Row 5, sku: \"[\u039a][\u039c]-7\" is not plain ASCII: U+039A Greek, U+039C Greek.',\n//   'Row 5, name: \"Chlo\u00eb [\u041c]. Martin\" mixes Latin with U+041C Cyrillic.' ]\n"]) assert(!/[\u0370-\u04ff]/.test(s.split("\n").filter((l) => !l.startsWith("//")).join("\n")));
 });
 }
+
+// --- blog/fill-merged-cells-excel-import-sheetjs ---
+{
+const XLSX = require(process.env.XLSX_MODULE || "xlsx");
+const fs = require("fs");
+const path = require("path");
+
+const isEmpty = (value) => String(value ?? "").trim() === "";
+const isLabel = (value) => typeof value === "string" && value.trim() !== "";
+
+// Reads the first sheet of an .xlsx file.
+// rows: one array of cells per row. merges: the merged ranges.
+// Both count from 0 at the first cell of the sheet's stored range (origin).
+function readXlsx(bytes) {
+  const data = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;
+  // An .xlsx file is a zip archive, and zip archives start with the bytes "PK".
+  if (data[0] !== 0x50 || data[1] !== 0x4b) throw new TypeError("not an .xlsx file");
+  const workbook = XLSX.read(data);
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  if (!sheet?.["!ref"]) return { rows: [], merges: [], origin: { r: 0, c: 0 } };
+  const origin = XLSX.utils.decode_range(sheet["!ref"]).s;
+  const rows = XLSX.utils.sheet_to_json(sheet, {
+    header: 1, defval: "", blankrows: true, raw: true });
+  const merges = (sheet["!merges"] ?? []).map((m) => ({
+    address: XLSX.utils.encode_range(m), // "A2:A4", for messages
+    top: m.s.r - origin.r, bottom: m.e.r - origin.r,
+    left: m.s.c - origin.c, right: m.e.c - origin.c,
+  }));
+  return { rows, merges, origin };
+}
+
+// Fills the merges in the data that are safe to fill; reports the others.
+// Changes rows in place. firstData: index of the first row under the header.
+// width: number of columns in the table.
+function fillMerges(rows, merges, firstData, width, origin) {
+  const notes = [];
+  const problems = [];
+  const skipRows = new Set();
+  const excelAddress = (r, c) => XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });
+  // Only the table's columns count: a stray comment further right does not make a row data.
+  const blank = (row) => row.slice(0, width).every(isEmpty);
+  for (const m of merges) {
+    if (m.bottom < firstData) continue; // in or above the header row
+    if (m.top >= rows.length) continue;  // below the last row: nothing to read
+    if (m.left >= width) continue;       // right of the table, such as a logo box
+    if (m.top < firstData) {
+      // A header cell merged down into the data. Harmless only if those rows are empty.
+      const into = rows.slice(firstData, m.bottom + 1);
+      if (!into.every(blank)) {
+        const reason = "runs from the header into the data; the header may have two rows";
+        problems.push({ range: m.address, reason });
+      }
+      continue;
+    }
+    const value = rows[m.top][m.left];
+    const last = Math.min(m.bottom, rows.length - 1);
+    // The user sees only the first cell's value. A value stored in another cell of
+    // the range is hidden in Excel, so it is reported and not imported.
+    for (let r = m.top; r <= last; r++) {
+      for (let c = m.left; c <= m.right; c++) {
+        if ((r === m.top && c === m.left) || isEmpty(rows[r][c])) continue;
+        problems.push({ range: m.address, reason: `hides ${JSON.stringify(rows[r][c])} in ${excelAddress(r, c)}` });
+        rows[r][c] = "";
+      }
+    }
+    const height = last - m.top + 1; // rows that exist, if the merge runs past the end
+    const span = m.right - m.left + 1;
+    if (span === 1 && isLabel(value)) {
+      // Text in one column over several rows: a group label. Copy it down, except
+      // into rows that are empty in the file (those are skipped, not imported).
+      const filled = [];
+      for (let r = m.top + 1; r <= last; r++) {
+        if (blank(rows[r])) continue;
+        rows[r][m.left] = value;
+        filled.push(excelAddress(r, m.left));
+      }
+      if (filled.length > 0) {
+        notes.push({ range: m.address, reason: `${JSON.stringify(value)} copied into ${filled.join(", ")}` });
+      }
+    } else if (span === 1) {
+      // A number, date or boolean over several rows, such as one total for two
+      // invoice lines. Copying it would count it twice.
+      if (!isEmpty(value) && last > m.top) {
+        problems.push({ range: m.address, reason: `covers ${height} rows; ${JSON.stringify(value)} is read into ${excelAddress(m.top, m.left)} only` });
+      }
+    } else if (m.left === 0 && m.right >= width - 1) {
+      // One cell across the whole table: a title, a section name or a footnote.
+      for (let r = m.top; r <= last; r++) skipRows.add(r);
+      const first = origin.r + m.top + 1;
+      const where = last > m.top ? `rows ${first}-${origin.r + last + 1}` : `row ${first}`;
+      // Text is skipped quietly; a number across the table (a grand total?) is reported.
+      const list = isLabel(value) || isEmpty(value) ? notes : problems;
+      list.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });
+    } else if (!isEmpty(value)) {
+      // Several columns but not the whole table: the value belongs to one of them,
+      // and only the user knows which. An empty merge, kept for layout, is left alone.
+      const size = height > 1 ? `${height} rows and ${span} columns` : `${span} columns`;
+      problems.push({ range: m.address, reason: `covers ${size}; ${JSON.stringify(value)} is read into ${excelAddress(m.top, m.left)} only` });
+    }
+  }
+  return { notes, problems, skipRows };
+}
+
+// Reads an .xlsx file with a one-row header into records.
+// headerTop: index of the header row, counted from the first row of the stored
+// range (0 for most files). The header row must not be merged across columns.
+function readMergedTable(bytes, headerTop = 0) {
+  const { rows, merges, origin } = readXlsx(bytes);
+  const headerCell = (c) => XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });
+  const columns = (rows[headerTop] ?? []).map((name) => String(name).trim());
+  const width = columns.findLastIndex((name) => name !== "") + 1;
+  if (width === 0) {
+    const reason = "the header row has no column names; if the header is lower, pass its index as headerTop";
+    return { columns: [], records: [], notes: [], problems: [{ range: headerCell(0), reason }] };
+  }
+  const problems = [];
+  // A header cell merged across columns ("Q1" over C1:D1) means a header with two
+  // or more rows. This code reads one header row, so it reports the file instead.
+  for (const m of merges) {
+    if (m.top <= headerTop && m.bottom >= headerTop && m.right > m.left && m.left < width) {
+      problems.push({ range: m.address, reason: "header cell merged across columns; this code reads a one-row header only" });
+    }
+  }
+  if (problems.length > 0) return { columns: [], records: [], notes: [], problems };
+
+  const firstData = headerTop + 1;
+  const filled = fillMerges(rows, merges, firstData, width, origin);
+  problems.push(...filled.problems);
+  const isData = (r) => r >= firstData && !filled.skipRows.has(r) &&
+    !rows[r].slice(0, width).every(isEmpty);
+  columns.length = width;
+  columns.forEach((name, c) => {
+    if (name === "" && rows.some((row, r) => isData(r) && !isEmpty(row[c]))) {
+      problems.push({ range: headerCell(c), reason: "has data but no column name" });
+    }
+  });
+  const seen = new Set();
+  columns.forEach((name, c) => {
+    if (name === "") return;
+    // "Email" and "email" would become one field in most mappings: report it.
+    if (seen.has(name.toLowerCase())) {
+      problems.push({ range: headerCell(c), reason: `repeats the column name ${JSON.stringify(name)}` });
+    }
+    seen.add(name.toLowerCase());
+  });
+
+  const records = [];
+  rows.forEach((row, r) => {
+    if (!isData(r)) return;
+    // Object.fromEntries defines own properties, so a column named "__proto__" is safe.
+    // With a repeated name, the later column wins; the problem above says so.
+    const values = Object.fromEntries(
+      columns.flatMap((name, c) => (name ? [[name, row[c] ?? ""]] : [])));
+    records.push({ row: origin.r + r + 1, values }); // the row number the user sees in Excel
+  });
+  return { columns: columns.filter((name) => name !== ""), records, notes: filled.notes, problems };
+}
+
+// tests/fixtures/orders-merged.xlsx was written by openpyxl 3.1.5 (tools/make_orders_fixture.py).
+const ordersBytes = fs.readFileSync(path.join(__dirname, "fixtures", "orders-merged.xlsx"));
+const mdBook = (rows, merges, origin) => {
+  const sheet = XLSX.utils.aoa_to_sheet(rows, origin ? { origin } : undefined);
+  if (origin) sheet["!ref"] = XLSX.utils.encode_range({ s: XLSX.utils.decode_cell(origin), e: XLSX.utils.decode_range(sheet["!ref"]).e });
+  sheet["!merges"] = merges.map((a) => XLSX.utils.decode_range(a));
+  const book = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(book, sheet, "S");
+  return XLSX.write(book, { type: "buffer", bookType: "xlsx" });
+};
+const text = (list) => list.map((p) => `${p.range}: ${p.reason}`);
+const show = (v) => typeof v === "string" ? "'" + v + "'" : String(v);
+// Runs "expr; // result" lines from a snippet and compares the printed result.
+const checkLines = (src, scope) => {
+  const lines = src.split("\n").filter((l) => l && !l.startsWith("//"));
+  const setup = lines.filter((l) => l.startsWith("const ")).join("\n");
+  let checked = 0;
+  for (const line of lines.filter((l) => !l.startsWith("const "))) {
+    const m = /^(.*?);\s*\/\/ (.*?)(\s{2,}\(.*\))?$/.exec(line);
+    const names = Object.keys(scope);
+    const got = new Function(...names, setup + "\nreturn (" + m[1] + ");")(...Object.values(scope));
+    assert.strictEqual(show(got), m[2].trim(), line);
+    checked++;
+  }
+  return checked;
+};
+
+ok("md: SheetJS 0.20.3: the problem lines give what the comments say", () => {
+  assert.strictEqual(XLSX.version, "0.20.3");
+  const workbook = XLSX.read(ordersBytes);
+  assert.strictEqual(checkLines("// Orders.xlsx: \"North\" is merged over A2:A4, \"Note: amounts in EUR\" over A6:D6.\nconst sheet = workbook.Sheets[workbook.SheetNames[0]];\nconst records = XLSX.utils.sheet_to_json(sheet, { defval: \"\" });\nrecords.length;          // 5\nrecords[1].Region;       // ''  (Bo's row: \"North\" is stored in A2 only)\nrecords[4].Region;       // 'Note: amounts in EUR'  (the footnote, read as an order)\nsheet[\"!merges\"].length; // 2\n", { XLSX, workbook }), 4);
+  // Only the first cell of each merge holds a value in the file.
+  const sheet = workbook.Sheets.Orders;
+  for (const a of ["A3", "A4", "B6", "D6"]) assert.strictEqual(sheet[a], undefined, a);
+  assert.strictEqual(sheet.A2.v, "North");
+});
+ok("md: the example gives the output in its comments", async () => {
+  const file = { arrayBuffer: async () => ordersBytes.buffer.slice(ordersBytes.byteOffset, ordersBytes.byteOffset + ordersBytes.length) };
+  const src = "let table;\ntry {\n  table = readMergedTable(await file.arrayBuffer());\n} catch (error) {\n  // readXlsx throws a TypeError for a file that is not .xlsx,\n  // and SheetJS throws for a damaged one.\n  // Log the original error, so a bug in your own code is not mistaken for a bad file.\n  console.error(error);\n  const reason = \"the file could not be read as .xlsx\";\n  table = { columns: [], records: [], notes: [], problems: [{ range: null, reason }] };\n}\nconst { columns, records, notes, problems } = table;\n\nrecords.map((r) => `${r.row}: ${r.values.Region}, ${r.values.Rep}`);\n// [ '2: North, Ana', '3: North, Bo', '4: North, Cy', '5: South, Di' ]\nnotes.map((n) => `${n.range}: ${n.reason}`);\n// [ 'A2:A4: \"North\" copied into A3, A4',\n//   'A6:D6: row 6 skipped: \"Note: amounts in EUR\" spans the table' ]\nproblems; // []\n";
+  const body = src.slice(0, src.indexOf("\n\nrecords.map"));
+  const got = await new Function("readMergedTable", "file", "return (async () => {" + body + "\nreturn table; })();")(readMergedTable, file);
+  const rows = got.records.map((r) => `${r.row}: ${r.values.Region}, ${r.values.Rep}`);
+  assert.deepStrictEqual(rows, ["2: North, Ana", "3: North, Bo", "4: North, Cy", "5: South, Di"]);
+  for (const r of rows) assert(src.includes("'" + r + "'"), r);
+  const notes = text(got.notes);
+  assert.deepStrictEqual(notes, ['A2:A4: "North" copied into A3, A4', 'A6:D6: row 6 skipped: "Note: amounts in EUR" spans the table']);
+  for (const n of notes) assert(src.includes("'" + n + "'"), n);
+  assert.deepStrictEqual(got.problems, []);
+  assert.deepStrictEqual(got.columns, ["Region", "Rep", "Invoice", "Amount"]);
+  assert.deepStrictEqual(got.records[1].values, { Region: "North", Rep: "Bo", Invoice: "INV-2", Amount: 90 });
+  // The catch branch: a CSV is refused with the message in the example.
+  const csv = { arrayBuffer: async () => new TextEncoder().encode("Region,Rep\nNorth,Ana\n").buffer };
+  const quiet = console.error; console.error = () => {};
+  const bad = await new Function("readMergedTable", "file", "return (async () => {" + body + "\nreturn table; })();")(readMergedTable, csv);
+  console.error = quiet;
+  assert.deepStrictEqual(text(bad.problems), ["null: the file could not be read as .xlsx"]);
+});
+ok("md: a file SheetJS writes reads the same as the openpyxl file", () => {
+  const bytes = mdBook([["Region", "Rep", "Invoice", "Amount"], ["North", "Ana", "INV-1", 100], ["", "Bo", "INV-2", 90],
+    ["", "Cy", "INV-3", 70], ["South", "Di", "INV-4", 60], ["Note: amounts in EUR", "", "", ""]], ["A2:A4", "A6:D6"]);
+  assert.deepStrictEqual(readMergedTable(bytes), readMergedTable(ordersBytes));
+});
+const invoices = () => mdBook([["Customer", "Invoice", "Line", "Amount"], ["Acme", "INV-7", "Licence", 150],
+  ["", "INV-7", "Shipping", ""], ["Bolt", "Paid by card, see note", "", 40]], ["A2:A3", "D2:D3", "B4:C4"]);
+ok("md: the invoices example gives the output in its comments", () => {
+  const t = readMergedTable(invoices());
+  const src = "// Invoices.xlsx: header Customer, Invoice, Line, Amount (A1:D1). Merged in the data:\n// \"Acme\" over A2:A3, 150 over D2:D3 (one amount for two lines),\n// and \"Paid by card, see note\" over B4:C4.\nproblems.map((p) => `${p.range}: ${p.reason}`);\n// [ 'D2:D3: covers 2 rows; 150 is read into D2 only',\n//   'B4:C4: covers 2 columns; \"Paid by card, see note\" is read into B4 only' ]\nrecords[1].values; // { Customer: 'Acme', Invoice: 'INV-7', Line: 'Shipping', Amount: '' }\n";
+  const probs = text(t.problems);
+  assert.deepStrictEqual(probs, ["D2:D3: covers 2 rows; 150 is read into D2 only", 'B4:C4: covers 2 columns; "Paid by card, see note" is read into B4 only']);
+  for (const p of probs) assert(src.includes("'" + p + "'"), p);
+  assert.deepStrictEqual(t.records[1].values, { Customer: "Acme", Invoice: "INV-7", Line: "Shipping", Amount: "" });
+  assert(src.includes("records[1].values; // { Customer: 'Acme', Invoice: 'INV-7', Line: 'Shipping', Amount: '' }"));
+  assert.deepStrictEqual(text(t.notes), ['A2:A3: "Acme" copied into A3']);
+  assert.deepStrictEqual(t.records.map((r) => r.values.Amount), [150, "", 40]);
+});
+ok("md: decision table, one case per row", () => {
+  const H = ["Region", "Rep", "Amount", "Note"];
+  const run = (rows, merges) => readMergedTable(mdBook([H, ...rows], merges));
+  // Text in one column: copied down. Also in a value column ("TBD").
+  const tbd = run([["North", "Ana", "TBD", ""], ["", "Bo", "", ""]], ["A2:A3", "C2:C3"]);
+  assert.deepStrictEqual(tbd.records.map((r) => [r.values.Region, r.values.Amount]), [["North", "TBD"], ["North", "TBD"]]);
+  assert.deepStrictEqual(text(tbd.notes), ['A2:A3: "North" copied into A3', 'C2:C3: "TBD" copied into C3']);
+  // A number, a date and a boolean in one column: kept in the first row, reported.
+  const num = run([["North", "Ana", 100, ""], ["North", "Bo", "", ""]], ["C2:C3"]);
+  assert.deepStrictEqual(num.records.map((r) => r.values.Amount), [100, ""]);
+  assert.deepStrictEqual(text(num.problems), ["C2:C3: covers 2 rows; 100 is read into C2 only"]);
+  const date = run([["North", "Ana", new Date(Date.UTC(2026, 0, 5)), ""], ["North", "Bo", "", ""]], ["C2:C3"]);
+  assert.strictEqual(typeof date.records[0].values.Amount, "number"); // a serial number with raw: true
+  assert.strictEqual(date.problems.length, 1);
+  const bool = run([["North", "Ana", true, ""], ["North", "Bo", "", ""]], ["C2:C3"]);
+  assert.deepStrictEqual(text(bool.problems), ["C2:C3: covers 2 rows; true is read into C2 only"]);
+  // Text across the whole table: rows skipped with a note. Over two rows: both rows.
+  const title = run([["Europe", "", "", ""], ["North", "Ana", 1, ""], ["Total in EUR", "", "", ""], ["", "", "", ""]], ["A2:D2", "A4:D5"]);
+  assert.deepStrictEqual(title.records.map((r) => r.row), [3]);
+  assert.deepStrictEqual(text(title.notes), ['A2:D2: row 2 skipped: "Europe" spans the table', 'A4:D5: rows 4-5 skipped: "Total in EUR" spans the table']);
+  assert.deepStrictEqual(title.problems, []);
+  // A number across the whole table: skipped and reported.
+  const total = run([["North", "Ana", 1, ""], [500, "", "", ""]], ["A3:D3"]);
+  assert.deepStrictEqual([total.records.length, text(total.problems)], [1, ["A3:D3: row 3 skipped: 500 spans the table"]]);
+  // Some columns of one row: kept in the first column, reported. An empty merge: left alone.
+  const part = run([["North", "Ana", "long note", ""], ["South", "Bo", "", ""]], ["C2:D2", "C3:D3"]);
+  assert.deepStrictEqual(text(part.problems), ['C2:D2: covers 2 columns; "long note" is read into C2 only']);
+  assert.deepStrictEqual(part.records[0].values, { Region: "North", Rep: "Ana", Amount: "long note", Note: "" });
+  // Several rows and columns: reported; the rows are still read.
+  const block = run([["North", "", 1, ""], ["", "", 2, ""], ["South", "Cy", 3, ""]], ["A2:B3"]);
+  assert.deepStrictEqual(text(block.problems), ['A2:B3: covers 2 rows and 2 columns; "North" is read into A2 only']);
+  assert.deepStrictEqual(block.records.map((r) => [r.row, r.values.Region]), [[2, "North"], [3, ""], [4, "South"]]);
+  // Starts in the header, ends in the data: reported, unless the rows it reaches are empty.
+  const down = run([["", "Ana", 1, ""]], ["A1:A2"]);
+  assert.deepStrictEqual(down.records.map((r) => r.values.Rep), ["Ana"]); // records are still returned
+  assert.deepStrictEqual(text(down.problems), ["A1:A2: runs from the header into the data; the header may have two rows"]);
+  const downEmpty = run([["", "", "", ""], ["North", "Ana", 1, ""]], ["A1:A2"]);
+  assert.deepStrictEqual([downEmpty.problems, downEmpty.records.map((r) => r.row)], [[], [3]]);
+});
+ok("md: hidden values, empty rows and merges outside the table", () => {
+  // A value stored under a merge is hidden in Excel: reported and not imported.
+  const hidden = readMergedTable(mdBook([["Region", "Rep"], ["North", "Ana"], ["South", "Bo"]], ["A2:A3"]));
+  assert.deepStrictEqual(hidden.records.map((r) => r.values.Region), ["North", "North"]);
+  assert.deepStrictEqual(text(hidden.problems), ['A2:A3: hides "South" in A3']);
+  const across = readMergedTable(mdBook([["Name", "Note", "Amount"], ["Ana", "long note", 5]], ["B2:C2"]));
+  assert.deepStrictEqual(text(across.problems), ["B2:C2: hides 5 in C2", 'B2:C2: covers 2 columns; "long note" is read into B2 only']);
+  assert.deepStrictEqual(across.records[0].values, { Name: "Ana", Note: "long note", Amount: "" });
+  // A row that is empty in the file is skipped, even inside a merge.
+  const gap = readMergedTable(mdBook([["Region", "Rep"], ["North", "Ana"], ["", ""], ["", "Bo"]], ["A2:A4"]));
+  assert.deepStrictEqual(gap.records.map((r) => [r.row, r.values.Region, r.values.Rep]), [[2, "North", "Ana"], [4, "North", "Bo"]]);
+  assert.deepStrictEqual(text(gap.notes), ['A2:A4: "North" copied into A4']);
+  // An empty merged cell fills nothing and adds no note.
+  const empty = readMergedTable(mdBook([["Region", "Rep"], ["", "Ana"], ["", "Bo"]], ["A2:A3"]));
+  assert.deepStrictEqual([empty.notes, empty.problems], [[], []]);
+  // A stray comment right of the table does not make a row data or get a label copied in.
+  const comment = readMergedTable(mdBook([["Region", "Rep", "", ""], ["North", "Ana", "", ""], ["", "", "", "check"], ["", "Bo", "", ""]], ["A2:A4"]));
+  assert.deepStrictEqual(comment.records.map((r) => [r.row, r.values.Region, r.values.Rep]), [[2, "North", "Ana"], [4, "North", "Bo"]]);
+  assert.deepStrictEqual(text(comment.notes), ['A2:A4: "North" copied into A4']);
+  // A number merged past the last row: the message counts the rows that exist.
+  const pastNum = readMergedTable(mdBook([["Rep", "Amount"], ["Ana", 5], ["Bo", ""]], ["B2:B9"]));
+  assert.deepStrictEqual(text(pastNum.problems), ["B2:B9: covers 2 rows; 5 is read into B2 only"]);
+  // Limits stated in the post: a label alone on its row becomes a record with only that label;
+  // in a one-column table a footnote merged down is copied like a label.
+  const alone = readMergedTable(mdBook([["Region", "Rep", "Invoice", "Amount"], ["North", "", "", ""], ["", "Ana", "INV-1", 100], ["", "Bo", "INV-2", 90]], ["A2:A4"]));
+  assert.deepStrictEqual(alone.records[0], { row: 2, values: { Region: "North", Rep: "", Invoice: "", Amount: "" } });
+  assert.strictEqual(alone.records.length, 3);
+  const oneCol = readMergedTable(mdBook([["Name"], ["Ana"], ["Note"], [""]], ["A3:A4"]));
+  assert.deepStrictEqual(oneCol.records.map((r) => r.values.Name), ["Ana", "Note"]);
+  // A merge past the last row fills only the rows that exist.
+  const past = readMergedTable(mdBook([["Region", "Rep"], ["West", "Ed"], ["", "Fay"]], ["A2:A9"]));
+  assert.deepStrictEqual(text(past.notes), ['A2:A9: "West" copied into A3']);
+  // A stray cell right of the table does not widen it; a merge there is ignored.
+  const stray = readMergedTable(mdBook([["Name", "Rep", "", ""], ["Ana", "x", "", ""], ["Note", "", "", "?"], ["Bo", "y", "logo", ""]], ["A3:B3", "C4:D5"]));
+  assert.deepStrictEqual(text(stray.notes), ['A3:B3: row 3 skipped: "Note" spans the table']);
+  assert.deepStrictEqual(stray.problems, []);
+  assert.deepStrictEqual(stray.columns, ["Name", "Rep"]);
+  // A merge above the header (a title) is ignored when headerTop is set.
+  const titled = readMergedTable(mdBook([["Sales export", ""], ["Region", "Rep"], ["North", "Ana"], ["", "Bo"]], ["A1:B1", "A3:A4"]), 1);
+  assert.deepStrictEqual(titled.records.map((r) => [r.row, r.values.Region]), [[3, "North"], [4, "North"]]);
+  assert.deepStrictEqual(titled.problems, []);
+});
+ok("md: header checks", () => {
+  // A header merged across columns is refused, with no records.
+  const q = readMergedTable(mdBook([["Region", "Q1", ""], ["", "Revenue", "Cost"], ["North", 1, 2]], ["B1:C1"]));
+  assert.deepStrictEqual([q.records, text(q.problems)], [[], ["B1:C1: header cell merged across columns; this code reads a one-row header only"]]);
+  const amount = readMergedTable(mdBook([["Name", "Amount", ""], ["Ana", 1, 2]], ["B1:C1"]));
+  assert.strictEqual(amount.problems.length, 1);
+  // A title merged across above headerTop is not a header merge.
+  const titled = readMergedTable(mdBook([["Sales", "", ""], ["Name", "Rep", "City"], ["Ana", "x", "y"]], ["A1:C1"]), 1);
+  assert.deepStrictEqual(titled.problems, []);
+  // Repeated names (any case) and data without a name are reported.
+  const t = readMergedTable(mdBook([["Name", "name", "", "Email"], ["Ana", "x", "y", "a@b.co"]], []));
+  assert.deepStrictEqual(text(t.problems), ["C1: has data but no column name", 'B1: repeats the column name "name"']);
+  assert.deepStrictEqual(t.columns, ["Name", "name", "Email"]);
+  // A column with neither name nor data is dropped quietly.
+  const quiet = readMergedTable(mdBook([["Name", "", "Email"], ["Ana", "", "a@b.co"]], []));
+  assert.deepStrictEqual([quiet.problems, Object.keys(quiet.records[0].values)], [[], ["Name", "Email"]]);
+  // No names in the header row.
+  const none = readMergedTable(mdBook([["", ""], ["Name", "Email"]], []));
+  assert.deepStrictEqual(text(none.problems), ["A1: the header row has no column names; if the header is lower, pass its index as headerTop"]);
+  // An empty sheet.
+  const book = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(book, XLSX.utils.aoa_to_sheet([]), "S");
+  const blank = readMergedTable(XLSX.write(book, { type: "buffer", bookType: "xlsx" }));
+  assert.strictEqual(blank.problems.length, 1);
+  // A column called __proto__ is an own property, not the prototype.
+  const proto = readMergedTable(mdBook([["__proto__", "Name"], ["x", "Ana"]], []));
+  assert.strictEqual(Object.getPrototypeOf(proto.records[0].values), Object.prototype);
+  assert.strictEqual(Object.getOwnPropertyDescriptor(proto.records[0].values, "__proto__").value, "x");
+  // Header names are trimmed.
+  assert.deepStrictEqual(readMergedTable(mdBook([[" Name "], ["Ana"]], [])).columns, ["Name"]);
+});
+ok("md: a sheet that does not start at A1 keeps Excel addresses and row numbers", () => {
+  const bytes = mdBook([["Region", "Rep"], ["North", "Ana"], ["", "Bo"], ["Total", ""]], ["B4:B5", "B6:C6"], "B3");
+  const { origin, merges } = readXlsx(bytes);
+  assert.deepStrictEqual([origin, merges[0]], [{ r: 2, c: 1 }, { address: "B4:B5", top: 1, bottom: 2, left: 0, right: 0 }]);
+  const t = readMergedTable(bytes);
+  assert.deepStrictEqual(t.records, [{ row: 4, values: { Region: "North", Rep: "Ana" } }, { row: 5, values: { Region: "North", Rep: "Bo" } }]);
+  assert.deepStrictEqual(text(t.notes), ['B4:B5: "North" copied into B5', 'B6:C6: row 6 skipped: "Total" spans the table']);
+});
+ok("md: readXlsx refuses files that are not .xlsx", () => {
+  assert.throws(() => readXlsx(new TextEncoder().encode("Region,Rep\nNorth,Ana\n")), TypeError);
+  assert.throws(() => readXlsx(new Uint8Array([0xd0, 0xcf, 0x11, 0xe0])), TypeError);
+  assert.throws(() => readXlsx(new Uint8Array([])), TypeError);
+  // A damaged zip: SheetJS throws.
+  assert.throws(() => readXlsx(new Uint8Array([0x50, 0x4b, 3, 4, 0, 0, 0, 0])));
+  // An ArrayBuffer works as well as a Uint8Array.
+  const u8 = new Uint8Array(ordersBytes);
+  assert.deepStrictEqual(readXlsx(u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.length)).merges.length, 2);
+});
+ok("md: snippets have no invisible characters", () => {
+  for (const s of ["// Orders.xlsx: \"North\" is merged over A2:A4, \"Note: amounts in EUR\" over A6:D6.\nconst sheet = workbook.Sheets[workbook.SheetNames[0]];\nconst records = XLSX.utils.sheet_to_json(sheet, { defval: \"\" });\nrecords.length;          // 5\nrecords[1].Region;       // ''  (Bo's row: \"North\" is stored in A2 only)\nrecords[4].Region;       // 'Note: amounts in EUR'  (the footnote, read as an order)\nsheet[\"!merges\"].length; // 2\n", "// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz\nimport * as XLSX from \"xlsx\";\n\nconst isEmpty = (value) => String(value ?? \"\").trim() === \"\";\nconst isLabel = (value) => typeof value === \"string\" && value.trim() !== \"\";\n\n// Reads the first sheet of an .xlsx file.\n// rows: one array of cells per row. merges: the merged ranges.\n// Both count from 0 at the first cell of the sheet's stored range (origin).\nfunction readXlsx(bytes) {\n  const data = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;\n  // An .xlsx file is a zip archive, and zip archives start with the bytes \"PK\".\n  if (data[0] !== 0x50 || data[1] !== 0x4b) throw new TypeError(\"not an .xlsx file\");\n  const workbook = XLSX.read(data);\n  const sheet = workbook.Sheets[workbook.SheetNames[0]];\n  if (!sheet?.[\"!ref\"]) return { rows: [], merges: [], origin: { r: 0, c: 0 } };\n  const origin = XLSX.utils.decode_range(sheet[\"!ref\"]).s;\n  const rows = XLSX.utils.sheet_to_json(sheet, {\n    header: 1, defval: \"\", blankrows: true, raw: true });\n  const merges = (sheet[\"!merges\"] ?? []).map((m) => ({\n    address: XLSX.utils.encode_range(m), // \"A2:A4\", for messages\n    top: m.s.r - origin.r, bottom: m.e.r - origin.r,\n    left: m.s.c - origin.c, right: m.e.c - origin.c,\n  }));\n  return { rows, merges, origin };\n}\n", "// Fills the merges in the data that are safe to fill; reports the others.\n// Changes rows in place. firstData: index of the first row under the header.\n// width: number of columns in the table.\nfunction fillMerges(rows, merges, firstData, width, origin) {\n  const notes = [];\n  const problems = [];\n  const skipRows = new Set();\n  const excelAddress = (r, c) => XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });\n  // Only the table's columns count: a stray comment further right does not make a row data.\n  const blank = (row) => row.slice(0, width).every(isEmpty);\n  for (const m of merges) {\n    if (m.bottom < firstData) continue; // in or above the header row\n    if (m.top >= rows.length) continue;  // below the last row: nothing to read\n    if (m.left >= width) continue;       // right of the table, such as a logo box\n    if (m.top < firstData) {\n      // A header cell merged down into the data. Harmless only if those rows are empty.\n      const into = rows.slice(firstData, m.bottom + 1);\n      if (!into.every(blank)) {\n        const reason = \"runs from the header into the data; the header may have two rows\";\n        problems.push({ range: m.address, reason });\n      }\n      continue;\n    }\n    const value = rows[m.top][m.left];\n    const last = Math.min(m.bottom, rows.length - 1);\n    // The user sees only the first cell's value. A value stored in another cell of\n    // the range is hidden in Excel, so it is reported and not imported.\n    for (let r = m.top; r <= last; r++) {\n      for (let c = m.left; c <= m.right; c++) {\n        if ((r === m.top && c === m.left) || isEmpty(rows[r][c])) continue;\n        problems.push({ range: m.address, reason: `hides ${JSON.stringify(rows[r][c])} in ${excelAddress(r, c)}` });\n        rows[r][c] = \"\";\n      }\n    }\n    const height = last - m.top + 1; // rows that exist, if the merge runs past the end\n    const span = m.right - m.left + 1;\n    if (span === 1 && isLabel(value)) {\n      // Text in one column over several rows: a group label. Copy it down, except\n      // into rows that are empty in the file (those are skipped, not imported).\n      const filled = [];\n      for (let r = m.top + 1; r <= last; r++) {\n        if (blank(rows[r])) continue;\n        rows[r][m.left] = value;\n        filled.push(excelAddress(r, m.left));\n      }\n      if (filled.length > 0) {\n        notes.push({ range: m.address, reason: `${JSON.stringify(value)} copied into ${filled.join(\", \")}` });\n      }\n    } else if (span === 1) {\n      // A number, date or boolean over several rows, such as one total for two\n      // invoice lines. Copying it would count it twice.\n      if (!isEmpty(value) && last > m.top) {\n        problems.push({ range: m.address, reason: `covers ${height} rows; ${JSON.stringify(value)} is read into ${excelAddress(m.top, m.left)} only` });\n      }\n    } else if (m.left === 0 && m.right >= width - 1) {\n      // One cell across the whole table: a title, a section name or a footnote.\n      for (let r = m.top; r <= last; r++) skipRows.add(r);\n      const first = origin.r + m.top + 1;\n      const where = last > m.top ? `rows ${first}-${origin.r + last + 1}` : `row ${first}`;\n      // Text is skipped quietly; a number across the table (a grand total?) is reported.\n      const list = isLabel(value) || isEmpty(value) ? notes : problems;\n      list.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });\n    } else if (!isEmpty(value)) {\n      // Several columns but not the whole table: the value belongs to one of them,\n      // and only the user knows which. An empty merge, kept for layout, is left alone.\n      const size = height > 1 ? `${height} rows and ${span} columns` : `${span} columns`;\n      problems.push({ range: m.address, reason: `covers ${size}; ${JSON.stringify(value)} is read into ${excelAddress(m.top, m.left)} only` });\n    }\n  }\n  return { notes, problems, skipRows };\n}\n", "// Reads an .xlsx file with a one-row header into records.\n// headerTop: index of the header row, counted from the first row of the stored\n// range (0 for most files). The header row must not be merged across columns.\nfunction readMergedTable(bytes, headerTop = 0) {\n  const { rows, merges, origin } = readXlsx(bytes);\n  const headerCell = (c) => XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });\n  const columns = (rows[headerTop] ?? []).map((name) => String(name).trim());\n  const width = columns.findLastIndex((name) => name !== \"\") + 1;\n  if (width === 0) {\n    const reason = \"the header row has no column names; if the header is lower, pass its index as headerTop\";\n    return { columns: [], records: [], notes: [], problems: [{ range: headerCell(0), reason }] };\n  }\n  const problems = [];\n  // A header cell merged across columns (\"Q1\" over C1:D1) means a header with two\n  // or more rows. This code reads one header row, so it reports the file instead.\n  for (const m of merges) {\n    if (m.top <= headerTop && m.bottom >= headerTop && m.right > m.left && m.left < width) {\n      problems.push({ range: m.address, reason: \"header cell merged across columns; this code reads a one-row header only\" });\n    }\n  }\n  if (problems.length > 0) return { columns: [], records: [], notes: [], problems };\n\n  const firstData = headerTop + 1;\n  const filled = fillMerges(rows, merges, firstData, width, origin);\n  problems.push(...filled.problems);\n  const isData = (r) => r >= firstData && !filled.skipRows.has(r) &&\n    !rows[r].slice(0, width).every(isEmpty);\n  columns.length = width;\n  columns.forEach((name, c) => {\n    if (name === \"\" && rows.some((row, r) => isData(r) && !isEmpty(row[c]))) {\n      problems.push({ range: headerCell(c), reason: \"has data but no column name\" });\n    }\n  });\n  const seen = new Set();\n  columns.forEach((name, c) => {\n    if (name === \"\") return;\n    // \"Email\" and \"email\" would become one field in most mappings: report it.\n    if (seen.has(name.toLowerCase())) {\n      problems.push({ range: headerCell(c), reason: `repeats the column name ${JSON.stringify(name)}` });\n    }\n    seen.add(name.toLowerCase());\n  });\n\n  const records = [];\n  rows.forEach((row, r) => {\n    if (!isData(r)) return;\n    // Object.fromEntries defines own properties, so a column named \"__proto__\" is safe.\n    // With a repeated name, the later column wins; the problem above says so.\n    const values = Object.fromEntries(\n      columns.flatMap((name, c) => (name ? [[name, row[c] ?? \"\"]] : [])));\n    records.push({ row: origin.r + r + 1, values }); // the row number the user sees in Excel\n  });\n  return { columns: columns.filter((name) => name !== \"\"), records, notes: filled.notes, problems };\n}\n", "let table;\ntry {\n  table = readMergedTable(await file.arrayBuffer());\n} catch (error) {\n  // readXlsx throws a TypeError for a file that is not .xlsx,\n  // and SheetJS throws for a damaged one.\n  // Log the original error, so a bug in your own code is not mistaken for a bad file.\n  console.error(error);\n  const reason = \"the file could not be read as .xlsx\";\n  table = { columns: [], records: [], notes: [], problems: [{ range: null, reason }] };\n}\nconst { columns, records, notes, problems } = table;\n\nrecords.map((r) => `${r.row}: ${r.values.Region}, ${r.values.Rep}`);\n// [ '2: North, Ana', '3: North, Bo', '4: North, Cy', '5: South, Di' ]\nnotes.map((n) => `${n.range}: ${n.reason}`);\n// [ 'A2:A4: \"North\" copied into A3, A4',\n//   'A6:D6: row 6 skipped: \"Note: amounts in EUR\" spans the table' ]\nproblems; // []\n", "// Invoices.xlsx: header Customer, Invoice, Line, Amount (A1:D1). Merged in the data:\n// \"Acme\" over A2:A3, 150 over D2:D3 (one amount for two lines),\n// and \"Paid by card, see note\" over B4:C4.\nproblems.map((p) => `${p.range}: ${p.reason}`);\n// [ 'D2:D3: covers 2 rows; 150 is read into D2 only',\n//   'B4:C4: covers 2 columns; \"Paid by card, see note\" is read into B4 only' ]\nrecords[1].values; // { Customer: 'Acme', Invoice: 'INV-7', Line: 'Shipping', Amount: '' }\n"]) assert(!/[\u00a0\u00ad\u200b-\u200f\u2028\u2029\u202f\u2060\u3000\ufeff]/.test(s));
+});
+}
