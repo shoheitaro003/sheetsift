@@ -1,0 +1,97 @@
+title: Fill merged cells in Excel imports with SheetJS
+description: SheetJS stores a merged cell's value in its first cell only. Tested JavaScript that fills merged group labels and reports the merges it should not guess.
+date: 2026-11-24
+---
+<p>A customer uploads an order list where "North" is merged over three rows. Your importer reads it with SheetJS and gets "North" for the first order only; the next two have no region. A footnote merged across the bottom row arrives as one more order.</p>
+<p>By the end of this post you will have <code>readMergedTable(bytes)</code>, about 150 lines on top of SheetJS. It copies merged labels such as a region into every row they cover, skips title and footnote rows, and lists the merges it should not guess about, by their Excel address. It handles .xlsx files with a one-row header. Every result quoted below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> (the tests named <code>md:</code>) in Node 22 with SheetJS 0.20.3.</p>
+
+<h2>The problem</h2>
+<p>Here is the file. Each merged range is drawn as one cell:</p>
+<div class="table">
+<table aria-label="Orders.xlsx, first sheet">
+<thead><tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr></thead>
+<tbody>
+<tr><th>1</th><td>Region</td><td>Rep</td><td>Invoice</td><td>Amount</td></tr>
+<tr><th>2</th><td rowspan="3">North<br><small>(A2:A4)</small></td><td>Ana</td><td>INV-1</td><td>100</td></tr>
+<tr><th>3</th><td>Bo</td><td>INV-2</td><td>90</td></tr>
+<tr><th>4</th><td>Cy</td><td>INV-3</td><td>70</td></tr>
+<tr><th>5</th><td>South</td><td>Di</td><td>INV-4</td><td>60</td></tr>
+<tr><th>6</th><td colspan="4">Note: amounts in EUR <small>(A6:D6)</small></td></tr>
+</tbody>
+</table>
+</div>
+<p>Read the usual way:</p>
+{{code:MD_PROBLEM}}
+<p>In the file, a merged range stores its value in its first (top-left) cell only; A3 and A4 hold nothing. The merge itself is stored separately, and SheetJS returns the list of merged ranges in <code>sheet["!merges"]</code>. That list is all you need to put "North" back into rows 3 and 4.</p>
+<p>But you cannot fill every merge. Copying a total of 150 merged over two invoice lines gives 300 when you add up the lines. So the code below decides by the shape of the merge and the type of its value.</p>
+
+<h2>Step 1: read the rows and the merges</h2>
+<p>All the code in this post goes in one module; export <code>readMergedTable</code> from it.</p>
+{{code:MD_READ}}
+<p>Why each option is there:</p>
+<ul>
+<li><code>header: 1</code> returns each row as an array, so row and column positions match the sheet. <code>defval: ""</code> fills missing cells and <code>blankrows: true</code> keeps empty rows, so <code>rows[r][c]</code> is always the same cell as in the file.</li>
+<li><code>raw: true</code> returns stored values, not the text Excel displays: a number stays a number. Dates arrive as serial numbers; our post on <a href="../read-excel-dates-javascript-sheetjs/">reading Excel dates</a> converts them.</li>
+<li>The <em>stored range</em> of a sheet, in <code>sheet["!ref"]</code>, is the block of cells the file uses, such as <code>A1:D6</code>. It does not have to start at A1, so the code counts from its first cell (<code>origin</code>) and moves each merge by the same amount. Each merge keeps its <code>address</code>, because that is what the user sees in Excel.</li>
+</ul>
+<p>The first check refuses anything that is not a zip archive, such as a CSV or an old .xls file, with a <code>TypeError</code>. A CSV has no merges at all, so this code would have nothing to fill.</p>
+
+<h2>Step 2: decide what each merge means</h2>
+<p>Below the header, the shape of a merge and the type of its value tell you what it is. Only one case is safe to fill: text merged down one column.</p>
+<div class="table">
+<table>
+<thead><tr><th>Merge in the data</th><th>Usually means</th><th>What <code>fillMerges</code> does</th></tr></thead>
+<tbody>
+<tr><td>Text in one column, several rows (A2:A4)</td><td>a group label, such as a region</td><td>copies it into each row; adds a note</td></tr>
+<tr><td>A number, date or boolean in one column, several rows (D2:D3)</td><td>one total for several lines</td><td>keeps it in the first row only; reports a problem</td></tr>
+<tr><td>Text across the whole table (A6:D6)</td><td>a title, section name or footnote</td><td>skips the rows; adds a note</td></tr>
+<tr><td>A number across the whole table</td><td>maybe a grand total</td><td>skips the rows; reports a problem</td></tr>
+<tr><td>Some of the columns (B4:C4), one row or more</td><td>a long text that needed room, or layout</td><td>keeps the value in the first cell; reports a problem. An empty merge is left alone</td></tr>
+<tr><td>Starts in the header row, ends in the data</td><td>a mistake, or a header with more rows</td><td>reports a problem, unless the rows it reaches are empty; the records are still returned</td></tr>
+</tbody>
+</table>
+</div>
+{{code:MD_FILL}}
+<p>A few details the table leaves out, each covered by a test:</p>
+<ul>
+<li><strong>Text means any text.</strong> <code>TBD</code> merged over two amounts is copied into both, like a region. Your amount check should then reject <code>TBD</code> in both rows.</li>
+<li><strong>Hidden values.</strong> A program can write values into the other cells of a merge, but Excel shows only the first one. <code>fillMerges</code> reports such a value and clears it, so the import matches what the user sees.</li>
+<li><strong>Empty rows</strong> inside a merged label are not filled, so they are still skipped instead of becoming records with only a region.</li>
+<li><strong>The table's columns</strong> run from the first column of the stored range to the last column with a name. Cells further right are ignored: a stray comment there does not turn an empty row into a record, and a merge there, such as a logo box, is skipped.</li>
+</ul>
+
+<h2>Step 3: read the table</h2>
+<p><code>readMergedTable</code> reads the header row, refuses headers it cannot read, runs <code>fillMerges</code> and builds one record per data row, with the row number the user sees in Excel.</p>
+{{code:MD_TABLE}}
+<p>It reports three header problems besides the merges:</p>
+<ul>
+<li><strong>A header cell merged across columns</strong>, such as <code>Q1</code> over C1:D1. That usually means a header with two rows (<code>Q1</code> over <code>Revenue</code> and <code>Cost</code>), which this code does not read. Rather than guess the column names, it returns the problem and no records.</li>
+<li><strong>A column with data but no name.</strong> A column with neither is dropped without a message.</li>
+<li><strong>A name used twice</strong>, ignoring case (<code>Name</code> and <code>name</code>). The later column overwrites the earlier one in the record, so the user should rename one.</li>
+</ul>
+<p>Here it is on the order list, with the <code>try</code>/<code>catch</code> that turns an unreadable file into a problem too:</p>
+{{code:MD_EXAMPLE}}
+<p>And on an invoice file where two merges should not be filled:</p>
+{{code:MD_PROBLEMS}}
+<p>The amount 150 stays on the first line, so the invoice still adds up to 150. The payment note stays in the Invoice column, where the user can see it is in the wrong place.</p>
+<p>Show the notes in your import preview, so the user can see that "North" was copied and row 6 was skipped. Import only when <code>problems</code> is empty, or when the user has fixed or accepted each one. If the header is not the first row of the stored range, pass its index as <code>headerTop</code>, counting from 0 at the first row of the stored range: a header in Excel row 3 of a range that starts at A1 is <code>headerTop = 2</code>. Our post on <a href="../detect-header-row-spreadsheet-javascript/">finding the header row</a> finds it. A title merged across the rows above the header is then ignored.</p>
+
+<h2>What this does not cover</h2>
+<ul>
+<li><strong>Headers with two or more rows.</strong> They are refused, as described in step 3.</li>
+<li><strong>CSV and .xls files.</strong> A CSV stores no merges, so a region typed once over three rows arrives as a value followed by empty cells, the same as cells nobody filled in. Fill such a column only after the user says it is grouped.</li>
+<li><strong>A label on a row of its own.</strong> If "North" sits alone in row 2, merged over A2:A4, and the orders start in row 3, row 2 becomes a record with only a region. Your required-field checks will catch it.</li>
+<li><strong>One-column tables.</strong> With a single column, a footnote merged down that column looks like a group label, so it is read as a record, not skipped.</li>
+<li><strong>Section labels as data.</strong> A row like <code>Europe</code> across the table is skipped. If the rows below belong to it, add it as a column yourself.</li>
+<li><strong>Empty columns left of the table.</strong> If the stored range starts at column A but the table starts at B, a footnote merged over B:E does not reach the first column, so it is reported instead of skipped. Ask the user to delete the empty column.</li>
+<li><strong>Other sheets and hidden rows.</strong> Only the first sheet is read, and hidden rows are read like any other.</li>
+<li><strong>Blank cells that are not merged.</strong> They stay empty. Our post on <a href="../find-placeholder-values-csv-excel-javascript/">placeholder values</a> shows how to report them in required columns.</li>
+</ul>
+
+<div class="cta">
+<h2>Try it on your own file</h2>
+<p>SheetSift is a drop-in React importer. The demo on our homepage finds the header row and reads each column's type, such as email, date or number, from its name and values. It runs in your browser: drop in a file and nothing is uploaded.</p>
+<p><a class="btn" href="../../#try">Open the demo</a></p>
+</div>
+
+<p class="disclosure">We build SheetSift. Filling merged cells as shown here is not in SheetSift yet; you are free to use the functions in this post in your own code.</p>

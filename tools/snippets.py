@@ -1355,3 +1355,201 @@ LK_EXAMPLE = r'''checkRecords([
 //   'Row 5, sku: "[Κ][Μ]-7" is not plain ASCII: U+039A Greek, U+039C Greek.',
 //   'Row 5, name: "Chloë [М]. Martin" mixes Latin with U+041C Cyrillic.' ]
 '''
+
+
+# --- blog/fill-merged-cells-excel-import-sheetjs ---
+MD_PROBLEM = r'''// Orders.xlsx: "North" is merged over A2:A4, "Note: amounts in EUR" over A6:D6.
+const sheet = workbook.Sheets[workbook.SheetNames[0]];
+const records = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+records.length;          // 5
+records[1].Region;       // ''  (Bo's row: "North" is stored in A2 only)
+records[4].Region;       // 'Note: amounts in EUR'  (the footnote, read as an order)
+sheet["!merges"].length; // 2
+'''
+
+MD_READ = r'''// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
+import * as XLSX from "xlsx";
+
+const isEmpty = (value) => String(value ?? "").trim() === "";
+const isLabel = (value) => typeof value === "string" && value.trim() !== "";
+
+// Reads the first sheet of an .xlsx file.
+// rows: one array of cells per row. merges: the merged ranges.
+// Both count from 0 at the first cell of the sheet's stored range (origin).
+function readXlsx(bytes) {
+  const data = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;
+  // An .xlsx file is a zip archive, and zip archives start with the bytes "PK".
+  if (data[0] !== 0x50 || data[1] !== 0x4b) throw new TypeError("not an .xlsx file");
+  const workbook = XLSX.read(data);
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  if (!sheet?.["!ref"]) return { rows: [], merges: [], origin: { r: 0, c: 0 } };
+  const origin = XLSX.utils.decode_range(sheet["!ref"]).s;
+  const rows = XLSX.utils.sheet_to_json(sheet, {
+    header: 1, defval: "", blankrows: true, raw: true });
+  const merges = (sheet["!merges"] ?? []).map((m) => ({
+    address: XLSX.utils.encode_range(m), // "A2:A4", for messages
+    top: m.s.r - origin.r, bottom: m.e.r - origin.r,
+    left: m.s.c - origin.c, right: m.e.c - origin.c,
+  }));
+  return { rows, merges, origin };
+}
+'''
+
+MD_FILL = r'''// Fills the merges in the data that are safe to fill; reports the others.
+// Changes rows in place. firstData: index of the first row under the header.
+// width: number of columns in the table.
+function fillMerges(rows, merges, firstData, width, origin) {
+  const notes = [];
+  const problems = [];
+  const skipRows = new Set();
+  const excelAddress = (r, c) => XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });
+  // Only the table's columns count: a stray comment further right does not make a row data.
+  const blank = (row) => row.slice(0, width).every(isEmpty);
+  for (const m of merges) {
+    if (m.bottom < firstData) continue; // in or above the header row
+    if (m.top >= rows.length) continue;  // below the last row: nothing to read
+    if (m.left >= width) continue;       // right of the table, such as a logo box
+    if (m.top < firstData) {
+      // A header cell merged down into the data. Harmless only if those rows are empty.
+      const into = rows.slice(firstData, m.bottom + 1);
+      if (!into.every(blank)) {
+        const reason = "runs from the header into the data; the header may have two rows";
+        problems.push({ range: m.address, reason });
+      }
+      continue;
+    }
+    const value = rows[m.top][m.left];
+    const last = Math.min(m.bottom, rows.length - 1);
+    // The user sees only the first cell's value. A value stored in another cell of
+    // the range is hidden in Excel, so it is reported and not imported.
+    for (let r = m.top; r <= last; r++) {
+      for (let c = m.left; c <= m.right; c++) {
+        if ((r === m.top && c === m.left) || isEmpty(rows[r][c])) continue;
+        problems.push({ range: m.address, reason: `hides ${JSON.stringify(rows[r][c])} in ${excelAddress(r, c)}` });
+        rows[r][c] = "";
+      }
+    }
+    const height = last - m.top + 1; // rows that exist, if the merge runs past the end
+    const span = m.right - m.left + 1;
+    if (span === 1 && isLabel(value)) {
+      // Text in one column over several rows: a group label. Copy it down, except
+      // into rows that are empty in the file (those are skipped, not imported).
+      const filled = [];
+      for (let r = m.top + 1; r <= last; r++) {
+        if (blank(rows[r])) continue;
+        rows[r][m.left] = value;
+        filled.push(excelAddress(r, m.left));
+      }
+      if (filled.length > 0) {
+        notes.push({ range: m.address, reason: `${JSON.stringify(value)} copied into ${filled.join(", ")}` });
+      }
+    } else if (span === 1) {
+      // A number, date or boolean over several rows, such as one total for two
+      // invoice lines. Copying it would count it twice.
+      if (!isEmpty(value) && last > m.top) {
+        problems.push({ range: m.address, reason: `covers ${height} rows; ${JSON.stringify(value)} is read into ${excelAddress(m.top, m.left)} only` });
+      }
+    } else if (m.left === 0 && m.right >= width - 1) {
+      // One cell across the whole table: a title, a section name or a footnote.
+      for (let r = m.top; r <= last; r++) skipRows.add(r);
+      const first = origin.r + m.top + 1;
+      const where = last > m.top ? `rows ${first}-${origin.r + last + 1}` : `row ${first}`;
+      // Text is skipped quietly; a number across the table (a grand total?) is reported.
+      const list = isLabel(value) || isEmpty(value) ? notes : problems;
+      list.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });
+    } else if (!isEmpty(value)) {
+      // Several columns but not the whole table: the value belongs to one of them,
+      // and only the user knows which. An empty merge, kept for layout, is left alone.
+      const size = height > 1 ? `${height} rows and ${span} columns` : `${span} columns`;
+      problems.push({ range: m.address, reason: `covers ${size}; ${JSON.stringify(value)} is read into ${excelAddress(m.top, m.left)} only` });
+    }
+  }
+  return { notes, problems, skipRows };
+}
+'''
+
+MD_TABLE = r'''// Reads an .xlsx file with a one-row header into records.
+// headerTop: index of the header row, counted from the first row of the stored
+// range (0 for most files). The header row must not be merged across columns.
+function readMergedTable(bytes, headerTop = 0) {
+  const { rows, merges, origin } = readXlsx(bytes);
+  const headerCell = (c) => XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });
+  const columns = (rows[headerTop] ?? []).map((name) => String(name).trim());
+  const width = columns.findLastIndex((name) => name !== "") + 1;
+  if (width === 0) {
+    const reason = "the header row has no column names; if the header is lower, pass its index as headerTop";
+    return { columns: [], records: [], notes: [], problems: [{ range: headerCell(0), reason }] };
+  }
+  const problems = [];
+  // A header cell merged across columns ("Q1" over C1:D1) means a header with two
+  // or more rows. This code reads one header row, so it reports the file instead.
+  for (const m of merges) {
+    if (m.top <= headerTop && m.bottom >= headerTop && m.right > m.left && m.left < width) {
+      problems.push({ range: m.address, reason: "header cell merged across columns; this code reads a one-row header only" });
+    }
+  }
+  if (problems.length > 0) return { columns: [], records: [], notes: [], problems };
+
+  const firstData = headerTop + 1;
+  const filled = fillMerges(rows, merges, firstData, width, origin);
+  problems.push(...filled.problems);
+  const isData = (r) => r >= firstData && !filled.skipRows.has(r) &&
+    !rows[r].slice(0, width).every(isEmpty);
+  columns.length = width;
+  columns.forEach((name, c) => {
+    if (name === "" && rows.some((row, r) => isData(r) && !isEmpty(row[c]))) {
+      problems.push({ range: headerCell(c), reason: "has data but no column name" });
+    }
+  });
+  const seen = new Set();
+  columns.forEach((name, c) => {
+    if (name === "") return;
+    // "Email" and "email" would become one field in most mappings: report it.
+    if (seen.has(name.toLowerCase())) {
+      problems.push({ range: headerCell(c), reason: `repeats the column name ${JSON.stringify(name)}` });
+    }
+    seen.add(name.toLowerCase());
+  });
+
+  const records = [];
+  rows.forEach((row, r) => {
+    if (!isData(r)) return;
+    // Object.fromEntries defines own properties, so a column named "__proto__" is safe.
+    // With a repeated name, the later column wins; the problem above says so.
+    const values = Object.fromEntries(
+      columns.flatMap((name, c) => (name ? [[name, row[c] ?? ""]] : [])));
+    records.push({ row: origin.r + r + 1, values }); // the row number the user sees in Excel
+  });
+  return { columns: columns.filter((name) => name !== ""), records, notes: filled.notes, problems };
+}
+'''
+
+MD_EXAMPLE = r'''let table;
+try {
+  table = readMergedTable(await file.arrayBuffer());
+} catch (error) {
+  // readXlsx throws a TypeError for a file that is not .xlsx,
+  // and SheetJS throws for a damaged one.
+  // Log the original error, so a bug in your own code is not mistaken for a bad file.
+  console.error(error);
+  const reason = "the file could not be read as .xlsx";
+  table = { columns: [], records: [], notes: [], problems: [{ range: null, reason }] };
+}
+const { columns, records, notes, problems } = table;
+
+records.map((r) => `${r.row}: ${r.values.Region}, ${r.values.Rep}`);
+// [ '2: North, Ana', '3: North, Bo', '4: North, Cy', '5: South, Di' ]
+notes.map((n) => `${n.range}: ${n.reason}`);
+// [ 'A2:A4: "North" copied into A3, A4',
+//   'A6:D6: row 6 skipped: "Note: amounts in EUR" spans the table' ]
+problems; // []
+'''
+
+MD_PROBLEMS = r'''// Invoices.xlsx: header Customer, Invoice, Line, Amount (A1:D1). Merged in the data:
+// "Acme" over A2:A3, 150 over D2:D3 (one amount for two lines),
+// and "Paid by card, see note" over B4:C4.
+problems.map((p) => `${p.range}: ${p.reason}`);
+// [ 'D2:D3: covers 2 rows; 150 is read into D2 only',
+//   'B4:C4: covers 2 columns; "Paid by card, see note" is read into B4 only' ]
+records[1].values; // { Customer: 'Acme', Invoice: 'INV-7', Line: 'Shipping', Amount: '' }
+'''
