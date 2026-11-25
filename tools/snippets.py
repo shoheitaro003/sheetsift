@@ -1608,6 +1608,7 @@ function readHeader(rows, merges, top, origin, maxRows = 3) {
     }
     parts.push(labels);
   }
+  const first = parts.findIndex((labels) => labels.length > 0); // first named column
   const width = parts.findLastIndex((labels) => labels.length > 0) + 1;
   if (width === 0) return fail(excelAddress(top, 0), "the header row has no column names; if the header is lower, pass its index as headerTop");
   parts.length = width;
@@ -1616,43 +1617,60 @@ function readHeader(rows, merges, top, origin, maxRows = 3) {
   const problems = [];
   for (const m of merges) {
     if (!isGroup(m) || m.top < top || m.top >= top + depth || m.left >= width) continue;
-    if (m.left === 0 && m.right >= width - 1 && width > 1) {
-      // A cell over every column is a title, not a group: it would start every name.
+    if (m.left <= first && m.right >= width - 1 && width - first > 1) {
+      // A cell over every named column is read as a title: it would start every name.
       problems.push({ range: m.address, reason: "spans the whole table, so it looks like a title; pass the row of the column names as headerTop" });
       continue;
     }
+    // Every column under a group label needs a name in some header row below it.
     for (let c = m.left; c <= Math.min(m.right, width - 1); c++) {
-      if (isEmpty(shown(m.bottom + 1, c))) {
+      let named = false;
+      for (let r = m.bottom + 1; r < top + depth; r++) named ||= !isEmpty(shown(r, c));
+      if (!named) {
         problems.push({ range: m.address, reason: `${JSON.stringify(valueAt(m.top, m.left))} has no column name under it in ${excelAddress(m.bottom + 1, c)}` });
       }
     }
   }
-  // Under the first header row, a name must sit under a group label (or be part of
-  // a merge). A value anywhere else, such as "Ana" in column A, means the merge
-  // above was only layout and this row is data.
-  const underGroup = (r, c) => merges.some((g) => isGroup(g) && g.left <= c && c <= g.right && g.bottom + 1 === r);
+  // Under the first header row, a value must be part of a merge, sit under a group
+  // label, or have only empty cells above it (a name aligned to the bottom row).
+  // A value under a plain label, such as "Ana" under "Name", means the merge that
+  // made this row part of the header is not a group label: it is a title or layout.
+  const labelAbove = (r, c) => {
+    for (let a = r - 1; a >= top; a--) if (!isEmpty(shown(a, c))) return a;
+    return -1;
+  };
   for (let r = top + 1; r < top + depth; r++) {
-    const c = [...Array(width).keys()].find((c) =>
-      !isEmpty(valueAt(r, c)) && !mergeAt(r, c) && !underGroup(r, c));
+    const c = [...Array(width).keys()].find((c) => {
+      const a = labelAbove(r, c);
+      return !isEmpty(valueAt(r, c)) && !mergeAt(r, c) && a >= 0 && !isGroup(mergeAt(a, c) ?? {});
+    });
     if (c === undefined) continue;
-    const cause = merges.find((g) => isGroup(g) && g.top < r && g.bottom + 1 >= r);
-    problems.push({ range: excelAddress(r, c), reason: `holds ${JSON.stringify(valueAt(r, c))}, which is under no group label; ${cause.address} would make row ${origin.r + r + 1} a header row, so that merge is probably layout over data` });
+    // A group label in the header made row r a header row, so one is always found.
+    const cause = merges.find((g) => isGroup(g) && g.top >= top && g.top < r &&
+      g.bottom + 1 >= r && g.left < width);
+    const a = labelAbove(r, c);
+    const value = JSON.stringify(valueAt(r, c));
+    const label = JSON.stringify(shown(a, c));
+    problems.push({ range: excelAddress(r, c), reason: `${value} is under ${label} (${excelAddress(a, c)}), not under a group label, yet ${cause.address} makes row ${origin.r + r + 1} a header row. ` +
+      `If ${cause.address} is a title, pass the row of the column names as headerTop; if it is layout, unmerge it; if ${value} is part of a name, type the whole name in one cell` });
   }
   if (problems.length > 0) return { depth: 0, columns: [], parts: [], problems };
   return { depth, columns: parts.map((labels) => labels.join(" ")), parts, problems };
 }
 '''
 
-MH_TABLE = r'''// Reads an .xlsx file whose header may have up to three rows into records.
+MH_TABLE = r'''// Reads an .xlsx file whose header may have up to maxRows rows into records.
 // headerTop: index of the first header row, counted from the first row of the
 // stored range (0 for most files).
-function readGroupedTable(bytes, headerTop = 0) {
+function readGroupedTable(bytes, headerTop = 0, maxRows = 3) {
   const { rows, merges, origin } = readXlsx(bytes);
-  const header = readHeader(rows, merges, headerTop, origin);
+  const header = readHeader(rows, merges, headerTop, origin, maxRows);
   if (header.problems.length > 0) return { columns: [], records: [], notes: [], problems: header.problems };
   const { columns, depth } = header;
   const width = columns.length;
-  const headerCell = (c) => XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });
+  // The header cells of column c, such as "D1:D2", for messages.
+  const headerCells = (c) => XLSX.utils.encode_range({
+    s: { r: origin.r + headerTop, c: origin.c + c }, e: { r: origin.r + headerTop + depth - 1, c: origin.c + c } });
 
   // Merges in the data: the same rules as for a one-row header.
   const firstData = headerTop + depth;
@@ -1664,13 +1682,13 @@ function readGroupedTable(bytes, headerTop = 0) {
   columns.forEach((name, c) => {
     if (name === "") {
       if (rows.some((row, r) => isData(r) && !isEmpty(row[c]))) {
-        problems.push({ range: headerCell(c), reason: "has data but no column name" });
+        problems.push({ range: headerCells(c), reason: "has data but no column name" });
       }
       return;
     }
     // Typed twice ("Q1" over two groups): the later column would overwrite the first.
     if (seen.has(name.toLowerCase())) {
-      problems.push({ range: headerCell(c), reason: `repeats the column name ${JSON.stringify(name)}` });
+      problems.push({ range: headerCells(c), reason: `repeats the column name ${JSON.stringify(name)}` });
     }
     seen.add(name.toLowerCase());
   });
@@ -1686,7 +1704,15 @@ function readGroupedTable(bytes, headerTop = 0) {
 }
 '''
 
-MH_EXAMPLE = r'''const { columns, records, notes, problems } = readGroupedTable(await file.arrayBuffer());
+MH_EXAMPLE = r'''let table;
+try {
+  table = readGroupedTable(await file.arrayBuffer());
+} catch (error) {
+  // readXlsx throws a TypeError for a file that is not .xlsx, and SheetJS throws for a damaged one.
+  console.error(error);
+  table = { columns: [], records: [], notes: [], problems: [{ range: null, reason: "the file could not be read as .xlsx" }] };
+}
+const { columns, records, notes, problems } = table;
 
 columns;
 // [ 'Region', 'Rep', 'Q1 Revenue', 'Q1 Cost', 'Q2 Revenue', 'Q2 Cost' ]
@@ -1696,7 +1722,8 @@ notes.map((n) => `${n.range}: ${n.reason}`); // [ 'A3:A4: "North" copied into A4
 problems; // []
 '''
 
-MH_PROBLEMS = r'''// Three files this code refuses, with no records:
+MH_PROBLEMS = r'''// title, hole and layout hold the bytes of three small .xlsx files
+// that this code refuses, with no records:
 // title: "Sales 2026" merged across A1:C1, above the column names in row 2.
 // hole: "Q1" across B1:C1, with "Revenue" in B2 and nothing in C2.
 // layout: "Note" merged across B1:C1 only to make room; row 2 is Ana's data.
@@ -1708,5 +1735,5 @@ readGroupedTable(title, 1).columns; // [ 'Name', 'Rep', 'City' ]
 reasons(readGroupedTable(hole));
 // [ 'B1:C1: "Q1" has no column name under it in C2' ]
 reasons(readGroupedTable(layout));
-// [ 'A2: holds "Ana", which is under no group label; B1:C1 would make row 2 a header row, so that merge is probably layout over data' ]
+// [ 'A2: "Ana" is under "Name" (A1), not under a group label, yet B1:C1 makes row 2 a header row. If B1:C1 is a title, pass the row of the column names as headerTop; if it is layout, unmerge it; if "Ana" is part of a name, type the whole name in one cell' ]
 '''

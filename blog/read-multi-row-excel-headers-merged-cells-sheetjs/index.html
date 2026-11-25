@@ -29,7 +29,7 @@
 <h1>Read multi-row Excel headers with merged cells in SheetJS</h1>
 <p class="meta"><time datetime="2026-11-25">2026-11-25</time></p>
 <p>A customer uploads a sales report whose header has two rows: "Q1" is merged across two columns, with "Revenue" and "Cost" under it. SheetJS reads the first row as the column names, so you get keys like <code>__EMPTY</code>, and the second header row arrives as a record.</p>
-<p>By the end of this post you will have <code>readGroupedTable(bytes)</code>: it finds how many rows the header has from its merged cells, names each column from top to bottom (<code>Q1 Revenue</code>, <code>Q1 Cost</code>), and refuses headers it would name wrongly, with the Excel address of the cell to fix. It builds on <code>readXlsx</code> and <code>fillMerges</code> from our post on <a href="../fill-merged-cells-excel-import-sheetjs/">filling merged cells</a>, which handles merges in the data rows. Every result quoted below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> (the tests named <code>mh:</code>) in Node 22 with SheetJS 0.20.3.</p>
+<p>By the end of this post you will have <code>readGroupedTable(bytes)</code>: it finds how many rows the header has from its merged cells, names each column from top to bottom (<code>Q1 Revenue</code>, <code>Q1 Cost</code>), and refuses headers it cannot name with confidence, with the Excel address of the cell to fix. The code is not self-contained: it adds two functions to the module from our post on <a href="../fill-merged-cells-excel-import-sheetjs/">filling merged cells</a> and uses its <code>readXlsx</code>, <code>fillMerges</code>, <code>isEmpty</code> and <code>isLabel</code>, which also handle merges in the data rows. Every result quoted below is checked by <a href="https://github.com/shoheitaro003/sheetsift/blob/main/tests/article-examples.cjs">our test file</a> (the tests named <code>mh:</code>) in Node 22 with SheetJS 0.20.3.</p>
 
 <h2>The problem</h2>
 <p>Here is the file. Each merged range is drawn as one cell:</p>
@@ -59,7 +59,7 @@ Object.keys(fromRow2[0]).join(&quot;, &quot;); // &#x27;__EMPTY, __EMPTY_1, Reve
 
 <h2>Step 1: read the header</h2>
 <p>The merges tell you the shape of the header. A label merged <em>across</em> columns is a <strong>group label</strong>: it says that the columns under it share a name, so the row under it must be part of the header too. A label merged <em>down</em>, like "Region" over A1:A2, just fills the header's height and counts once in the name. A merge with no value is layout, and is ignored.</p>
-<p>Add this function to the module from the previous post; it uses <code>isEmpty</code> and <code>isLabel</code> from there.</p>
+<p>Add this function to the module from the previous post.</p>
 <pre><code>// Reads a header that starts at row `top` and may have up to maxRows rows.
 // A cell merged across columns (&quot;Q1&quot; over C1:D1) is a group label, so the row
 // below it is part of the header too. Returns one name per column (&quot;Q1 Revenue&quot;),
@@ -103,6 +103,7 @@ function readHeader(rows, merges, top, origin, maxRows = 3) {
     }
     parts.push(labels);
   }
+  const first = parts.findIndex((labels) =&gt; labels.length &gt; 0); // first named column
   const width = parts.findLastIndex((labels) =&gt; labels.length &gt; 0) + 1;
   if (width === 0) return fail(excelAddress(top, 0), &quot;the header row has no column names; if the header is lower, pass its index as headerTop&quot;);
   parts.length = width;
@@ -111,27 +112,42 @@ function readHeader(rows, merges, top, origin, maxRows = 3) {
   const problems = [];
   for (const m of merges) {
     if (!isGroup(m) || m.top &lt; top || m.top &gt;= top + depth || m.left &gt;= width) continue;
-    if (m.left === 0 &amp;&amp; m.right &gt;= width - 1 &amp;&amp; width &gt; 1) {
-      // A cell over every column is a title, not a group: it would start every name.
+    if (m.left &lt;= first &amp;&amp; m.right &gt;= width - 1 &amp;&amp; width - first &gt; 1) {
+      // A cell over every named column is read as a title: it would start every name.
       problems.push({ range: m.address, reason: &quot;spans the whole table, so it looks like a title; pass the row of the column names as headerTop&quot; });
       continue;
     }
+    // Every column under a group label needs a name in some header row below it.
     for (let c = m.left; c &lt;= Math.min(m.right, width - 1); c++) {
-      if (isEmpty(shown(m.bottom + 1, c))) {
+      let named = false;
+      for (let r = m.bottom + 1; r &lt; top + depth; r++) named ||= !isEmpty(shown(r, c));
+      if (!named) {
         problems.push({ range: m.address, reason: `${JSON.stringify(valueAt(m.top, m.left))} has no column name under it in ${excelAddress(m.bottom + 1, c)}` });
       }
     }
   }
-  // Under the first header row, a name must sit under a group label (or be part of
-  // a merge). A value anywhere else, such as &quot;Ana&quot; in column A, means the merge
-  // above was only layout and this row is data.
-  const underGroup = (r, c) =&gt; merges.some((g) =&gt; isGroup(g) &amp;&amp; g.left &lt;= c &amp;&amp; c &lt;= g.right &amp;&amp; g.bottom + 1 === r);
+  // Under the first header row, a value must be part of a merge, sit under a group
+  // label, or have only empty cells above it (a name aligned to the bottom row).
+  // A value under a plain label, such as &quot;Ana&quot; under &quot;Name&quot;, means the merge that
+  // made this row part of the header is not a group label: it is a title or layout.
+  const labelAbove = (r, c) =&gt; {
+    for (let a = r - 1; a &gt;= top; a--) if (!isEmpty(shown(a, c))) return a;
+    return -1;
+  };
   for (let r = top + 1; r &lt; top + depth; r++) {
-    const c = [...Array(width).keys()].find((c) =&gt;
-      !isEmpty(valueAt(r, c)) &amp;&amp; !mergeAt(r, c) &amp;&amp; !underGroup(r, c));
+    const c = [...Array(width).keys()].find((c) =&gt; {
+      const a = labelAbove(r, c);
+      return !isEmpty(valueAt(r, c)) &amp;&amp; !mergeAt(r, c) &amp;&amp; a &gt;= 0 &amp;&amp; !isGroup(mergeAt(a, c) ?? {});
+    });
     if (c === undefined) continue;
-    const cause = merges.find((g) =&gt; isGroup(g) &amp;&amp; g.top &lt; r &amp;&amp; g.bottom + 1 &gt;= r);
-    problems.push({ range: excelAddress(r, c), reason: `holds ${JSON.stringify(valueAt(r, c))}, which is under no group label; ${cause.address} would make row ${origin.r + r + 1} a header row, so that merge is probably layout over data` });
+    // A group label in the header made row r a header row, so one is always found.
+    const cause = merges.find((g) =&gt; isGroup(g) &amp;&amp; g.top &gt;= top &amp;&amp; g.top &lt; r &amp;&amp;
+      g.bottom + 1 &gt;= r &amp;&amp; g.left &lt; width);
+    const a = labelAbove(r, c);
+    const value = JSON.stringify(valueAt(r, c));
+    const label = JSON.stringify(shown(a, c));
+    problems.push({ range: excelAddress(r, c), reason: `${value} is under ${label} (${excelAddress(a, c)}), not under a group label, yet ${cause.address} makes row ${origin.r + r + 1} a header row. ` +
+      `If ${cause.address} is a title, pass the row of the column names as headerTop; if it is layout, unmerge it; if ${value} is part of a name, type the whole name in one cell` });
   }
   if (problems.length &gt; 0) return { depth: 0, columns: [], parts: [], problems };
   return { depth, columns: parts.map((labels) =&gt; labels.join(&quot; &quot;)), parts, problems };
@@ -139,23 +155,25 @@ function readHeader(rows, merges, top, origin, maxRows = 3) {
 </code></pre>
 <p>What the three parts do, and why:</p>
 <ul>
-<li><strong>Counting rows.</strong> The header starts as one row. Each group label in it pulls in the row under it. If that row holds a group label too (a year over quarters), the next row comes in as well. The loop stops when nothing grows. More than <code>maxRows</code> (3) rows usually means a merge in the data, not a header, so it is refused.</li>
-<li><strong>Names.</strong> For each column, the code takes what Excel shows in each header row, from top to bottom, and joins the labels with a space. <code>parts</code> keeps the pieces (<code>["Q1", "Revenue"]</code>) if you prefer nested fields. A number used as a label, such as the year 2026, becomes text.</li>
-<li><strong>Checks.</strong> Three headers would give wrong names, so they are refused before any record is read (examples below): a merge over every column, which is a title, not a group; a group label with an empty cell under it; and a text value under no group label in a header row, which means a "group" was only a layout merge and that row is data.</li>
+<li><strong>Counting rows.</strong> The header starts as one row. Each group label in it pulls in the row under it. If that row holds a group label too (a year over quarters), the next row comes in as well. The loop stops when nothing grows. We cap the header at <code>maxRows</code> (3) rows, enough for year, quarter and measure, so that a stray merge in the data cannot swallow data rows into the header.</li>
+<li><strong>Names.</strong> For each column, the code takes what Excel shows in each header row, from top to bottom, and joins the labels with a space. <code>parts</code> keeps the pieces (<code>["Q1", "Revenue"]</code>): use them as the key if you build nested fields, because a joined name can clash with a one-row name such as <code>Q1 Revenue</code> (the duplicate check below reports that). A number used as a label, such as the year 2026, becomes text.</li>
+<li><strong>Checks.</strong> Three kinds of header would give wrong names, so they are refused before any record is read (examples in the next sections). A merge over every named column is read as a title. A column under a group label must have a name in a lower header row. And in a lower header row, a value may sit under a group label or under empty cells (a name aligned to the bottom row, like "Region" in A2 with A1 empty), but not under a plain label: "Ana" under "Name" means the merge that made this row part of the header is layout or a title, and the row is really data.</li>
 </ul>
 
 <h2>Step 2: read the table</h2>
 <p><code>readGroupedTable</code> reads the header, then handles the data the same way as the one-row version: <code>fillMerges</code> copies merged group labels such as "North" down and reports merges it should not guess about, and each data row becomes a record with the row number the user sees in Excel.</p>
-<pre><code>// Reads an .xlsx file whose header may have up to three rows into records.
+<pre><code>// Reads an .xlsx file whose header may have up to maxRows rows into records.
 // headerTop: index of the first header row, counted from the first row of the
 // stored range (0 for most files).
-function readGroupedTable(bytes, headerTop = 0) {
+function readGroupedTable(bytes, headerTop = 0, maxRows = 3) {
   const { rows, merges, origin } = readXlsx(bytes);
-  const header = readHeader(rows, merges, headerTop, origin);
+  const header = readHeader(rows, merges, headerTop, origin, maxRows);
   if (header.problems.length &gt; 0) return { columns: [], records: [], notes: [], problems: header.problems };
   const { columns, depth } = header;
   const width = columns.length;
-  const headerCell = (c) =&gt; XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });
+  // The header cells of column c, such as &quot;D1:D2&quot;, for messages.
+  const headerCells = (c) =&gt; XLSX.utils.encode_range({
+    s: { r: origin.r + headerTop, c: origin.c + c }, e: { r: origin.r + headerTop + depth - 1, c: origin.c + c } });
 
   // Merges in the data: the same rules as for a one-row header.
   const firstData = headerTop + depth;
@@ -167,13 +185,13 @@ function readGroupedTable(bytes, headerTop = 0) {
   columns.forEach((name, c) =&gt; {
     if (name === &quot;&quot;) {
       if (rows.some((row, r) =&gt; isData(r) &amp;&amp; !isEmpty(row[c]))) {
-        problems.push({ range: headerCell(c), reason: &quot;has data but no column name&quot; });
+        problems.push({ range: headerCells(c), reason: &quot;has data but no column name&quot; });
       }
       return;
     }
     // Typed twice (&quot;Q1&quot; over two groups): the later column would overwrite the first.
     if (seen.has(name.toLowerCase())) {
-      problems.push({ range: headerCell(c), reason: `repeats the column name ${JSON.stringify(name)}` });
+      problems.push({ range: headerCells(c), reason: `repeats the column name ${JSON.stringify(name)}` });
     }
     seen.add(name.toLowerCase());
   });
@@ -189,8 +207,16 @@ function readGroupedTable(bytes, headerTop = 0) {
 }
 </code></pre>
 <p>Merges that start in the header and run into the data, such as "Region" over A1:A3 in a two-row header, are reported by <code>fillMerges</code>. With a one-row header and no group labels, the result is the same as <code>readMergedTable</code> from the previous post (a test checks this).</p>
-<p>Here it is on the sales report. Wrap the call in the same <code>try</code>/<code>catch</code> as in the previous post, so a file that is not .xlsx becomes a problem too:</p>
-<pre><code>const { columns, records, notes, problems } = readGroupedTable(await file.arrayBuffer());
+<p>Here it is on the sales report, with a <code>try</code>/<code>catch</code> that turns a file that is not .xlsx into a problem too:</p>
+<pre><code>let table;
+try {
+  table = readGroupedTable(await file.arrayBuffer());
+} catch (error) {
+  // readXlsx throws a TypeError for a file that is not .xlsx, and SheetJS throws for a damaged one.
+  console.error(error);
+  table = { columns: [], records: [], notes: [], problems: [{ range: null, reason: &quot;the file could not be read as .xlsx&quot; }] };
+}
+const { columns, records, notes, problems } = table;
 
 columns;
 // [ &#x27;Region&#x27;, &#x27;Rep&#x27;, &#x27;Q1 Revenue&#x27;, &#x27;Q1 Cost&#x27;, &#x27;Q2 Revenue&#x27;, &#x27;Q2 Cost&#x27; ]
@@ -202,7 +228,8 @@ problems; // []
 <p>Each Revenue column now says which quarter it belongs to, so your mapping screen can offer <code>Q1 Revenue</code> as its own field.</p>
 
 <h2>Headers it refuses</h2>
-<pre><code>// Three files this code refuses, with no records:
+<pre><code>// title, hole and layout hold the bytes of three small .xlsx files
+// that this code refuses, with no records:
 // title: &quot;Sales 2026&quot; merged across A1:C1, above the column names in row 2.
 // hole: &quot;Q1&quot; across B1:C1, with &quot;Revenue&quot; in B2 and nothing in C2.
 // layout: &quot;Note&quot; merged across B1:C1 only to make room; row 2 is Ana&#x27;s data.
@@ -214,7 +241,7 @@ readGroupedTable(title, 1).columns; // [ &#x27;Name&#x27;, &#x27;Rep&#x27;, &#x2
 reasons(readGroupedTable(hole));
 // [ &#x27;B1:C1: &quot;Q1&quot; has no column name under it in C2&#x27; ]
 reasons(readGroupedTable(layout));
-// [ &#x27;A2: holds &quot;Ana&quot;, which is under no group label; B1:C1 would make row 2 a header row, so that merge is probably layout over data&#x27; ]
+// [ &#x27;A2: &quot;Ana&quot; is under &quot;Name&quot; (A1), not under a group label, yet B1:C1 makes row 2 a header row. If B1:C1 is a title, pass the row of the column names as headerTop; if it is layout, unmerge it; if &quot;Ana&quot; is part of a name, type the whole name in one cell&#x27; ]
 </code></pre>
 <p>Each message names the cell to fix:</p>
 <div class="table">
@@ -224,16 +251,21 @@ reasons(readGroupedTable(layout));
 <tr><td>A title merged across every column, above the names</td><td>It would start every column name ("Sales 2026 Name")</td><td>Pass the row of the names as <code>headerTop</code>, here 1. Our post on <a href="../detect-header-row-spreadsheet-javascript/">finding the header row</a> finds it</td></tr>
 <tr><td>A group label with an empty cell under it</td><td>That column's name would be just "Q1"</td><td>Type the missing name, or unmerge the label</td></tr>
 <tr><td>A merge across a one-row header, with data below</td><td>The first data row would be read as names ("Note hi")</td><td>Unmerge the cell and name each column</td></tr>
-<tr><td>A header of more than three rows</td><td>Usually a merge in the data, not a header</td><td>Check the merges; pass a larger <code>maxRows</code> to <code>readHeader</code> if the header is real</td></tr>
+<tr><td>A label over one column with a name under it ("Q2" in D1 over "Revenue" in D2), next to a real group</td><td>It cannot be told apart from a column name over data</td><td>Type the whole name in one cell ("Q2 Revenue")</td></tr>
+<tr><td>A header of more than three rows</td><td>Over our limit</td><td>Check the merges; pass a larger <code>maxRows</code> as the third argument of <code>readGroupedTable</code> if the header is real</td></tr>
 </tbody>
 </table>
 </div>
-<p>Two more problems come back with the records, as in the one-row version: a name used twice, ignoring case (the same group label typed over two groups gives two "Q1 Revenue" columns), and a column with data but no name.</p>
+<p>Two more problems come back with the records, as in the one-row version: a name used twice, ignoring case (the same group label typed over two groups gives two "Q1 Revenue" columns), and a column with data but no name. Both point at the column's header cells, such as <code>D1:D2</code>.</p>
 
 <h2>What this does not cover</h2>
 <ul>
 <li><strong>Group labels typed once without a merge.</strong> If "Q1" is in C1 and D1 is just empty, there is no merge to read, so the header is one row. Filling "Q1" to the right would be a guess; ask the user to merge or repeat the label.</li>
 <li><strong>A layout merge over text data in every column it covers.</strong> If an <code>Id</code> column is merged down and "Contact" is merged over two text columns for looks, the first data row is read as names ("Contact Ana"). Show the column names in your preview so the user can catch it.</li>
+<li><strong>A real group over every column.</strong> "Contact" over First, Last and Email in a three-column table is refused as a title. Passing <code>headerTop</code> 1 reads the names without "Contact".</li>
+<li><strong>A title over only some columns.</strong> "Sales 2026" merged over A1:C1 above four names is read as a group label, so the names start with it ("Sales 2026 Name"), with no problem reported. If you know where the names are, pass <code>headerTop</code>; either way, show the column names in your preview.</li>
+<li><strong>Data right of the last named column</strong> is not read, and no problem is reported, as in the previous post.</li>
+<li><strong>Group labels stored as dates.</strong> A month label such as "Jan 2026" is stored as a number with a date format, so it arrives as <code>46023</code> and the names become <code>46023 Revenue</code>. Convert it as in our post on <a href="../read-excel-dates-javascript-sheetjs/">reading Excel dates</a>, or ask the user to type the label as text.</li>
 <li><strong>Notes beside the table.</strong> A note merged across two cells to the right of the header row is taken for a group label, so the file is refused with problems that point at the note. Ask the user to delete it.</li>
 <li><strong>CSV and .xls files</strong>, other sheets and hidden rows, as in the previous post.</li>
 </ul>

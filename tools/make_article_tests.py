@@ -1832,7 +1832,7 @@ ok("mh: refused headers and name checks", () => {
   assert.deepStrictEqual(text(two.problems), ['B1:D1: "Q1" has no column name under it in B2', 'B1:D1: "Q1" has no column name under it in C2']);
   // A layout merge over data with only numbers under it: still caught by the text in column A.
   assert.deepStrictEqual(text(readGroupedTable(layout).problems),
-    ['A2: holds "Ana", which is under no group label; B1:C1 would make row 2 a header row, so that merge is probably layout over data']);
+    ['A2: "Ana" is under "Name" (A1), not under a group label, yet B1:C1 makes row 2 a header row. If B1:C1 is a title, pass the row of the column names as headerTop; if it is layout, unmerge it; if "Ana" is part of a name, type the whole name in one cell']);
   // Limit stated in the post: a layout merge over all-text data in grouped columns only is read as a header.
   const fooled = readGroupedTable(book([["Contact", n], ["Ana", "a@b.co"], ["Bo", "b@c.co"]], ["A1:B1"]));
   assert.strictEqual(fooled.problems.length, 1); // over the whole table: reported as a title
@@ -1840,14 +1840,14 @@ ok("mh: refused headers and name checks", () => {
   assert.deepStrictEqual(fooled2.columns, ["Id", "Contact Ana", "Contact a@b.co"]);
   // Limit stated in the post: a merged note right of the header is taken for a group label; the file is refused.
   const note = readGroupedTable(book([["Name", "Email", n, "see notes", n], ["Ana", "a@b.co", n, n, n]], ["D1:E1"]));
-  assert.deepStrictEqual(text(note.problems).map((p) => p.slice(0, 6)), ["D1:E1:", "D1:E1:", "A2: ho"]);
+  assert.deepStrictEqual(text(note.problems).map((p) => p.slice(0, 6)), ["D1:E1:", "D1:E1:", 'A2: "A']);
   assert.deepStrictEqual(note.records, []);
   // The same group typed twice gives a repeated name.
   const twice = readGroupedTable(book([["Q1", n, "Q1", n], ["Revenue", "Cost", "Revenue", "Cost"], [1, 2, 3, 4]], ["A1:B1", "C1:D1"]));
-  assert.deepStrictEqual(text(twice.problems), ['C1: repeats the column name "Q1 Revenue"', 'D1: repeats the column name "Q1 Cost"']);
+  assert.deepStrictEqual(text(twice.problems), ['C1:C2: repeats the column name "Q1 Revenue"', 'D1:D2: repeats the column name "Q1 Cost"']);
   // A column with data but no name anywhere in the header.
   const unnamed = readGroupedTable(book([["Name", n, "Q1", n], [n, n, "Revenue", "Cost"], ["Ana", "x", 1, 2]], ["A1:A2", "C1:D1"]));
-  assert.deepStrictEqual(text(unnamed.problems), ["B1: has data but no column name"]);
+  assert.deepStrictEqual(text(unnamed.problems), ["B1:B2: has data but no column name"]);
   assert.deepStrictEqual(unnamed.columns, ["Name", "Q1 Revenue", "Q1 Cost"]);
   // A title above the header: refused at headerTop 0, read at headerTop 1.
   assert.deepStrictEqual(readGroupedTable(title, 1).records, [{ row: 3, values: { Name: "Ana", Rep: "x", City: "y" } }]);
@@ -1856,6 +1856,54 @@ ok("mh: refused headers and name checks", () => {
   // A column called __proto__ is an own property.
   const proto = readGroupedTable(book([["__proto__", "Q1", n], [n, "a", "b"], ["x", 1, 2]], ["A1:A2", "B1:C1"]));
   assert.strictEqual(Object.getOwnPropertyDescriptor(proto.records[0].values, "__proto__").value, "x");
+});
+ok("mh: review fixes: titles left of the table, narrow titles, real groups over all columns, dates", () => {
+  // A title over B1:D1 when the stored range starts at an empty column A: still a title.
+  const shifted = readGroupedTable(book([[n, "Sales 2026", n, n], [n, "Name", "Rep", "City"], [n, "Ana", "x", "y"]], ["B1:D1"]));
+  assert.deepStrictEqual(text(shifted.problems), ["B1:D1: spans the whole table, so it looks like a title; pass the row of the column names as headerTop"]);
+  // Limit stated in the post: a title over only some columns is read as a group label.
+  const narrow = readGroupedTable(book([["Sales 2026", n, n, n], ["Name", "Rep", "City", "Zip"], ["Ana", "x", "y", "z"]], ["A1:C1"]));
+  assert.deepStrictEqual([narrow.columns, narrow.problems], [["Sales 2026 Name", "Sales 2026 Rep", "Sales 2026 City", "Zip"], []]);
+  assert.deepStrictEqual(readGroupedTable(book([["Sales 2026", n, n, n], ["Name", "Rep", "City", "Zip"], ["Ana", "x", "y", "z"]], ["A1:C1"]), 1).columns, ["Name", "Rep", "City", "Zip"]);
+  // A name aligned to the bottom header row, with nothing above it: accepted.
+  const bottom = readGroupedTable(book([[n, "Q1", n], ["Region", "Revenue", "Cost"], ["North", 1, 2]], ["B1:C1"]));
+  assert.deepStrictEqual([bottom.columns, bottom.problems], [["Region", "Q1 Revenue", "Q1 Cost"], []]);
+  // Three rows with a gap under the year: "2026 Total". An empty column under the year is still refused.
+  const gapHole = readGroupedTable(book([["Region", "2026", n, n], [n, "Q1", n, n], [n, "Revenue", "Cost", n], ["North", 1, 2, 3]], ["A1:A3", "B1:D1", "B2:C2"]));
+  assert.deepStrictEqual(text(gapHole.problems), ['B1:D1: "2026" has no column name under it in D2']);
+  const gap = readGroupedTable(book([["Region", "2026", n, n], [n, "Q1", n, n], [n, "Revenue", "Cost", "Total"], ["North", 1, 2, 3]], ["A1:A3", "B1:D1", "B2:C2"]));
+  assert.deepStrictEqual([gap.columns, gap.problems], [["Region", "2026 Q1 Revenue", "2026 Q1 Cost", "2026 Total"], []]);
+  // Limit stated in the post: a label over one column with a name under it is refused (it looks like a name over data).
+  const single = readGroupedTable(book([["Region", "Q1", n, "Q2"], [n, "Revenue", "Cost", "Revenue"], ["North", 1, 2, 3]], ["A1:A2", "B1:C1"]));
+  assert.deepStrictEqual(text(single.problems), ['D2: "Revenue" is under "Q2" (D1), not under a group label, yet B1:C1 makes row 2 a header row. If B1:C1 is a title, pass the row of the column names as headerTop; if it is layout, unmerge it; if "Revenue" is part of a name, type the whole name in one cell']);
+  // maxRows can be passed to readGroupedTable.
+  const four = book([["A", "G", n], [n, "H", n], [n, "I", n], [n, "x", "y"], ["v", 1, 2]], ["A1:A4", "B1:C1", "B2:C2", "B3:C3"]);
+  assert.strictEqual(readGroupedTable(four).problems.length, 1);
+  assert.deepStrictEqual(readGroupedTable(four, 0, 4).columns, ["A", "G H I x", "G H I y"]);
+  // Limit stated in the post: data right of the last named column is ignored without a problem.
+  const right = readGroupedTable(book([["Name", "Q1", n, n], [n, "a", "b", n], ["Ana", 1, 2, "extra"]], ["A1:A2", "B1:C1"]));
+  assert.deepStrictEqual([right.columns, right.problems, Object.keys(right.records[0].values)], [["Name", "Q1 a", "Q1 b"], [], ["Name", "Q1 a", "Q1 b"]]);
+  // Limit stated in the post: a real group over every column is refused like a title.
+  const contact = readGroupedTable(book([["Contact", n, n], ["First", "Last", "Email"], ["Ana", "Lee", "a@b.co"]], ["A1:C1"]));
+  assert.strictEqual(contact.problems[0].range, "A1:C1");
+  assert.deepStrictEqual(readGroupedTable(book([["Contact", n, n], ["First", "Last", "Email"], ["Ana", "Lee", "a@b.co"]], ["A1:C1"]), 1).columns, ["First", "Last", "Email"]);
+  // Limit stated in the post: a group label stored as a date arrives as its serial number.
+  // (Excel stores a date as a number with a date format: 46023 is 2026-01-01.)
+  const datedSheet = XLSX.utils.aoa_to_sheet([["Name", n, n], [n, "Revenue", "Cost"], ["Ana", 1, 2]]);
+  datedSheet.B1 = { t: "n", v: 46023, z: "mmm yyyy" };
+  datedSheet["!merges"] = ["A1:A2", "B1:C1"].map((a) => XLSX.utils.decode_range(a));
+  const datedBook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(datedBook, datedSheet, "S");
+  const datedBytes = XLSX.write(datedBook, { type: "buffer", bookType: "xlsx" });
+  assert.strictEqual(XLSX.read(datedBytes).Sheets.S.B1.w, "Jan 2026");
+  const dated = readGroupedTable(datedBytes);
+  assert.deepStrictEqual(dated.columns, ["Name", "46023 Revenue", "46023 Cost"]);
+  // The cause named in a message is a group in the header, not a title above headerTop.
+  const above = readGroupedTable(book([["Report", n, n], ["Name", "Note", n], ["Ana", "hi", 5]], ["A1:C1", "B2:C2"]), 1);
+  assert.deepStrictEqual(above.problems.map((p) => p.reason.includes("B2:C2")), [true]);
+  // A number under a plain label in a header row is refused too.
+  const num = readGroupedTable(book([["Id", "Note", n], [7, "hi", "x"]], ["B1:C1"]));
+  assert.deepStrictEqual(num.problems.map((p) => p.range), ["A2"]);
 });
 ok("mh: a sheet that does not start at A1 keeps Excel addresses and row numbers", () => {
   const rows = [["Region", "Q1", n], [n, "Revenue", "Cost"], ["North", 1, 2], [n, 3, 4]];
