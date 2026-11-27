@@ -2828,332 +2828,195 @@ const fs = require("fs");
 const path = require("path");
 const util = require("util");
 
-const isEmpty = (value) => String(value ?? "").trim() === "";
-const isLabel = (value) => typeof value === "string" && value.trim() !== "";
+const hasText = (value) => String(value ?? "").trim() !== "";
+// Line breaks typed with Alt+Enter and runs of spaces become one space.
+const tidy = (value) => String(value).replace(/\s+/g, " ").trim();
 
-// Reads the first sheet of an .xlsx file.
-// rows: one array of cells per row. merges: the merged ranges.
-// Both count from 0 at the first cell of the sheet's stored range (origin).
-function readXlsx(bytes) {
-  const data = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;
-  // An .xlsx file is a zip archive, and zip archives start with the bytes "PK".
-  if (data[0] !== 0x50 || data[1] !== 0x4b) throw new TypeError("not an .xlsx file");
-  const workbook = XLSX.read(data);
+// Reads the first sheet. rows: one array of cells per row. merges: the merged
+// ranges. Both count from 0 at the start of the sheet's range (its "!ref").
+function readSheet(bytes) {
+  const workbook = XLSX.read(bytes);
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   if (!sheet?.["!ref"]) return { rows: [], merges: [], origin: { r: 0, c: 0 } };
   const origin = XLSX.utils.decode_range(sheet["!ref"]).s;
   const rows = XLSX.utils.sheet_to_json(sheet, {
-    header: 1, defval: "", blankrows: true, raw: true });
+    header: 1, defval: null, blankrows: true, raw: true });
   const merges = (sheet["!merges"] ?? []).map((m) => ({
-    address: XLSX.utils.encode_range(m), // "A2:A4", for messages
+    address: XLSX.utils.encode_range(m), // "C1:D1", for messages
     top: m.s.r - origin.r, bottom: m.e.r - origin.r,
     left: m.s.c - origin.c, right: m.e.c - origin.c,
   }));
   return { rows, merges, origin };
 }
 
-// Fills the merges in the data that are safe to fill; reports the others.
-// Changes rows in place. firstData: index of the first row under the header.
-// width: number of columns in the table.
-function fillMerges(rows, merges, firstData, width, origin) {
-  const notes = [];
-  const problems = [];
-  const skipRows = new Set();
-  const excelAddress = (r, c) => XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });
-  // Only the table's columns count: a stray comment further right does not make a row data.
-  const blank = (row) => row.slice(0, width).every(isEmpty);
-  for (const m of merges) {
-    if (m.bottom < firstData) continue; // in or above the header row
-    if (m.top >= rows.length) continue;  // below the last row: nothing to read
-    if (m.left >= width) continue;       // right of the table, such as a logo box
-    if (m.top < firstData) {
-      // A header cell merged down into the data. Harmless only if those rows are empty.
-      const into = rows.slice(firstData, m.bottom + 1);
-      if (!into.every(blank)) {
-        const reason = "runs from the header into the data; the header may have two rows";
-        problems.push({ range: m.address, reason });
-      }
-      continue;
-    }
-    const value = rows[m.top][m.left];
-    const last = Math.min(m.bottom, rows.length - 1);
-    // The user sees only the first cell's value. A value stored in another cell of
-    // the range is hidden in Excel, so it is reported and not imported.
-    for (let r = m.top; r <= last; r++) {
-      for (let c = m.left; c <= m.right; c++) {
-        if ((r === m.top && c === m.left) || isEmpty(rows[r][c])) continue;
-        problems.push({ range: m.address, reason: `hides ${JSON.stringify(rows[r][c])} in ${excelAddress(r, c)}` });
-        rows[r][c] = "";
-      }
-    }
-    const height = last - m.top + 1; // rows that exist, if the merge runs past the end
-    const span = m.right - m.left + 1;
-    if (span === 1 && isLabel(value)) {
-      // Text in one column over several rows: a group label. Copy it down, except
-      // into rows that are empty in the file (those are skipped, not imported).
-      const filled = [];
-      for (let r = m.top + 1; r <= last; r++) {
-        if (blank(rows[r])) continue;
-        rows[r][m.left] = value;
-        filled.push(excelAddress(r, m.left));
-      }
-      if (filled.length > 0) {
-        notes.push({ range: m.address, reason: `${JSON.stringify(value)} copied into ${filled.join(", ")}` });
-      }
-    } else if (span === 1) {
-      // A number, date or boolean over several rows, such as one total for two
-      // invoice lines. Copying it would count it twice.
-      if (!isEmpty(value) && last > m.top) {
-        problems.push({ range: m.address, reason: `covers ${height} rows; ${JSON.stringify(value)} is read into ${excelAddress(m.top, m.left)} only` });
-      }
-    } else if (m.left === 0 && m.right >= width - 1) {
-      // One cell across the whole table: a title, a section name or a footnote.
-      for (let r = m.top; r <= last; r++) skipRows.add(r);
-      const first = origin.r + m.top + 1;
-      const where = last > m.top ? `rows ${first}-${origin.r + last + 1}` : `row ${first}`;
-      // Text is skipped quietly; a number across the table (a grand total?) is reported.
-      const list = isLabel(value) || isEmpty(value) ? notes : problems;
-      list.push({ range: m.address, reason: `${where} skipped: ${JSON.stringify(value)} spans the table` });
-    } else if (!isEmpty(value)) {
-      // Several columns but not the whole table: the value belongs to one of them,
-      // and only the user knows which. An empty merge, kept for layout, is left alone.
-      const size = height > 1 ? `${height} rows and ${span} columns` : `${span} columns`;
-      problems.push({ range: m.address, reason: `covers ${size}; ${JSON.stringify(value)} is read into ${excelAddress(m.top, m.left)} only` });
-    }
+// The text of a merge (in its top-left cell). A merge can lie outside the
+// sheet's range, so the row may not exist.
+const mergeText = (rows, m) => rows[m.top]?.[m.left];
+// A group label: a merge with text across two or more columns.
+const isGroupLabel = (rows, m) => m.right > m.left && hasText(mergeText(rows, m));
+
+// Finds the header rows. headerRow is the Excel row number of its first row.
+// Returns { top, end } (row indexes; end is the first row after the header)
+// or { problem }.
+function findHeaderRows(sheet, { headerRow = sheet.origin.r + 1, maxRows = 3 } = {}) {
+  const { rows, merges, origin } = sheet;
+  const top = headerRow - 1 - origin.r;
+  const label = (m) => `"${tidy(mergeText(rows, m))}" (${m.address})`;
+  const problem = (range, reason, hint) => ({ problem: { range, reason, hint } });
+  if (top < 0 || top >= rows.length) return problem(null, `row ${headerRow} is outside the sheet`);
+  if (!rows[top].some(hasText)) return problem(null, `row ${headerRow} is empty`,
+    "pass headerRow: the Excel row number of the column names");
+
+  // Each group label needs a row of names under it: grow the header until
+  // every group label that starts in it has one.
+  let end = top + 1;
+  for (;;) {
+    const groups = merges.filter((m) => isGroupLabel(rows, m) && m.top >= top && m.top < end);
+    const needed = Math.max(end, ...groups.map((m) => m.bottom + 2));
+    if (needed === end) break;
+    end = needed;
   }
-  return { notes, problems, skipRows };
+  const lastRow = headerRow + (end - top) - 1;
+  if (end > rows.length) return problem(null,
+    `the header (rows ${headerRow}-${lastRow}) runs past the end of the sheet`);
+
+  // A title: a group label in the first row over every column that has a label.
+  const labelled = (c) => {
+    for (let r = top; r < end; r++) {
+      if (hasText(rows[r]?.[c])) return true;
+    }
+    return merges.some((m) => hasText(mergeText(rows, m)) && m.left <= c && c <= m.right &&
+      m.top < end && m.bottom >= top);
+  };
+  const width = Math.max(...rows.slice(top, end).map((row) => row.length));
+  const named = [];
+  for (let c = 0; c < width; c++) if (labelled(c)) named.push(c);
+  const title = merges.find((m) => isGroupLabel(rows, m) && m.top === top &&
+    named.length > 1 && m.left <= named[0] && m.right >= named.at(-1));
+  if (title) {
+    const next = rows.findIndex((row, r) => r > title.bottom && row.some(hasText));
+    return problem(title.address, `${label(title)} spans every column, so it looks like a title`,
+      next < 0 ? undefined : `pass headerRow: ${next + origin.r + 1} if the names start there`);
+  }
+  if (end - top > maxRows) return problem(null,
+    `the merges make a header of ${end - top} rows; the limit is ${maxRows}`,
+    "check the merges, or pass a larger maxRows if the header is real");
+
+  // A labelled merge that starts above the header or reaches below it.
+  const crossing = merges.find((m) => hasText(mergeText(rows, m)) &&
+    m.bottom >= top && m.top < end &&       // it touches the header
+    (m.top < top || m.bottom >= end));      // and goes past its edge
+  if (crossing) return problem(crossing.address,
+    `${label(crossing)} crosses the edge of the header (rows ${headerRow}-${lastRow})`,
+    `merge it over rows ${headerRow}-${lastRow} only, or unmerge it`);
+  return { top, end, headerRow, lastRow };
 }
 
-// Reads an .xlsx file with a one-row header into records.
-// headerTop: index of the header row, counted from the first row of the stored
-// range (0 for most files). The header row must not be merged across columns.
-function readMergedTable(bytes, headerTop = 0) {
-  const { rows, merges, origin } = readXlsx(bytes);
-  const headerCell = (c) => XLSX.utils.encode_cell({ r: origin.r + headerTop, c: origin.c + c });
-  const columns = (rows[headerTop] ?? []).map((name) => String(name).trim());
-  const width = columns.findLastIndex((name) => name !== "") + 1;
-  if (width === 0) {
-    const reason = "the header row has no column names; if the header is lower, pass its index as headerTop";
-    return { columns: [], records: [], notes: [], problems: [{ range: headerCell(0), reason }] };
-  }
-  const problems = [];
-  // A header cell merged across columns ("Q1" over C1:D1) means a header with two
-  // or more rows. This code reads one header row, so it reports the file instead.
-  for (const m of merges) {
-    if (m.top <= headerTop && m.bottom >= headerTop && m.right > m.left && m.left < width) {
-      problems.push({ range: m.address, reason: "header cell merged across columns; this code reads a one-row header only" });
-    }
-  }
-  if (problems.length > 0) return { columns: [], records: [], notes: [], problems };
+// Names each column from the header rows, top to bottom: "Q1" over "Revenue"
+// gives "Q1 Revenue". Returns { columns, end } or { problems }.
+function readHeader(sheet, options) {
+  const { rows, merges, origin } = sheet;
+  const found = findHeaderRows(sheet, options);
+  if (found.problem) return { problems: [found.problem] };
+  const { top, end } = found;
+  const cellAt = (r, c) => XLSX.utils.encode_cell({ r: r + origin.r, c: c + origin.c });
+  const mergeAt = (r, c) =>
+    merges.find((m) => r >= m.top && r <= m.bottom && c >= m.left && c <= m.right);
+  // What Excel shows: a merge shows the value of its top-left cell.
+  const shown = (r, c) => {
+    const m = mergeAt(r, c);
+    return m ? mergeText(rows, m) : rows[r][c];
+  };
+  const headerRows = [];
+  for (let r = top; r < end; r++) headerRows.push(r);
+  const groups = merges.filter((m) => isGroupLabel(rows, m) && m.top >= top && m.top < end);
+  const width = Math.max(...headerRows.map((r) => rows[r].length));
 
-  const firstData = headerTop + 1;
-  const filled = fillMerges(rows, merges, firstData, width, origin);
-  problems.push(...filled.problems);
-  const isData = (r) => r >= firstData && !filled.skipRows.has(r) &&
-    !rows[r].slice(0, width).every(isEmpty);
-  columns.length = width;
-  columns.forEach((name, c) => {
-    if (name === "" && rows.some((row, r) => isData(r) && !isEmpty(row[c]))) {
-      problems.push({ range: headerCell(c), reason: "has data but no column name" });
-    }
-  });
-  const seen = new Set();
-  columns.forEach((name, c) => {
-    if (name === "") return;
-    // "Email" and "email" would become one field in most mappings: report it.
-    if (seen.has(name.toLowerCase())) {
-      problems.push({ range: headerCell(c), reason: `repeats the column name ${JSON.stringify(name)}` });
-    }
-    seen.add(name.toLowerCase());
-  });
-
-  const records = [];
-  rows.forEach((row, r) => {
-    if (!isData(r)) return;
-    // Object.fromEntries defines own properties, so a column named "__proto__" is safe.
-    // With a repeated name, the later column wins; the problem above says so.
-    const values = Object.fromEntries(
-      columns.flatMap((name, c) => (name ? [[name, row[c] ?? ""]] : [])));
-    records.push({ row: origin.r + r + 1, values }); // the row number the user sees in Excel
-  });
-  return { columns: columns.filter((name) => name !== ""), records, notes: filled.notes, problems };
-}
-
-// The header starts as one row. Each group label in it needs one row of names
-// under it; if that row holds a group label too (a year over quarters), one more.
-function countHeaderRows(merges, top, isGroup) {
-  let depth = 1;
-  for (let grown = true; grown; ) {
-    grown = false;
-    for (const m of merges) {
-      if (!isGroup(m) || m.top < top || m.top >= top + depth) continue;
-      const needed = m.bottom - top + 2; // the label's rows plus one row of names
-      if (needed > depth) { depth = needed; grown = true; }
-    }
-  }
-  return depth;
-}
-
-// Returns the problems that would give wrong column names.
-function checkHeader({ headerRows, width, groups, valueAt, mergeAt, label, isGroup, excelAddress, origin }) {
-  const problems = [];
-  const named = [...Array(width).keys()].filter((c) => headerRows.some((r) => label(r, c) !== ""));
-  for (const g of groups) {
-    const text = JSON.stringify(label(g.top, g.left));
-    // Over every named column, it would start every name: read it as a title.
-    if (named.length > 1 && g.left <= named[0] && g.right >= named.at(-1)) {
-      problems.push({ range: g.address, reason: `${text} spans the whole table, so it looks like a title`,
-        hint: "pass the row index of the column names as headerTop" });
-      continue;
-    }
-    // Every column under a group label needs a name in a header row below it.
-    for (let c = g.left; c <= Math.min(g.right, width - 1); c++) {
-      if (headerRows.some((r) => r > g.bottom && label(r, c) !== "")) continue;
-      problems.push({ range: g.address, reason: `${text} has no column name under it in ${excelAddress(g.bottom + 1, c)}`,
-        hint: "type the missing name, or unmerge the label" });
-    }
-  }
-  // A plain label is a header value that is not a group label. A value under a
-  // plain label ("Ana" under "Name") means the row is data, pulled into the header
-  // by a merge that is a title or layout.
-  for (const r of headerRows.slice(1)) {
-    const cause = groups.find((g) => g.top < r && g.bottom + 1 >= r)?.address ?? "a merge above it";
-    const row = origin.r + r + 1;
-    for (let c = 0; c < width; c++) {
-      if (isEmpty(valueAt(r, c)) || mergeAt(r, c)) continue;
-      const above = headerRows.filter((a) => a < r && label(a, c) !== "").at(-1);
-      if (above === undefined || isGroup(mergeAt(above, c))) continue;
-      problems.push({ range: excelAddress(r, c),
-        reason: `${JSON.stringify(valueAt(r, c))} is under the plain label ${JSON.stringify(label(above, c))} (${excelAddress(above, c)}), so row ${row} looks like data`,
-        hint: `${cause} made row ${row} part of the header. Unmerge it if it is layout; pass headerTop if it is a title; type one name in one cell if both cells are one name` });
-    }
-  }
-  return problems;
-}
-
-// Reads a header that starts at row index `top` and may have up to maxRows rows.
-// A cell merged across columns ("Q1" over C1:D1) is a group label, so the row
-// below it is part of the header too. Returns one name per column ("Q1 Revenue"),
-// the parts of each name (["Q1", "Revenue"]), the number of header rows, notes and
-// problems. If any problem has refuse: true, the header was not read.
-function readHeader(rows, merges, top, origin, maxRows = 3) {
-  const excelAddress = (r, c) => XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });
-  const valueAt = (r, c) => rows[r]?.[c] ?? "";
-  const mergeAt = (r, c) => merges.find((m) => m.top <= r && r <= m.bottom && m.left <= c && c <= m.right);
-  // What Excel shows in a cell: for any cell of a merge, the first cell's value.
-  const shown = (r, c) => { const m = mergeAt(r, c); return m ? valueAt(m.top, m.left) : valueAt(r, c); };
-  // Line breaks (Alt+Enter) and double spaces inside a label become one space.
-  const label = (r, c) => String(shown(r, c)).replace(/\s+/g, " ").trim();
-  // A group label: a merge across columns with a value. An empty merge is layout.
-  const isGroup = (m) => m !== undefined && m.right > m.left && !isEmpty(valueAt(m.top, m.left));
-  const refuse = (list) => ({ depth: 0, columns: [], parts: [], notes: [], problems: list.map((p) => ({ ...p, refuse: true })) });
-  const start = excelAddress(Math.min(top, Math.max(rows.length - 1, 0)), 0);
-  if (top >= rows.length) return refuse([{ range: start, reason: `headerTop ${top} is past the last row of the sheet` }]);
-
-  const depth = countHeaderRows(merges, top, isGroup);
-  if (depth > maxRows) return refuse([{ range: start, reason: `the header would have ${depth} rows; this code reads at most ${maxRows}` }]);
-  // The file ends inside the header, such as a group label in its last row.
-  if (top + depth > rows.length) return refuse([{ range: start, reason: `no data rows under the ${depth}-row header` }]);
-  const headerRows = [...Array(depth).keys()].map((i) => top + i);
-
-  // Names: the labels of each column from top to bottom, joined with a space.
-  // A label merged down ("Region" over A1:A2) counts once.
-  const labelsOf = (c) => {
-    const labels = [];
-    let previous;
+  const columns = [], problems = [];
+  for (let c = 0; c < width; c++) {
+    const parts = [];
+    let lastMerge = null;  // a merge counts once, however many rows it covers
+    let plainLabel = null; // the last label above that is not a group label
     for (const r of headerRows) {
       const m = mergeAt(r, c);
-      if (m !== undefined && m === previous) continue;
-      previous = m;
-      if (label(r, c) !== "") labels.push(label(r, c));
+      if (m && m === lastMerge) continue;
+      lastMerge = m;
+      const value = shown(r, c);
+      if (!hasText(value)) continue;
+      // Text under a plain label is a data row that a merge pulled into the header.
+      if (plainLabel !== null) problems.push({ range: cellAt(r, c),
+        reason: `"${tidy(value)}" is under "${tidy(plainLabel)}", ` +
+          `which is not a group label, so row ${r + origin.r + 1} looks like data`,
+        hint: "unmerge cells that are only layout, or type the full name in one cell" });
+      if (!groups.includes(m)) plainLabel = value;
+      parts.push(tidy(value));
     }
-    return labels;
-  };
-  const lastColumn = Math.max(0, ...headerRows.map((r) => rows[r]?.length ?? 0));
-  const parts = [...Array(lastColumn).keys()].map(labelsOf);
-  const width = parts.findLastIndex((labels) => labels.length > 0) + 1;
-  if (width === 0) return refuse([{ range: start, reason: "the header row has no column names; if the header is lower, pass its row index as headerTop" }]);
-  parts.length = width;
-  const groups = merges.filter((m) => isGroup(m) && m.top >= top && m.top < top + depth && m.left < width);
-
-  const problems = checkHeader({ headerRows, width, groups, valueAt, mergeAt, label, isGroup, excelAddress, origin });
-  if (problems.length > 0) return refuse(problems);
-  // Rows past the header that are all empty do not count as data.
-  if (rows.slice(top + depth).every((row) => row.every(isEmpty))) {
-    return refuse([{ range: start, reason: `no data rows under the ${depth}-row header` }]);
-  }
-
-  // A group label over the first named column may be a title over part of the
-  // table ("Sales 2026" over A1:C1). It is read as a group, with a note.
-  const first = parts.findIndex((labels) => labels.length > 0);
-  const notes = groups.filter((g) => g.top === top && g.left <= first).map((g) => ({
-    range: g.address, reason: `${JSON.stringify(label(g.top, g.left))} starts the names of the columns under it; if it is a title, pass the row index of the column names as headerTop` }));
-
-  // A value stored in a cell that a header merge covers is hidden in Excel and is
-  // not used in any name. It is reported; the header is still read.
-  for (const m of merges.filter((m) => m.left < width)) {
-    for (const r of headerRows) {
-      if (r < m.top || r > m.bottom) continue;
-      for (let c = m.left; c <= m.right; c++) {
-        if ((r === m.top && c === m.left) || isEmpty(valueAt(r, c))) continue;
-        problems.push({ range: m.address, reason: `hides ${JSON.stringify(valueAt(r, c))} in ${excelAddress(r, c)}`,
-          hint: "only the first cell's value is used in the name" });
-      }
+    // Every column under a group label needs a name in a row below the label.
+    for (const g of groups) {
+      if (c < g.left || c > g.right) continue;
+      if (headerRows.some((r) => r > g.bottom && hasText(shown(r, c)))) continue;
+      problems.push({ range: cellAt(g.bottom + 1, c),
+        reason: `"${tidy(mergeText(rows, g))}" (${g.address}) has no column name under it here`,
+        hint: "type the column's name in this cell" });
     }
+    if (parts.length) columns.push({ name: parts.join(" "), parts, index: c,
+      letter: XLSX.utils.encode_col(c + origin.c) });
   }
-  return { depth, columns: parts.map((labels) => labels.join(" ")), parts, notes, problems };
+  if (problems.length) return { problems };
+  if (!rows.slice(end).some((row) => row.some(hasText))) return { problems: [{ range: null,
+    reason: `there are no data rows under the header (rows ${found.headerRow}-${found.lastRow})` }] };
+
+  // A repeated name would overwrite the first column's value in every record.
+  // Names that differ only in case are refused too: a mapping that ignores
+  // case would mix them up.
+  const seen = new Map();
+  for (const col of columns) {
+    const first = seen.get(col.name.toLowerCase());
+    if (!first) { seen.set(col.name.toLowerCase(), col); continue; }
+    problems.push({ range: col.letter,
+      reason: `column ${col.letter} has the same name as column ${first.letter}: "${first.name}"`,
+      hint: "rename one of them" });
+  }
+  return problems.length ? { problems } : { columns, end };
 }
 
-// Reads an .xlsx file whose header may have up to maxRows rows into records.
-// headerTop: index of the first header row. 0 is the first row SheetJS reads
-// (Excel row 1 for most files), 1 the row under it.
-function readGroupedTable(bytes, headerTop = 0, maxRows = 3) {
-  const { rows, merges, origin } = readXlsx(bytes);
-  const header = readHeader(rows, merges, headerTop, origin, maxRows);
-  if (header.problems.some((p) => p.refuse)) return { columns: [], records: [], notes: [], problems: header.problems };
-  const { columns, depth } = header;
-  const width = columns.length;
-  // The header cells of column c, such as "D1:D2", for messages.
-  const headerCells = (c) => XLSX.utils.encode_range({
-    s: { r: origin.r + headerTop, c: origin.c + c }, e: { r: origin.r + headerTop + depth - 1, c: origin.c + c } });
-
-  // Merges in the data: the same rules as for a one-row header.
-  const firstData = headerTop + depth;
-  const filled = fillMerges(rows, merges, firstData, width, origin);
-  const problems = [...header.problems, ...filled.problems];
-  const isData = (r) => r >= firstData && !filled.skipRows.has(r) &&
-    !rows[r].slice(0, width).every(isEmpty);
-  const seen = new Set();
-  columns.forEach((name, c) => {
-    if (name === "") {
-      if (rows.some((row, r) => isData(r) && !isEmpty(row[c]))) {
-        problems.push({ range: headerCells(c), reason: "has data but no column name" });
-      }
-      return;
-    }
-    // Typed twice ("Q1" over two groups): the later column would overwrite the
-    // first in each record, so the file is refused.
-    if (seen.has(name.toLowerCase())) {
-      problems.push({ range: headerCells(c), reason: `repeats the column name ${JSON.stringify(name)}`, refuse: true });
-    }
-    seen.add(name.toLowerCase());
-  });
-
-  const notes = [...header.notes, ...filled.notes];
-  if (problems.some((p) => p.refuse)) return { columns: [], records: [], notes, problems };
-  const records = [];
-  rows.forEach((row, r) => {
-    if (!isData(r)) return;
+// Reads the records under the header. Each record has its Excel row number.
+function readGroupedTable(bytes, options) {
+  const sheet = readSheet(bytes);
+  const header = readHeader(sheet, options);
+  const { rows, merges, origin } = sheet;
+  if (header.problems) {
+    return { columns: [], records: [], notes: [], problems: header.problems };
+  }
+  const records = [], notes = [];
+  for (let r = header.end; r < rows.length; r++) {
+    if (!rows[r].some(hasText)) continue; // blank row
+    // fromEntries keeps a column named "__proto__" as an ordinary key.
     const values = Object.fromEntries(
-      columns.flatMap((name, c) => (name ? [[name, row[c] ?? ""]] : [])));
-    records.push({ row: origin.r + r + 1, values });
-  });
-  return { columns: columns.filter((name) => name !== ""), records, notes, problems };
+      header.columns.map((col) => [col.name, rows[r][col.index] ?? null]));
+    records.push({ row: r + origin.r + 1, values });
+  }
+  // A loop, not Math.max(...rows): spreading 100,000 rows overflows the stack.
+  let width = 0;
+  for (const row of rows) width = Math.max(width, row.length);
+  const data = rows.slice(header.end);
+  for (let c = 0; c < width; c++) {
+    const named = header.columns.some((col) => col.index === c);
+    if (!named && data.some((row) => hasText(row[c]))) notes.push({
+      range: XLSX.utils.encode_col(c + origin.c),
+      reason: "this column has data but no name, so it was left out" });
+  }
+  for (const m of merges) {
+    const first = XLSX.utils.encode_cell({ r: m.top + origin.r, c: m.left + origin.c });
+    if (m.top >= header.end) notes.push({ range: m.address,
+      reason: `merged in the data: only ${first} holds the value` });
+  }
+  const columns = header.columns.map((col) => col.name);
+  return { columns, records, notes, problems: [] };
 }
 
 // tests/fixtures/sales-two-row-header.xlsx was written by openpyxl 3.1.5 (tools/make_sales_fixture.py).
 const salesBytes = fs.readFileSync(path.join(__dirname, "fixtures", "sales-two-row-header.xlsx"));
-const ordersBytes = fs.readFileSync(path.join(__dirname, "fixtures", "orders-merged.xlsx"));
 const n = null; // a blank cell, as Excel stores it
 const book = (rows, merges, origin) => {
   const sheet = XLSX.utils.aoa_to_sheet(rows, origin ? { origin } : undefined);
@@ -3165,8 +3028,6 @@ const book = (rows, merges, origin) => {
 };
 const text = (list) => list.map((p) => `${p.range}: ${p.reason}`);
 const show = (v) => util.inspect(v, { breakLength: Infinity, depth: 5 });
-// Runs each statement of a snippet; a statement followed by a "// result" comment
-// (on its line or the next) must print that result.
 const checkComments = async (src, scope) => {
   const lines = src.split("\n");
   const names = Object.keys(scope);
@@ -3174,8 +3035,7 @@ const checkComments = async (src, scope) => {
   let checked = 0;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (line === "" || (line.startsWith("//") && !/^\/\/ [\[{'0-9]/.test(line))) continue;
-    if (line.startsWith("//")) continue; // a result line, handled with its statement
+    if (line === "" || line.startsWith("//")) continue;
     const same = /^(.*?);\s*\/\/ (.*?)(\s{2,}\(.*\))?$/.exec(line);
     const next = /^\/\/ ([\[{'0-9].*)$/.exec(lines[i + 1] ?? "");
     const expected = same ? same[2].trim() : next ? next[1] : null;
@@ -3194,223 +3054,176 @@ const salesMerges = ["A1:A2", "B1:B2", "C1:D1", "E1:F1", "A3:A4"];
 const title = book([["Sales 2026", n, n], ["Name", "Rep", "City"], ["Ana", "x", "y"]], ["A1:C1"]);
 const hole = book([["Name", "Q1", n], [n, "Revenue", n], ["Ana", 1, 2]], ["A1:A2", "B1:C1"]);
 const layout = book([["Name", "Note", n], ["Ana", "hi", 5]], ["B1:C1"]);
+const total = book([["Q1", n, "Total"], ["Revenue", "Cost", "Amount"], [1, 2, 3]], ["A1:B1"]);
+const cols = (bytes, options) => readGroupedTable(bytes, options).columns;
+const why = (bytes, options) => text(readGroupedTable(bytes, options).problems);
 
 ok("mh: SheetJS 0.20.3: the problem lines give what the comments say", async () => {
   assert.strictEqual(XLSX.version, "0.20.3");
   const workbook = XLSX.read(salesBytes);
-  assert.strictEqual(await checkComments("// Sales.xlsx: \"Region\" and \"Rep\" are merged down over A1:A2 and B1:B2,\n// \"Q1\" across C1:D1 and \"Q2\" across E1:F1, with Revenue and Cost under each.\nconst sheet = workbook.Sheets[workbook.SheetNames[0]];\nconst records = XLSX.utils.sheet_to_json(sheet);\nrecords.length;                    // 4  (row 2, the second header row, is read as a record)\nObject.keys(records[0]).join(\", \");  // 'Q1, __EMPTY, Q2, __EMPTY_1'\nconst fromRow2 = XLSX.utils.sheet_to_json(sheet, { range: 1 });\nObject.keys(fromRow2[0]).join(\", \"); // '__EMPTY, __EMPTY_1, Revenue, Cost, Revenue_1, Cost_1'\n", { XLSX, workbook }), 3);
+  assert.strictEqual(await checkComments("// Sales.xlsx: \"Region\" and \"Rep\" are merged down over A1:A2 and B1:B2,\n// \"Q1\" across C1:D1 and \"Q2\" across E1:F1, with Revenue and Cost under each.\n// bytes: the file's contents, e.g. new Uint8Array(await file.arrayBuffer()).\nconst workbook = XLSX.read(bytes);\nconst sheet = workbook.Sheets[workbook.SheetNames[0]];\nconst records = XLSX.utils.sheet_to_json(sheet);\nrecords.length;                    // 4  (row 2, the second header row, is read as a record)\nObject.keys(records[0]).join(\", \");  // 'Q1, __EMPTY, Q2, __EMPTY_1'\nconst fromRow2 = XLSX.utils.sheet_to_json(sheet, { range: 1 });\nObject.keys(fromRow2[0]).join(\", \"); // '__EMPTY, __EMPTY_1, Revenue, Cost, Revenue_1, Cost_1'\n", { XLSX, bytes: salesBytes }), 3);
   // In the file, only the first cell of each merge holds a value.
   const sheet = workbook.Sheets.Sales;
   for (const a of ["A2", "B2", "D1", "F1", "A4"]) assert.strictEqual(sheet[a], undefined, a);
 });
-ok("mh: the fixed-layout and data-shape lines give what the comments say", async () => {
+ok("mh: the fixed-template lines give what the comment says", async () => {
   const sheet = XLSX.read(salesBytes).Sheets.Sales;
   assert.strictEqual(await checkComments("// Only for a template you control: the header is always rows 1-2 of Sales.xlsx.\nconst columns = [\"Region\", \"Rep\", \"Q1 Revenue\", \"Q1 Cost\", \"Q2 Revenue\", \"Q2 Cost\"];\nconst records = XLSX.utils.sheet_to_json(sheet, { header: columns, range: 2 });\nrecords[1]; // { Rep: 'Bo', 'Q1 Revenue': 90, 'Q1 Cost': 50, 'Q2 Revenue': 80, 'Q2 Cost': 40 }\n", { XLSX, sheet }), 1);
-  assert.strictEqual(await checkComments("const { rows, merges, origin } = readXlsx(bytes);\nrows[0];    // [ 'Region', 'Rep', 'Q1', '', 'Q2', '' ]\nmerges[2];  // { address: 'E1:F1', top: 0, bottom: 0, left: 4, right: 5 }\norigin;     // { c: 0, r: 0 }\n", { readXlsx, bytes: salesBytes }), 3);
-});
-ok("mh: line breaks and spaces in labels, headerTop past the end, title notes", () => {
-  const br = readGroupedTable(book([["Name", "Q1\nresults", n], [n, "Revenue  (EUR)", " Cost\r\n"], ["Ana", 1, 2]], ["A1:A2", "B1:C1"]));
-  assert.deepStrictEqual([br.columns, br.problems], [["Name", "Q1 results Revenue (EUR)", "Q1 results Cost"], []]);
-  assert.deepStrictEqual(text(readGroupedTable(book([["Name"], ["Ana"]], []), 5).problems), ["A2: headerTop 5 is past the last row of the sheet"]);
-  // A group over the first named column gets a note; the sales report gets none.
-  const narrow = readGroupedTable(book([["Sales 2026", n, n, n], ["Name", "Rep", "City", "Zip"], ["Ana", "x", "y", "z"]], ["A1:C1"]));
-  assert.deepStrictEqual(text(narrow.notes), ['A1:C1: "Sales 2026" starts the names of the columns under it; if it is a title, pass the row index of the column names as headerTop']);
-  assert.deepStrictEqual(readGroupedTable(salesBytes).notes.length, 1);
-  // A header row missing from rows (a hole) does not crash readHeader.
-  const holed = [["Name", "Q1", n], , ["Ana", 1, 2]];
-  assert.strictEqual(readHeader(holed, readXlsx(book([["Name", "Q1", n]], ["B1:C1"])).merges, 0, { r: 0, c: 0 }).problems[0].refuse, true);
 });
 ok("mh: the example gives the output in its comments", async () => {
-  assert.strictEqual(await checkComments("// file: a File from <input type=\"file\">, inside an async change handler.\nlet table;\ntry {\n  table = readGroupedTable(await file.arrayBuffer());\n} catch (error) {\n  // readXlsx throws a TypeError when the bytes do not start like a zip archive\n  // (an .xlsx file is one), and SheetJS throws for a damaged file.\n  console.error(error);\n  table = { columns: [], records: [], notes: [], problems: [{ range: null, reason: \"the file could not be read as .xlsx\" }] };\n}\nconst { columns, records, notes, problems } = table;\n\ncolumns;\n// [ 'Region', 'Rep', 'Q1 Revenue', 'Q1 Cost', 'Q2 Revenue', 'Q2 Cost' ]\nrecords[1];\n// { row: 4, values: { Region: 'North', Rep: 'Bo', 'Q1 Revenue': 90, 'Q1 Cost': 50, 'Q2 Revenue': 80, 'Q2 Cost': 40 } }\nnotes.map((n) => `${n.range}: ${n.reason}`); // [ 'A3:A4: \"North\" copied into A4' ]\nproblems; // []\n", { readGroupedTable, file: fileOf(salesBytes) }), 4);
+  assert.strictEqual(await checkComments("// file: a File from <input type=\"file\">, inside an async change handler.\nconst bytes = new Uint8Array(await file.arrayBuffer());\nconst { columns, records, notes, problems } = readGroupedTable(bytes);\ncolumns;\n// [ 'Region', 'Rep', 'Q1 Revenue', 'Q1 Cost', 'Q2 Revenue', 'Q2 Cost' ]\nrecords[0];\n// { row: 3, values: { Region: 'North', Rep: 'Ana', 'Q1 Revenue': 100, 'Q1 Cost': 60, 'Q2 Revenue': 120, 'Q2 Cost': 70 } }\nrecords[1].values.Region; // null\nnotes.map((n) => `${n.range}: ${n.reason}`);\n// [ 'A3:A4: merged in the data: only A3 holds the value' ]\nproblems; // []\n", { readGroupedTable, file: fileOf(salesBytes) }), 5);
+  const t = readGroupedTable(salesBytes);
+  assert.deepStrictEqual(t.records.map((r) => r.row), [3, 4, 5]);
 });
 ok("mh: a file SheetJS writes reads the same as the openpyxl file", () => {
   assert.deepStrictEqual(readGroupedTable(book(salesRows, salesMerges)), readGroupedTable(salesBytes));
 });
-ok("mh: the refused files give the output in the comments", async () => {
-  assert.strictEqual(await checkComments("// title, hole and layout hold the bytes of three small .xlsx files\n// that this code refuses, with no records:\n// title: \"Sales 2026\" merged across A1:C1, above the column names in row 2.\n// hole: \"Q1\" across B1:C1, with \"Revenue\" in B2 and nothing in C2.\n// layout: \"Note\" merged across B1:C1 only to make room; row 2 is Ana's data.\nconst reasons = (table) => table.problems.map((p) => `${p.range}: ${p.reason}`);\n\nconst titled = readGroupedTable(title);\nreasons(titled);\n// [ 'A1:C1: \"Sales 2026\" spans the whole table, so it looks like a title' ]\ntitled.problems[0].hint; // 'pass the row index of the column names as headerTop'\nreadGroupedTable(title, 1).columns; // [ 'Name', 'Rep', 'City' ]\nreasons(readGroupedTable(hole));\n// [ 'B1:C1: \"Q1\" has no column name under it in C2' ]\nconst laidOut = readGroupedTable(layout);\nreasons(laidOut);\n// [ 'A2: \"Ana\" is under the plain label \"Name\" (A1), so row 2 looks like data' ]\nlaidOut.problems[0].hint;\n// 'B1:C1 made row 2 part of the header. Unmerge it if it is layout; pass headerTop if it is a title; type one name in one cell if both cells are one name'\n", { readGroupedTable, title, hole, layout }), 6);
+ok("mh: the refused files give the output in the comments, with no records", async () => {
+  assert.strictEqual(await checkComments("// title, hole, layout and total hold the bytes of four small .xlsx files:\n// title: \"Sales 2026\" merged across A1:C1, above the names Name, Rep, City in row 2.\n// hole: \"Name\" merged over A1:A2; \"Q1\" merged across B1:C1, with \"Revenue\"\n//   in B2 and nothing in C2.\n// layout: \"Name\" in A1 and \"Note\" merged across B1:C1 only to make room;\n//   row 2 is Ana's data: Ana, hi, 5.\n// total: \"Q1\" merged across A1:B1 over Revenue and Cost; \"Total\" in C1 over\n//   \"Amount\" in C2, not merged.\nconst reasons = (table) => table.problems.map((p) => `${p.range}: ${p.reason}`);\nconst titled = readGroupedTable(title);\nreasons(titled);\n// [ 'A1:C1: \"Sales 2026\" (A1:C1) spans every column, so it looks like a title' ]\ntitled.problems[0].hint; // 'pass headerRow: 2 if the names start there'\nreadGroupedTable(title, { headerRow: 2 }).columns; // [ 'Name', 'Rep', 'City' ]\nreasons(readGroupedTable(hole));\n// [ 'C2: \"Q1\" (B1:C1) has no column name under it here' ]\nreasons(readGroupedTable(layout));\n// [ 'A2: \"Ana\" is under \"Name\", which is not a group label, so row 2 looks like data' ]\nreasons(readGroupedTable(total));\n// [ 'C2: \"Amount\" is under \"Total\", which is not a group label, so row 2 looks like data' ]\n", { readGroupedTable, title, hole, layout, total }), 6);
   for (const t of [title, hole, layout]) assert.deepStrictEqual(readGroupedTable(t).records, []);
+  for (const t of [title, hole, layout]) assert(readGroupedTable(t).problems.every((p) => p.hint));
+  assert.deepStrictEqual(readGroupedTable(title, { headerRow: 2 }).records, [{ row: 3, values: { Name: "Ana", Rep: "x", City: "y" } }]);
 });
-ok("mh: a one-row header gives the same result as readMergedTable", () => {
-  assert.deepStrictEqual(readGroupedTable(ordersBytes), readMergedTable(ordersBytes));
-  const plain = book([["Name", "Email"], ["Ana", "a@b.co"]], []);
-  assert.deepStrictEqual(readGroupedTable(plain), readMergedTable(plain));
-  // The file readMergedTable refuses ("Q1" over two columns) is read here.
-  const q = book([["Region", "Q1", n], [n, "Revenue", "Cost"], ["North", 1, 2]], ["B1:C1"]);
-  assert.strictEqual(readMergedTable(q).problems.length, 1);
-  assert.deepStrictEqual(readGroupedTable(q).records, [{ row: 3, values: { Region: "North", "Q1 Revenue": 1, "Q1 Cost": 2 } }]);
-});
-ok("mh: readHeader on three rows, numbers as names, and the row limit", () => {
-  const o = { r: 0, c: 0 };
-  // Year over quarters over measures: three header rows.
-  const three = [["Region", "2026", n, n, n], [n, "Q1", n, "Q2", n], [n, "Revenue", "Cost", "Revenue", "Cost"], ["North", 1, 2, 3, 4]];
-  const m3 = readXlsx(book(three, ["A1:A3", "B1:E1", "B2:C2", "D2:E2"])).merges;
-  const h3 = readHeader(three, m3, 0, o);
-  assert.deepStrictEqual([h3.depth, h3.columns], [3, ["Region", "2026 Q1 Revenue", "2026 Q1 Cost", "2026 Q2 Revenue", "2026 Q2 Cost"]]);
-  assert.deepStrictEqual(h3.parts[1], ["2026", "Q1", "Revenue"]);
-  // A group label that is a number (2026 stored as a number) and numbers under a group.
-  const years = readGroupedTable(book([["Name", "Revenue", n], [n, 2025, 2026], ["Ana", 1, 2]], ["A1:A2", "B1:C1"]));
-  assert.deepStrictEqual([years.columns, years.problems], [["Name", "Revenue 2025", "Revenue 2026"], []]);
-  const numGroup = readGroupedTable(book([["Name", 2026, n], [n, "Q1", "Q2"], ["Ana", 1, 2]], ["A1:A2", "B1:C1"]));
-  assert.deepStrictEqual(numGroup.columns, ["Name", "2026 Q1", "2026 Q2"]);
-  // A column not under any group, left blank in row 2 without a merge: one-part name.
-  const blank = readGroupedTable(book([["Name", "Q1", n], [n, "Revenue", "Cost"], ["Ana", 1, 2]], ["B1:C1"]));
-  assert.deepStrictEqual(blank.columns, ["Name", "Q1 Revenue", "Q1 Cost"]);
-  // Four header rows: refused.
-  const four = [["A", "G", n], [n, "H", n], [n, "I", n], [n, "x", "y"], ["v", 1, 2]];
-  const m4 = readXlsx(book(four, ["B1:C1", "B2:C2", "B3:C3"])).merges;
-  assert.deepStrictEqual(text(readHeader(four, m4, 0, o).problems), ["A1: the header would have 4 rows; this code reads at most 3"]);
-  assert.strictEqual(readHeader(four, m4, 0, o, 4).depth, 4);
-  // A header with nothing under it, and a header row with no names.
-  // A header with nothing under it: cut off by the end of the file, followed only by
-  // empty rows, or a one-row header alone.
-  const noData = ["A1: no data rows under the 2-row header"];
-  assert.deepStrictEqual(text(readGroupedTable(book([["Name", "Q1", n]], ["B1:C1"])).problems), noData);
-  assert.deepStrictEqual(text(readGroupedTable(book([["Name", "Q1", n], [n, "Revenue", "Cost"]], ["A1:A2", "B1:C1"])).problems), noData);
-  assert.deepStrictEqual(text(readGroupedTable(book([["Name", "Q1", n], [n, "Revenue", "Cost"], [n, n, n], [n, n, n]], ["A1:A2", "B1:C1"])).problems), noData);
-  assert.deepStrictEqual(readGroupedTable(book([["Name", "Q1", n], [n, "Revenue", "Cost"]], ["A1:A2", "B1:C1"])).records, []);
-  assert.deepStrictEqual(text(readGroupedTable(book([["Name", "Email"]], [])).problems), ["A1: no data rows under the 1-row header"]);
-  assert.deepStrictEqual(text(readGroupedTable(book([[n, n], ["Name", "Email"]], [])).problems),
-    ["A1: the header row has no column names; if the header is lower, pass its row index as headerTop"]);
-});
-ok("mh: merges that are not group labels", () => {
+ok("mh: one-row headers read like sheet_to_json", () => {
+  const plain = book([["Name", "Email"], ["Ana", "a@b.co"], [n, n], ["Bo", "b@c.co"]], []);
+  const t = readGroupedTable(plain);
+  assert.deepStrictEqual([t.columns, t.problems, t.notes], [["Name", "Email"], [], []]);
+  assert.deepStrictEqual(t.records, [{ row: 2, values: { Name: "Ana", Email: "a@b.co" } }, { row: 4, values: { Name: "Bo", Email: "b@c.co" } }]);
   // An empty merge across the header is layout: the header stays one row.
   const empty = readGroupedTable(book([["Name", "Email", n, n], ["Ana", "a@b.co", n, n]], ["C1:D1"]));
   assert.deepStrictEqual([empty.columns, empty.problems, empty.records.length], [["Name", "Email"], [], 1]);
-  // A label merged down with no group is a one-row header: reported by fillMerges, records still read.
-  const down = readGroupedTable(book([["Region", "Rep"], [n, "Ana"]], ["A1:A2"]));
-  assert.deepStrictEqual(text(down.problems), ["A1:A2: runs from the header into the data; the header may have two rows"]);
-  // A label merged down past the header rows reaches the data: reported.
-  const deep = readGroupedTable(book([["Region", "Q1", n], [n, "Revenue", "Cost"], [n, 1, 2]], ["A1:A3", "B1:C1"]));
-  assert.deepStrictEqual(text(deep.problems), ["A1:A3: runs from the header into the data; the header may have two rows"]);
-  // A value hidden under a header merge does not change the names; it is reported,
-  // and the records are still read (as for hidden values in the data).
-  const hidden = readGroupedTable(book([["Name", "Q1", "x"], ["old", "Revenue", "Cost"], ["Ana", 1, 2]], ["A1:A2", "B1:C1"]));
-  assert.deepStrictEqual(hidden.columns, ["Name", "Q1 Revenue", "Q1 Cost"]);
-  assert.deepStrictEqual(text(hidden.problems), ['A1:A2: hides "old" in A2', 'B1:C1: hides "x" in C1']);
-  assert.strictEqual(hidden.records.length, 1);
-  assert(hidden.problems.every((p) => !p.refuse));
-  // Data merges below a two-row header follow the one-row rules.
-  const data = readGroupedTable(book([["Rep", "Q1", n], [n, "Revenue", "Cost"], ["Ana", 100, 60], ["Bo", n, 50], ["Total in EUR", n, n]], ["A1:A2", "B1:C1", "B3:B4", "A5:C5"]));
-  assert.deepStrictEqual(text(data.problems), ["B3:B4: covers 2 rows; 100 is read into B3 only"]);
-  assert.deepStrictEqual(text(data.notes), ['A5:C5: row 5 skipped: "Total in EUR" spans the table']);
-  assert.deepStrictEqual(data.records.map((r) => r.row), [3, 4]);
 });
-ok("mh: refused headers and name checks", () => {
-  // Several missing names under one group: one problem each.
-  const two = readGroupedTable(book([["Name", "Q1", n, n], [n, n, n, "x"], ["Ana", 1, 2, 3]], ["A1:A2", "B1:D1"]));
-  assert.deepStrictEqual(text(two.problems), ['B1:D1: "Q1" has no column name under it in B2', 'B1:D1: "Q1" has no column name under it in C2']);
-  // A layout merge over data with only numbers under it: still caught by the text in column A.
-  assert.deepStrictEqual(text(readGroupedTable(layout).problems),
-    ['A2: "Ana" is under the plain label "Name" (A1), so row 2 looks like data']);
-  assert(readGroupedTable(layout).problems.every((p) => p.refuse));
-  // Every such cell is reported, not only the first in the row.
-  const wide = readGroupedTable(book([["Name", "Note", n, "City"], ["Ana", "hi", 5, "Oslo"]], ["B1:C1"]));
-  assert.deepStrictEqual(text(wide.problems), ['A2: "Ana" is under the plain label "Name" (A1), so row 2 looks like data', 'D2: "Oslo" is under the plain label "City" (D1), so row 2 looks like data']);
-  assert.deepStrictEqual(wide.problems.map((p) => p.hint.slice(0, 32)), ["B1:C1 made row 2 part of the hea", "B1:C1 made row 2 part of the hea"]);
-  // Limit stated in the post: a layout merge over all-text data in grouped columns only is read as a header.
-  const fooled = readGroupedTable(book([["Contact", n], ["Ana", "a@b.co"], ["Bo", "b@c.co"]], ["A1:B1"]));
-  assert.strictEqual(fooled.problems.length, 1); // over the whole table: reported as a title
-  const fooled2 = readGroupedTable(book([["Id", "Contact", n], [n, "Ana", "a@b.co"], [7, "Bo", "b@c.co"]], ["A1:A2", "B1:C1"]));
-  assert.deepStrictEqual(fooled2.columns, ["Id", "Contact Ana", "Contact a@b.co"]);
-  // A merge right of the table does not add hidden-value problems.
-  const side = readGroupedTable(book([["Name", "Q1", n, n, n, "x"], [n, "a", "b", n, n, n], ["Ana", 1, 2, n, n, n]], ["A1:A2", "B1:C1", "E1:F1"]));
-  assert.deepStrictEqual([side.columns, side.problems], [["Name", "Q1 a", "Q1 b"], []]);
-  // Limit stated in the post: a merged note right of the header is taken for a group label; the file is refused.
-  const note = readGroupedTable(book([["Name", "Email", n, "see notes", n], ["Ana", "a@b.co", n, n, n]], ["D1:E1"]));
-  assert.deepStrictEqual(text(note.problems).map((p) => p.slice(0, 6)), ["D1:E1:", "D1:E1:", 'A2: "A', 'B2: "a']);
-  assert.deepStrictEqual(note.records, []);
-  // The same group typed twice gives a repeated name.
-  const twice = readGroupedTable(book([["Q1", n, "Q1", n], ["Revenue", "Cost", "Revenue", "Cost"], [1, 2, 3, 4]], ["A1:B1", "C1:D1"]));
-  assert.deepStrictEqual(text(twice.problems), ['C1:C2: repeats the column name "Q1 Revenue"', 'D1:D2: repeats the column name "Q1 Cost"']);
-  // A repeated name would overwrite values, so the file is refused with no records.
-  assert.deepStrictEqual([twice.records, twice.problems.every((p) => p.refuse)], [[], true]);
-  // A column with data but no name anywhere in the header.
-  const unnamed = readGroupedTable(book([["Name", n, "Q1", n], [n, n, "Revenue", "Cost"], ["Ana", "x", 1, 2]], ["A1:A2", "C1:D1"]));
-  assert.deepStrictEqual(text(unnamed.problems), ["B1:B2: has data but no column name"]);
-  assert.deepStrictEqual(unnamed.columns, ["Name", "Q1 Revenue", "Q1 Cost"]);
-  // A title above the header: refused at headerTop 0, read at headerTop 1.
-  assert.deepStrictEqual(readGroupedTable(title, 1).records, [{ row: 3, values: { Name: "Ana", Rep: "x", City: "y" } }]);
-  const titled2 = readGroupedTable(book([["Sales", n, n], ["Name", "Q1", n], [n, "Revenue", "Cost"], ["Ana", 1, 2]], ["A1:C1", "A2:A3", "B2:C2"]), 1);
-  assert.deepStrictEqual([titled2.columns, titled2.problems], [["Name", "Q1 Revenue", "Q1 Cost"], []]);
-  // A column called __proto__ is an own property.
-  const proto = readGroupedTable(book([["__proto__", "Q1", n], [n, "a", "b"], ["x", 1, 2]], ["A1:A2", "B1:C1"]));
-  assert.strictEqual(Object.getOwnPropertyDescriptor(proto.records[0].values, "__proto__").value, "x");
-});
-ok("mh: review fixes: titles left of the table, narrow titles, real groups over all columns, dates", () => {
-  // A title over B1:D1 when the stored range starts at an empty column A: still a title.
-  const shifted = readGroupedTable(book([[n, "Sales 2026", n, n], [n, "Name", "Rep", "City"], [n, "Ana", "x", "y"]], ["B1:D1"]));
-  assert.deepStrictEqual(text(shifted.problems), ['B1:D1: "Sales 2026" spans the whole table, so it looks like a title']);
-  // Limit stated in the post: a title over only some columns is read as a group label.
-  const narrow = readGroupedTable(book([["Sales 2026", n, n, n], ["Name", "Rep", "City", "Zip"], ["Ana", "x", "y", "z"]], ["A1:C1"]));
-  assert.deepStrictEqual([narrow.columns, narrow.problems], [["Sales 2026 Name", "Sales 2026 Rep", "Sales 2026 City", "Zip"], []]);
-  assert.deepStrictEqual(readGroupedTable(book([["Sales 2026", n, n, n], ["Name", "Rep", "City", "Zip"], ["Ana", "x", "y", "z"]], ["A1:C1"]), 1).columns, ["Name", "Rep", "City", "Zip"]);
-  // A name aligned to the bottom header row, with nothing above it: accepted.
-  const bottom = readGroupedTable(book([[n, "Q1", n], ["Region", "Revenue", "Cost"], ["North", 1, 2]], ["B1:C1"]));
-  assert.deepStrictEqual([bottom.columns, bottom.problems], [["Region", "Q1 Revenue", "Q1 Cost"], []]);
-  // Three rows with a gap under the year: "2026 Total". An empty column under the year is still refused.
-  const gapHole = readGroupedTable(book([["Region", "2026", n, n], [n, "Q1", n, n], [n, "Revenue", "Cost", n], ["North", 1, 2, 3]], ["A1:A3", "B1:D1", "B2:C2"]));
-  assert.deepStrictEqual(text(gapHole.problems), ['B1:D1: "2026" has no column name under it in D2']);
-  const gap = readGroupedTable(book([["Region", "2026", n, n], [n, "Q1", n, n], [n, "Revenue", "Cost", "Total"], ["North", 1, 2, 3]], ["A1:A3", "B1:D1", "B2:C2"]));
-  assert.deepStrictEqual([gap.columns, gap.problems], [["Region", "2026 Q1 Revenue", "2026 Q1 Cost", "2026 Total"], []]);
-  // Limit stated in the post: a label over one column with a name under it is refused (it looks like a name over data).
-  const single = readGroupedTable(book([["Region", "Q1", n, "Q2"], [n, "Revenue", "Cost", "Revenue"], ["North", 1, 2, 3]], ["A1:A2", "B1:C1"]));
-  assert.deepStrictEqual(text(single.problems), ['D2: "Revenue" is under the plain label "Q2" (D1), so row 2 looks like data']);
-  // The same with "Total" over "Amount" beside a group: refused, and fixed by typing one name.
-  const total = book([["Q1", n, "Total"], ["Revenue", "Cost", "Amount"], [1, 2, 3]], ["A1:B1"]);
-  assert.deepStrictEqual(text(readGroupedTable(total).problems), ['C2: "Amount" is under the plain label "Total" (C1), so row 2 looks like data']);
-  const totalFixed = book([["Q1", n, "Total Amount"], ["Revenue", "Cost", n], [1, 2, 3]], ["A1:B1", "C1:C2"]);
-  assert.deepStrictEqual(readGroupedTable(totalFixed).columns, ["Q1 Revenue", "Q1 Cost", "Total Amount"]);
-  // maxRows can be passed to readGroupedTable.
+ok("mh: three header rows, numbers as labels, line breaks, and the row limit", () => {
+  const three = book([["Region", "2026", n, n, n], [n, "Q1", n, "Q2", n], [n, "Revenue", "Cost", "Revenue", "Cost"], ["North", 1, 2, 3, 4]], ["A1:A3", "B1:E1", "B2:C2", "D2:E2"]);
+  assert.deepStrictEqual(cols(three), ["Region", "2026 Q1 Revenue", "2026 Q1 Cost", "2026 Q2 Revenue", "2026 Q2 Cost"]);
+  assert.deepStrictEqual(readHeader(readSheet(three)).columns[1].parts, ["2026", "Q1", "Revenue"]);
+  assert.deepStrictEqual(readGroupedTable(three).records, [{ row: 4, values: { Region: "North", "2026 Q1 Revenue": 1, "2026 Q1 Cost": 2, "2026 Q2 Revenue": 3, "2026 Q2 Cost": 4 } }]);
+  assert.deepStrictEqual(cols(book([["Name", "Revenue", n], [n, 2025, 2026], ["Ana", 1, 2]], ["A1:A2", "B1:C1"])), ["Name", "Revenue 2025", "Revenue 2026"]);
+  assert.deepStrictEqual(cols(book([["Name", 2026, n], [n, "Q1", "Q2"], ["Ana", 1, 2]], ["A1:A2", "B1:C1"])), ["Name", "2026 Q1", "2026 Q2"]);
+  assert.deepStrictEqual(cols(book([["Name", "Q1\nresults", n], [n, "Revenue  (EUR)", " Cost\r\n"], ["Ana", 1, 2]], ["A1:A2", "B1:C1"])), ["Name", "Q1 results Revenue (EUR)", "Q1 results Cost"]);
+  // A name aligned to the bottom header row, unmerged, with nothing above it.
+  assert.deepStrictEqual(cols(book([[n, "Q1", n], ["Region", "Revenue", "Cost"], ["North", 1, 2]], ["B1:C1"])), ["Region", "Q1 Revenue", "Q1 Cost"]);
+  // A year with a gap under it: "2026 Total".
+  const gap = book([["Region", "2026", n, n], [n, "Q1", n, n], [n, "Revenue", "Cost", "Total"], ["North", 1, 2, 3]], ["A1:A3", "B1:D1", "B2:C2"]);
+  assert.deepStrictEqual(cols(gap), ["Region", "2026 Q1 Revenue", "2026 Q1 Cost", "2026 Total"]);
   const four = book([["A", "G", n], [n, "H", n], [n, "I", n], [n, "x", "y"], ["v", 1, 2]], ["A1:A4", "B1:C1", "B2:C2", "B3:C3"]);
-  assert.strictEqual(readGroupedTable(four).problems.length, 1);
-  assert.deepStrictEqual(readGroupedTable(four, 0, 4).columns, ["A", "G H I x", "G H I y"]);
-  // Limit stated in the post: data right of the last named column is ignored without a problem.
-  const right = readGroupedTable(book([["Name", "Q1", n, n], [n, "a", "b", n], ["Ana", 1, 2, "extra"]], ["A1:A2", "B1:C1"]));
-  assert.deepStrictEqual([right.columns, right.problems, Object.keys(right.records[0].values)], [["Name", "Q1 a", "Q1 b"], [], ["Name", "Q1 a", "Q1 b"]]);
-  // Limit stated in the post: a real group over every column is refused like a title.
-  const contact = readGroupedTable(book([["Contact", n, n], ["First", "Last", "Email"], ["Ana", "Lee", "a@b.co"]], ["A1:C1"]));
-  assert.strictEqual(contact.problems[0].range, "A1:C1");
-  assert.deepStrictEqual(readGroupedTable(book([["Contact", n, n], ["First", "Last", "Email"], ["Ana", "Lee", "a@b.co"]], ["A1:C1"]), 1).columns, ["First", "Last", "Email"]);
-  // Limit stated in the post: a group label stored as a date arrives as its serial number.
-  // (Excel stores a date as a number with a date format: 46023 is 2026-01-01.)
-  const datedSheet = XLSX.utils.aoa_to_sheet([["Name", n, n], [n, "Revenue", "Cost"], ["Ana", 1, 2]]);
-  datedSheet.B1 = { t: "n", v: 46023, z: "mmm yyyy" };
-  datedSheet["!merges"] = ["A1:A2", "B1:C1"].map((a) => XLSX.utils.decode_range(a));
-  const datedBook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(datedBook, datedSheet, "S");
-  const datedBytes = XLSX.write(datedBook, { type: "buffer", bookType: "xlsx" });
-  assert.strictEqual(XLSX.read(datedBytes).Sheets.S.B1.w, "Jan 2026");
-  const dated = readGroupedTable(datedBytes);
-  assert.deepStrictEqual(dated.columns, ["Name", "46023 Revenue", "46023 Cost"]);
-  // The cause named in a message is a group in the header, not a title above headerTop.
-  const above = readGroupedTable(book([["Report", n, n], ["Name", "Note", n], ["Ana", "hi", 5]], ["A1:C1", "B2:C2"]), 1);
-  assert.deepStrictEqual(above.problems.map((p) => p.hint.startsWith("B2:C2")), [true]);
-  // A number under a plain label in a header row is refused too.
-  const num = readGroupedTable(book([["Id", "Note", n], [7, "hi", "x"]], ["B1:C1"]));
-  assert.deepStrictEqual(num.problems.map((p) => p.range), ["A2"]);
+  assert.deepStrictEqual(why(four), ["null: the merges make a header of 4 rows; the limit is 3"]);
+  assert.deepStrictEqual(cols(four, { maxRows: 4 }), ["A", "G H I x", "G H I y"]);
+});
+ok("mh: refused headers", () => {
+  // Every missing name under a group is reported.
+  assert.deepStrictEqual(why(book([["Name", "Q1", n, n], [n, n, n, "x"], ["Ana", 1, 2, 3]], ["A1:A2", "B1:D1"])),
+    ['B2: "Q1" (B1:D1) has no column name under it here', 'C2: "Q1" (B1:D1) has no column name under it here']);
+  assert.deepStrictEqual(why(book([["Region", "2026", n, n], [n, "Q1", n, n], [n, "Revenue", "Cost", n], ["North", 1, 2, 3]], ["A1:A3", "B1:D1", "B2:C2"])),
+    ['D2: "2026" (B1:D1) has no column name under it here']);
+  // Every cell of a data row pulled into the header is reported, numbers too.
+  assert.deepStrictEqual(why(book([["Name", "Note", n, "City"], ["Ana", "hi", 5, "Oslo"]], ["B1:C1"])),
+    ['A2: "Ana" is under "Name", which is not a group label, so row 2 looks like data', 'D2: "Oslo" is under "City", which is not a group label, so row 2 looks like data']);
+  assert.deepStrictEqual(why(book([["Id", "Note", n], [7, "hi", "x"]], ["B1:C1"])), ['A2: "7" is under "Id", which is not a group label, so row 2 looks like data']);
+  // A plain label over one column with a name under it is refused; one name in one cell works.
+  const total = book([["Q1", n, "Total"], ["Revenue", "Cost", "Amount"], [1, 2, 3]], ["A1:B1"]);
+  assert.deepStrictEqual(why(total), ['C2: "Amount" is under "Total", which is not a group label, so row 2 looks like data']);
+  assert.deepStrictEqual(cols(book([["Q1", n, "Total Amount"], ["Revenue", "Cost", n], [1, 2, 3]], ["A1:B1", "C1:C2"])), ["Q1 Revenue", "Q1 Cost", "Total Amount"]);
+  // The same group typed twice gives repeated names.
+  assert.deepStrictEqual(why(book([["Q1", n, "Q1", n], ["Revenue", "Cost", "revenue", "Cost"], [1, 2, 3, 4]], ["A1:B1", "C1:D1"])),
+    ['C: column C has the same name as column A: "Q1 Revenue"', 'D: column D has the same name as column B: "Q1 Cost"']);
+  // A title over a header that would be too tall gets the title message.
+  const tallTitle = book([["Report", n, n], ["2026", n, n], ["Q1", n, "Q2"], ["a", "b", "c"], [1, 2, 3]], ["A1:C1", "A2:C2", "A3:B3"]);
+  assert.deepStrictEqual(why(tallTitle), ['A1:C1: "Report" (A1:C1) spans every column, so it looks like a title']);
+  // 130,000 data rows: no stack overflow.
+  const big = [["Name", "Q1", n], [n, "Revenue", "Cost"]];
+  for (let i = 0; i < 130000; i++) big.push(["x" + i, i, 1]);
+  const bigTable = readGroupedTable(book(big, ["A1:A2", "B1:C1"]));
+  assert.deepStrictEqual([bigTable.records.length, bigTable.records.at(-1).row], [130000, 130002]);
+  // A label merged down past the header reaches the data.
+  assert.deepStrictEqual(why(book([["Region", "Q1", n], [n, "Revenue", "Cost"], [n, 1, 2]], ["A1:A3", "B1:C1"])), ['A1:A3: "Region" (A1:A3) crosses the edge of the header (rows 1-2)']);
+  assert.deepStrictEqual(why(book([["Region", "Rep"], [n, "Ana"]], ["A1:A2"])), ['A1:A2: "Region" (A1:A2) crosses the edge of the header (rows 1-1)']);
+  // A real group over every column is refused as a title; headerRow reads the names without it.
+  const contact = book([["Contact", n, n], ["First", "Last", "Email"], ["Ana", "Lee", "a@b.co"]], ["A1:C1"]);
+  assert.strictEqual(readGroupedTable(contact).problems[0].range, "A1:C1");
+  assert.deepStrictEqual(cols(contact, { headerRow: 2 }), ["First", "Last", "Email"]);
+  // A title over a two-row header: the hint gives the row of the names.
+  const titled = book([["Sales", n, n], ["Name", "Q1", n], [n, "Revenue", "Cost"], ["Ana", 1, 2]], ["A1:C1", "A2:A3", "B2:C2"]);
+  assert.strictEqual(readGroupedTable(titled).problems[0].hint, "pass headerRow: 2 if the names start there");
+  assert.deepStrictEqual(cols(titled, { headerRow: 2 }), ["Name", "Q1 Revenue", "Q1 Cost"]);
+  // A title over a stored range that starts at an empty column A.
+  assert.deepStrictEqual(why(book([[n, "Sales 2026", n, n], [n, "Name", "Rep", "City"], [n, "Ana", "x", "y"]], ["B1:D1"])), ['B1:D1: "Sales 2026" (B1:D1) spans every column, so it looks like a title']);
+  // No data rows, and a header row outside the sheet.
+  for (const b of [book([["Name", "Q1", n], [n, "Revenue", "Cost"]], ["A1:A2", "B1:C1"]), book([["Name", "Q1", n], [n, "Revenue", "Cost"], [n, n, n]], ["A1:A2", "B1:C1"])])
+    assert.deepStrictEqual(why(b), ["null: there are no data rows under the header (rows 1-2)"]);
+  assert.deepStrictEqual(why(book([["Name"], ["Ana"]], []), { headerRow: 5 }), ["null: row 5 is outside the sheet"]);
+  assert.deepStrictEqual(why(book([["Name"], ["Ana"]], []), { headerRow: 0 }), ["null: row 0 is outside the sheet"]);
+  // A title, a blank row, then the names: the hint skips the blank row.
+  const gapTitle = book([["Sales 2026", n, n], [n, n, n], ["Name", "Rep", "City"], ["Ana", "x", "y"]], ["A1:C1"]);
+  assert.strictEqual(readGroupedTable(gapTitle).problems[0].hint, "pass headerRow: 3 if the names start there");
+  assert.deepStrictEqual(why(gapTitle, { headerRow: 2 }), ["null: row 2 is empty"]);
+  assert.deepStrictEqual(cols(gapTitle, { headerRow: 3 }), ["Name", "Rep", "City"]);
+  // A merge that starts above headerRow and reaches into the header.
+  assert.deepStrictEqual(why(book([["Region", "Q1", n], [n, "Revenue", "Cost"], [n, 1, 2], ["x", 3, 4]], ["A1:A3", "B1:C1"]), { headerRow: 2 }),
+    ['A1:A3: "Region" (A1:A3) crosses the edge of the header (rows 2-2)']);
+  // A merged label in the last row, or merges outside the stored range: refused, no crash.
+  assert.deepStrictEqual(why(book([["Name", "Q1", n]], ["B1:C1"])), ["null: the header (rows 1-2) runs past the end of the sheet"]);
+  const outside = XLSX.utils.aoa_to_sheet([["Name", "Email"], ["Ana", "a@b.co"]]);
+  outside["!merges"] = ["E9:F9", "C1:D1"].map((a) => XLSX.utils.decode_range(a));
+  const ob = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(ob, outside, "S");
+  assert.deepStrictEqual(cols(XLSX.write(ob, { type: "buffer", bookType: "xlsx" })), ["Name", "Email"]);
+  // An empty sheet.
+  const blank = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(blank, XLSX.utils.aoa_to_sheet([]), "S");
+  assert.deepStrictEqual(why(XLSX.write(blank, { type: "buffer", bookType: "xlsx" })), ["null: row 1 is outside the sheet"]);
+});
+ok("mh: notes for merged data cells and unnamed columns", () => {
+  const t = readGroupedTable(book([["Rep", "Q1", n, n], [n, "Revenue", "Cost", n], ["Ana", 100, 60, "x"], ["Bo", n, 50, n], ["Total in EUR", n, n, n]], ["A1:A2", "B1:C1", "B3:B4", "A5:C5"]));
+  assert.deepStrictEqual(t.problems, []);
+  assert.deepStrictEqual(text(t.notes), ["D: this column has data but no name, so it was left out", "B3:B4: merged in the data: only B3 holds the value", "A5:C5: merged in the data: only A5 holds the value"]);
+  assert.deepStrictEqual(t.records.map((r) => r.row), [3, 4, 5]);
+  assert.deepStrictEqual(Object.keys(t.records[0].values), ["Rep", "Q1 Revenue", "Q1 Cost"]);
 });
 ok("mh: a sheet that does not start at A1 keeps Excel addresses and row numbers", () => {
-  const rows = [["Region", "Q1", n], [n, "Revenue", "Cost"], ["North", 1, 2], [n, 3, 4]];
-  const t = readGroupedTable(book(rows, ["B3:B4", "C3:D3", "B5:B6"], "B3"));
-  assert.deepStrictEqual(t.records.map((r) => [r.row, r.values.Region, r.values["Q1 Cost"]]), [[5, "North", 2], [6, "North", 4]]);
-  assert.deepStrictEqual(text(t.notes), ['B5:B6: "North" copied into B6']);
-  const bad = readGroupedTable(book([["Name", "Q1", n], [n, "Revenue", n], ["Ana", 1, 2]], ["B3:B4", "C3:D3"], "B3"));
-  assert.deepStrictEqual(text(bad.problems), ['C3:D3: "Q1" has no column name under it in D4']);
+  const rows = [["Region", "Q1", n], [n, "Revenue", "Cost"], ["North", 1, 2], ["South", 3, 4]];
+  const t = readGroupedTable(book(rows, ["B3:B4", "C3:D3"], "B3"));
+  assert.deepStrictEqual(t.records.map((r) => [r.row, r.values.Region, r.values["Q1 Cost"]]), [[5, "North", 2], [6, "South", 4]]);
+  assert.deepStrictEqual(why(book(rows, ["B3:B4", "C3:D3"], "B3"), { headerRow: 1 }), ["null: row 1 is outside the sheet"]);
+  assert.deepStrictEqual(why(book([["Name", "Q1", n], [n, "Revenue", n], ["Ana", 1, 2]], ["B3:B4", "C3:D3"], "B3")), ['D4: "Q1" (C3:D3) has no column name under it here']);
 });
-ok("mh: labels centered with Center Across Selection are not merges", () => {
-  // tests/fixtures/sales-center-across.xlsx: the sales report with "Q1" and "Q2"
-  // centered across C1:D1 and E1:F1 (alignment centerContinuous), not merged.
-  const bytes = fs.readFileSync(path.join(__dirname, "fixtures", "sales-center-across.xlsx"));
-  const sheet = XLSX.read(bytes, { cellStyles: true }).Sheets.Sales;
-  assert.deepStrictEqual(sheet["!merges"] ?? [], []);
-  const t = readGroupedTable(bytes);
-  assert.deepStrictEqual(t.columns, ["Region", "Rep", "Q1", "Q2"]);
-  assert.deepStrictEqual(text(t.problems), ["D1: has data but no column name"]);
-});
-ok("mh: files that are not .xlsx are refused", () => {
-  assert.throws(() => readGroupedTable(new TextEncoder().encode("Region,Rep\nNorth,Ana\n")), TypeError);
+ok("mh: limits stated in the post", () => {
+  // Center Across Selection: no merges, so a one-row header; D1 and F1 have data but no name.
+  // tests/fixtures/sales-center-across.xlsx: the sales report with "Q1" and "Q2" centered across, not merged.
+  const center = fs.readFileSync(path.join(__dirname, "fixtures", "sales-center-across.xlsx"));
+  assert.deepStrictEqual(XLSX.read(center).Sheets.Sales["!merges"] ?? [], []);
+  const c = readGroupedTable(center);
+  assert.deepStrictEqual(c.columns, ["Region", "Rep", "Q1", "Q2"]);
+  assert.deepStrictEqual(c.records[0], { row: 2, values: { Region: null, Rep: null, Q1: "Revenue", Q2: "Revenue" } });
+  assert.deepStrictEqual(text(c.notes), ["D: this column has data but no name, so it was left out", "F: this column has data but no name, so it was left out"]);
+  // A group label typed once without a merge: the same.
+  assert.deepStrictEqual(cols(book(salesRows, ["A3:A4"])), ["Region", "Rep", "Q1", "Q2"]);
+  // A title over only some columns starts the names it covers.
+  const narrow = book([["Sales 2026", n, n, n], ["Name", "Rep", "City", "Zip"], ["Ana", "x", "y", "z"]], ["A1:C1"]);
+  assert.deepStrictEqual(cols(narrow), ["Sales 2026 Name", "Sales 2026 Rep", "Sales 2026 City", "Zip"]);
+  // A layout merge over text data in every column it covers, beside a column merged down.
+  assert.deepStrictEqual(cols(book([["Id", "Contact", n], [n, "Ana", "a@b.co"], [7, "Bo", "b@c.co"]], ["A1:A2", "B1:C1"])), ["Id", "Contact Ana", "Contact a@b.co"]);
+  // A group label stored as a date arrives as its serial number.
+  const sheet = XLSX.utils.aoa_to_sheet([["Name", n, n], [n, "Revenue", "Cost"], ["Ana", 1, 2]]);
+  sheet.B1 = { t: "n", v: 46023, z: "mmm yyyy" };
+  sheet["!merges"] = ["A1:A2", "B1:C1"].map((a) => XLSX.utils.decode_range(a));
+  const b = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(b, sheet, "S");
+  const dated = XLSX.write(b, { type: "buffer", bookType: "xlsx" });
+  assert.strictEqual(XLSX.read(dated).Sheets.S.B1.w, "Jan 2026");
+  assert.deepStrictEqual(cols(dated), ["Name", "46023 Revenue", "46023 Cost"]);
+  // A note merged beside a one-row header is taken for a group label: refused.
+  const note = why(book([["Name", "Email", n, "see notes", n], ["Ana", "a@b.co", n, n, n]], ["D1:E1"]));
+  assert.deepStrictEqual(note.map((p) => p.slice(0, 3)), ["A2:", "B2:", "D2:", "E2:"]);
+  // Values stored in the covered cells of a header merge are ignored.
+  const hiddenBytes = book([["Name", "Q1", "x"], ["old", "Revenue", "Cost"], ["Ana", 1, 2]], ["A1:A2", "B1:C1"]);
+  assert.strictEqual(XLSX.read(hiddenBytes).Sheets.S.A2.v, "old");
+  assert.deepStrictEqual(cols(hiddenBytes), ["Name", "Q1 Revenue", "Q1 Cost"]);
+  // CSV files have no merges: a one-row header.
+  const csv = readGroupedTable(new TextEncoder().encode("Region,Q1,\n,Revenue,Cost\nNorth,1,2\n"));
+  assert.deepStrictEqual([csv.columns, csv.records[0].values], [["Region", "Q1"], { Region: null, Q1: "Revenue" }]);
+  // A column named __proto__ is an own property of the record.
+  const proto = readGroupedTable(book([["__proto__", "Q1", n], [n, "a", "b"], ["x", 1, 2]], ["A1:A2", "B1:C1"]));
+  assert.strictEqual(Object.getOwnPropertyDescriptor(proto.records[0].values, "__proto__")?.value, "x");
 });
 ok("mh: snippets have no invisible characters", () => {
-  for (const s of ["// Sales.xlsx: \"Region\" and \"Rep\" are merged down over A1:A2 and B1:B2,\n// \"Q1\" across C1:D1 and \"Q2\" across E1:F1, with Revenue and Cost under each.\nconst sheet = workbook.Sheets[workbook.SheetNames[0]];\nconst records = XLSX.utils.sheet_to_json(sheet);\nrecords.length;                    // 4  (row 2, the second header row, is read as a record)\nObject.keys(records[0]).join(\", \");  // 'Q1, __EMPTY, Q2, __EMPTY_1'\nconst fromRow2 = XLSX.utils.sheet_to_json(sheet, { range: 1 });\nObject.keys(fromRow2[0]).join(\", \"); // '__EMPTY, __EMPTY_1, Revenue, Cost, Revenue_1, Cost_1'\n", "// Only for a template you control: the header is always rows 1-2 of Sales.xlsx.\nconst columns = [\"Region\", \"Rep\", \"Q1 Revenue\", \"Q1 Cost\", \"Q2 Revenue\", \"Q2 Cost\"];\nconst records = XLSX.utils.sheet_to_json(sheet, { header: columns, range: 2 });\nrecords[1]; // { Rep: 'Bo', 'Q1 Revenue': 90, 'Q1 Cost': 50, 'Q2 Revenue': 80, 'Q2 Cost': 40 }\n", "const { rows, merges, origin } = readXlsx(bytes);\nrows[0];    // [ 'Region', 'Rep', 'Q1', '', 'Q2', '' ]\nmerges[2];  // { address: 'E1:F1', top: 0, bottom: 0, left: 4, right: 5 }\norigin;     // { c: 0, r: 0 }\n", "// The header starts as one row. Each group label in it needs one row of names\n// under it; if that row holds a group label too (a year over quarters), one more.\nfunction countHeaderRows(merges, top, isGroup) {\n  let depth = 1;\n  for (let grown = true; grown; ) {\n    grown = false;\n    for (const m of merges) {\n      if (!isGroup(m) || m.top < top || m.top >= top + depth) continue;\n      const needed = m.bottom - top + 2; // the label's rows plus one row of names\n      if (needed > depth) { depth = needed; grown = true; }\n    }\n  }\n  return depth;\n}\n", "// Returns the problems that would give wrong column names.\nfunction checkHeader({ headerRows, width, groups, valueAt, mergeAt, label, isGroup, excelAddress, origin }) {\n  const problems = [];\n  const named = [...Array(width).keys()].filter((c) => headerRows.some((r) => label(r, c) !== \"\"));\n  for (const g of groups) {\n    const text = JSON.stringify(label(g.top, g.left));\n    // Over every named column, it would start every name: read it as a title.\n    if (named.length > 1 && g.left <= named[0] && g.right >= named.at(-1)) {\n      problems.push({ range: g.address, reason: `${text} spans the whole table, so it looks like a title`,\n        hint: \"pass the row index of the column names as headerTop\" });\n      continue;\n    }\n    // Every column under a group label needs a name in a header row below it.\n    for (let c = g.left; c <= Math.min(g.right, width - 1); c++) {\n      if (headerRows.some((r) => r > g.bottom && label(r, c) !== \"\")) continue;\n      problems.push({ range: g.address, reason: `${text} has no column name under it in ${excelAddress(g.bottom + 1, c)}`,\n        hint: \"type the missing name, or unmerge the label\" });\n    }\n  }\n  // A plain label is a header value that is not a group label. A value under a\n  // plain label (\"Ana\" under \"Name\") means the row is data, pulled into the header\n  // by a merge that is a title or layout.\n  for (const r of headerRows.slice(1)) {\n    const cause = groups.find((g) => g.top < r && g.bottom + 1 >= r)?.address ?? \"a merge above it\";\n    const row = origin.r + r + 1;\n    for (let c = 0; c < width; c++) {\n      if (isEmpty(valueAt(r, c)) || mergeAt(r, c)) continue;\n      const above = headerRows.filter((a) => a < r && label(a, c) !== \"\").at(-1);\n      if (above === undefined || isGroup(mergeAt(above, c))) continue;\n      problems.push({ range: excelAddress(r, c),\n        reason: `${JSON.stringify(valueAt(r, c))} is under the plain label ${JSON.stringify(label(above, c))} (${excelAddress(above, c)}), so row ${row} looks like data`,\n        hint: `${cause} made row ${row} part of the header. Unmerge it if it is layout; pass headerTop if it is a title; type one name in one cell if both cells are one name` });\n    }\n  }\n  return problems;\n}\n", "// Reads a header that starts at row index `top` and may have up to maxRows rows.\n// A cell merged across columns (\"Q1\" over C1:D1) is a group label, so the row\n// below it is part of the header too. Returns one name per column (\"Q1 Revenue\"),\n// the parts of each name ([\"Q1\", \"Revenue\"]), the number of header rows, notes and\n// problems. If any problem has refuse: true, the header was not read.\nfunction readHeader(rows, merges, top, origin, maxRows = 3) {\n  const excelAddress = (r, c) => XLSX.utils.encode_cell({ r: origin.r + r, c: origin.c + c });\n  const valueAt = (r, c) => rows[r]?.[c] ?? \"\";\n  const mergeAt = (r, c) => merges.find((m) => m.top <= r && r <= m.bottom && m.left <= c && c <= m.right);\n  // What Excel shows in a cell: for any cell of a merge, the first cell's value.\n  const shown = (r, c) => { const m = mergeAt(r, c); return m ? valueAt(m.top, m.left) : valueAt(r, c); };\n  // Line breaks (Alt+Enter) and double spaces inside a label become one space.\n  const label = (r, c) => String(shown(r, c)).replace(/\\s+/g, \" \").trim();\n  // A group label: a merge across columns with a value. An empty merge is layout.\n  const isGroup = (m) => m !== undefined && m.right > m.left && !isEmpty(valueAt(m.top, m.left));\n  const refuse = (list) => ({ depth: 0, columns: [], parts: [], notes: [], problems: list.map((p) => ({ ...p, refuse: true })) });\n  const start = excelAddress(Math.min(top, Math.max(rows.length - 1, 0)), 0);\n  if (top >= rows.length) return refuse([{ range: start, reason: `headerTop ${top} is past the last row of the sheet` }]);\n\n  const depth = countHeaderRows(merges, top, isGroup);\n  if (depth > maxRows) return refuse([{ range: start, reason: `the header would have ${depth} rows; this code reads at most ${maxRows}` }]);\n  // The file ends inside the header, such as a group label in its last row.\n  if (top + depth > rows.length) return refuse([{ range: start, reason: `no data rows under the ${depth}-row header` }]);\n  const headerRows = [...Array(depth).keys()].map((i) => top + i);\n\n  // Names: the labels of each column from top to bottom, joined with a space.\n  // A label merged down (\"Region\" over A1:A2) counts once.\n  const labelsOf = (c) => {\n    const labels = [];\n    let previous;\n    for (const r of headerRows) {\n      const m = mergeAt(r, c);\n      if (m !== undefined && m === previous) continue;\n      previous = m;\n      if (label(r, c) !== \"\") labels.push(label(r, c));\n    }\n    return labels;\n  };\n  const lastColumn = Math.max(0, ...headerRows.map((r) => rows[r]?.length ?? 0));\n  const parts = [...Array(lastColumn).keys()].map(labelsOf);\n  const width = parts.findLastIndex((labels) => labels.length > 0) + 1;\n  if (width === 0) return refuse([{ range: start, reason: \"the header row has no column names; if the header is lower, pass its row index as headerTop\" }]);\n  parts.length = width;\n  const groups = merges.filter((m) => isGroup(m) && m.top >= top && m.top < top + depth && m.left < width);\n\n  const problems = checkHeader({ headerRows, width, groups, valueAt, mergeAt, label, isGroup, excelAddress, origin });\n  if (problems.length > 0) return refuse(problems);\n  // Rows past the header that are all empty do not count as data.\n  if (rows.slice(top + depth).every((row) => row.every(isEmpty))) {\n    return refuse([{ range: start, reason: `no data rows under the ${depth}-row header` }]);\n  }\n\n  // A group label over the first named column may be a title over part of the\n  // table (\"Sales 2026\" over A1:C1). It is read as a group, with a note.\n  const first = parts.findIndex((labels) => labels.length > 0);\n  const notes = groups.filter((g) => g.top === top && g.left <= first).map((g) => ({\n    range: g.address, reason: `${JSON.stringify(label(g.top, g.left))} starts the names of the columns under it; if it is a title, pass the row index of the column names as headerTop` }));\n\n  // A value stored in a cell that a header merge covers is hidden in Excel and is\n  // not used in any name. It is reported; the header is still read.\n  for (const m of merges.filter((m) => m.left < width)) {\n    for (const r of headerRows) {\n      if (r < m.top || r > m.bottom) continue;\n      for (let c = m.left; c <= m.right; c++) {\n        if ((r === m.top && c === m.left) || isEmpty(valueAt(r, c))) continue;\n        problems.push({ range: m.address, reason: `hides ${JSON.stringify(valueAt(r, c))} in ${excelAddress(r, c)}`,\n          hint: \"only the first cell's value is used in the name\" });\n      }\n    }\n  }\n  return { depth, columns: parts.map((labels) => labels.join(\" \")), parts, notes, problems };\n}\n", "// Reads an .xlsx file whose header may have up to maxRows rows into records.\n// headerTop: index of the first header row. 0 is the first row SheetJS reads\n// (Excel row 1 for most files), 1 the row under it.\nfunction readGroupedTable(bytes, headerTop = 0, maxRows = 3) {\n  const { rows, merges, origin } = readXlsx(bytes);\n  const header = readHeader(rows, merges, headerTop, origin, maxRows);\n  if (header.problems.some((p) => p.refuse)) return { columns: [], records: [], notes: [], problems: header.problems };\n  const { columns, depth } = header;\n  const width = columns.length;\n  // The header cells of column c, such as \"D1:D2\", for messages.\n  const headerCells = (c) => XLSX.utils.encode_range({\n    s: { r: origin.r + headerTop, c: origin.c + c }, e: { r: origin.r + headerTop + depth - 1, c: origin.c + c } });\n\n  // Merges in the data: the same rules as for a one-row header.\n  const firstData = headerTop + depth;\n  const filled = fillMerges(rows, merges, firstData, width, origin);\n  const problems = [...header.problems, ...filled.problems];\n  const isData = (r) => r >= firstData && !filled.skipRows.has(r) &&\n    !rows[r].slice(0, width).every(isEmpty);\n  const seen = new Set();\n  columns.forEach((name, c) => {\n    if (name === \"\") {\n      if (rows.some((row, r) => isData(r) && !isEmpty(row[c]))) {\n        problems.push({ range: headerCells(c), reason: \"has data but no column name\" });\n      }\n      return;\n    }\n    // Typed twice (\"Q1\" over two groups): the later column would overwrite the\n    // first in each record, so the file is refused.\n    if (seen.has(name.toLowerCase())) {\n      problems.push({ range: headerCells(c), reason: `repeats the column name ${JSON.stringify(name)}`, refuse: true });\n    }\n    seen.add(name.toLowerCase());\n  });\n\n  const notes = [...header.notes, ...filled.notes];\n  if (problems.some((p) => p.refuse)) return { columns: [], records: [], notes, problems };\n  const records = [];\n  rows.forEach((row, r) => {\n    if (!isData(r)) return;\n    const values = Object.fromEntries(\n      columns.flatMap((name, c) => (name ? [[name, row[c] ?? \"\"]] : [])));\n    records.push({ row: origin.r + r + 1, values });\n  });\n  return { columns: columns.filter((name) => name !== \"\"), records, notes, problems };\n}\n", "// file: a File from <input type=\"file\">, inside an async change handler.\nlet table;\ntry {\n  table = readGroupedTable(await file.arrayBuffer());\n} catch (error) {\n  // readXlsx throws a TypeError when the bytes do not start like a zip archive\n  // (an .xlsx file is one), and SheetJS throws for a damaged file.\n  console.error(error);\n  table = { columns: [], records: [], notes: [], problems: [{ range: null, reason: \"the file could not be read as .xlsx\" }] };\n}\nconst { columns, records, notes, problems } = table;\n\ncolumns;\n// [ 'Region', 'Rep', 'Q1 Revenue', 'Q1 Cost', 'Q2 Revenue', 'Q2 Cost' ]\nrecords[1];\n// { row: 4, values: { Region: 'North', Rep: 'Bo', 'Q1 Revenue': 90, 'Q1 Cost': 50, 'Q2 Revenue': 80, 'Q2 Cost': 40 } }\nnotes.map((n) => `${n.range}: ${n.reason}`); // [ 'A3:A4: \"North\" copied into A4' ]\nproblems; // []\n", "// title, hole and layout hold the bytes of three small .xlsx files\n// that this code refuses, with no records:\n// title: \"Sales 2026\" merged across A1:C1, above the column names in row 2.\n// hole: \"Q1\" across B1:C1, with \"Revenue\" in B2 and nothing in C2.\n// layout: \"Note\" merged across B1:C1 only to make room; row 2 is Ana's data.\nconst reasons = (table) => table.problems.map((p) => `${p.range}: ${p.reason}`);\n\nconst titled = readGroupedTable(title);\nreasons(titled);\n// [ 'A1:C1: \"Sales 2026\" spans the whole table, so it looks like a title' ]\ntitled.problems[0].hint; // 'pass the row index of the column names as headerTop'\nreadGroupedTable(title, 1).columns; // [ 'Name', 'Rep', 'City' ]\nreasons(readGroupedTable(hole));\n// [ 'B1:C1: \"Q1\" has no column name under it in C2' ]\nconst laidOut = readGroupedTable(layout);\nreasons(laidOut);\n// [ 'A2: \"Ana\" is under the plain label \"Name\" (A1), so row 2 looks like data' ]\nlaidOut.problems[0].hint;\n// 'B1:C1 made row 2 part of the header. Unmerge it if it is layout; pass headerTop if it is a title; type one name in one cell if both cells are one name'\n"]) assert(!/[\u00a0\u00ad\u200b-\u200f\u2028\u2029\u202f\u2060\u3000\ufeff]/.test(s));
+  for (const s of ["// Sales.xlsx: \"Region\" and \"Rep\" are merged down over A1:A2 and B1:B2,\n// \"Q1\" across C1:D1 and \"Q2\" across E1:F1, with Revenue and Cost under each.\n// bytes: the file's contents, e.g. new Uint8Array(await file.arrayBuffer()).\nconst workbook = XLSX.read(bytes);\nconst sheet = workbook.Sheets[workbook.SheetNames[0]];\nconst records = XLSX.utils.sheet_to_json(sheet);\nrecords.length;                    // 4  (row 2, the second header row, is read as a record)\nObject.keys(records[0]).join(\", \");  // 'Q1, __EMPTY, Q2, __EMPTY_1'\nconst fromRow2 = XLSX.utils.sheet_to_json(sheet, { range: 1 });\nObject.keys(fromRow2[0]).join(\", \"); // '__EMPTY, __EMPTY_1, Revenue, Cost, Revenue_1, Cost_1'\n", "// Only for a template you control: the header is always rows 1-2 of Sales.xlsx.\nconst columns = [\"Region\", \"Rep\", \"Q1 Revenue\", \"Q1 Cost\", \"Q2 Revenue\", \"Q2 Cost\"];\nconst records = XLSX.utils.sheet_to_json(sheet, { header: columns, range: 2 });\nrecords[1]; // { Rep: 'Bo', 'Q1 Revenue': 90, 'Q1 Cost': 50, 'Q2 Revenue': 80, 'Q2 Cost': 40 }\n", "// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz\nimport * as XLSX from \"xlsx\";\n\nconst hasText = (value) => String(value ?? \"\").trim() !== \"\";\n// Line breaks typed with Alt+Enter and runs of spaces become one space.\nconst tidy = (value) => String(value).replace(/\\s+/g, \" \").trim();\n\n// Reads the first sheet. rows: one array of cells per row. merges: the merged\n// ranges. Both count from 0 at the start of the sheet's range (its \"!ref\").\nfunction readSheet(bytes) {\n  const workbook = XLSX.read(bytes);\n  const sheet = workbook.Sheets[workbook.SheetNames[0]];\n  if (!sheet?.[\"!ref\"]) return { rows: [], merges: [], origin: { r: 0, c: 0 } };\n  const origin = XLSX.utils.decode_range(sheet[\"!ref\"]).s;\n  const rows = XLSX.utils.sheet_to_json(sheet, {\n    header: 1, defval: null, blankrows: true, raw: true });\n  const merges = (sheet[\"!merges\"] ?? []).map((m) => ({\n    address: XLSX.utils.encode_range(m), // \"C1:D1\", for messages\n    top: m.s.r - origin.r, bottom: m.e.r - origin.r,\n    left: m.s.c - origin.c, right: m.e.c - origin.c,\n  }));\n  return { rows, merges, origin };\n}\n\n// The text of a merge (in its top-left cell). A merge can lie outside the\n// sheet's range, so the row may not exist.\nconst mergeText = (rows, m) => rows[m.top]?.[m.left];\n// A group label: a merge with text across two or more columns.\nconst isGroupLabel = (rows, m) => m.right > m.left && hasText(mergeText(rows, m));\n", "// Finds the header rows. headerRow is the Excel row number of its first row.\n// Returns { top, end } (row indexes; end is the first row after the header)\n// or { problem }.\nfunction findHeaderRows(sheet, { headerRow = sheet.origin.r + 1, maxRows = 3 } = {}) {\n  const { rows, merges, origin } = sheet;\n  const top = headerRow - 1 - origin.r;\n  const label = (m) => `\"${tidy(mergeText(rows, m))}\" (${m.address})`;\n  const problem = (range, reason, hint) => ({ problem: { range, reason, hint } });\n  if (top < 0 || top >= rows.length) return problem(null, `row ${headerRow} is outside the sheet`);\n  if (!rows[top].some(hasText)) return problem(null, `row ${headerRow} is empty`,\n    \"pass headerRow: the Excel row number of the column names\");\n\n  // Each group label needs a row of names under it: grow the header until\n  // every group label that starts in it has one.\n  let end = top + 1;\n  for (;;) {\n    const groups = merges.filter((m) => isGroupLabel(rows, m) && m.top >= top && m.top < end);\n    const needed = Math.max(end, ...groups.map((m) => m.bottom + 2));\n    if (needed === end) break;\n    end = needed;\n  }\n  const lastRow = headerRow + (end - top) - 1;\n  if (end > rows.length) return problem(null,\n    `the header (rows ${headerRow}-${lastRow}) runs past the end of the sheet`);\n\n  // A title: a group label in the first row over every column that has a label.\n  const labelled = (c) => {\n    for (let r = top; r < end; r++) {\n      if (hasText(rows[r]?.[c])) return true;\n    }\n    return merges.some((m) => hasText(mergeText(rows, m)) && m.left <= c && c <= m.right &&\n      m.top < end && m.bottom >= top);\n  };\n  const width = Math.max(...rows.slice(top, end).map((row) => row.length));\n  const named = [];\n  for (let c = 0; c < width; c++) if (labelled(c)) named.push(c);\n  const title = merges.find((m) => isGroupLabel(rows, m) && m.top === top &&\n    named.length > 1 && m.left <= named[0] && m.right >= named.at(-1));\n  if (title) {\n    const next = rows.findIndex((row, r) => r > title.bottom && row.some(hasText));\n    return problem(title.address, `${label(title)} spans every column, so it looks like a title`,\n      next < 0 ? undefined : `pass headerRow: ${next + origin.r + 1} if the names start there`);\n  }\n  if (end - top > maxRows) return problem(null,\n    `the merges make a header of ${end - top} rows; the limit is ${maxRows}`,\n    \"check the merges, or pass a larger maxRows if the header is real\");\n\n  // A labelled merge that starts above the header or reaches below it.\n  const crossing = merges.find((m) => hasText(mergeText(rows, m)) &&\n    m.bottom >= top && m.top < end &&       // it touches the header\n    (m.top < top || m.bottom >= end));      // and goes past its edge\n  if (crossing) return problem(crossing.address,\n    `${label(crossing)} crosses the edge of the header (rows ${headerRow}-${lastRow})`,\n    `merge it over rows ${headerRow}-${lastRow} only, or unmerge it`);\n  return { top, end, headerRow, lastRow };\n}\n", "// Names each column from the header rows, top to bottom: \"Q1\" over \"Revenue\"\n// gives \"Q1 Revenue\". Returns { columns, end } or { problems }.\nfunction readHeader(sheet, options) {\n  const { rows, merges, origin } = sheet;\n  const found = findHeaderRows(sheet, options);\n  if (found.problem) return { problems: [found.problem] };\n  const { top, end } = found;\n  const cellAt = (r, c) => XLSX.utils.encode_cell({ r: r + origin.r, c: c + origin.c });\n  const mergeAt = (r, c) =>\n    merges.find((m) => r >= m.top && r <= m.bottom && c >= m.left && c <= m.right);\n  // What Excel shows: a merge shows the value of its top-left cell.\n  const shown = (r, c) => {\n    const m = mergeAt(r, c);\n    return m ? mergeText(rows, m) : rows[r][c];\n  };\n  const headerRows = [];\n  for (let r = top; r < end; r++) headerRows.push(r);\n  const groups = merges.filter((m) => isGroupLabel(rows, m) && m.top >= top && m.top < end);\n  const width = Math.max(...headerRows.map((r) => rows[r].length));\n\n  const columns = [], problems = [];\n  for (let c = 0; c < width; c++) {\n    const parts = [];\n    let lastMerge = null;  // a merge counts once, however many rows it covers\n    let plainLabel = null; // the last label above that is not a group label\n    for (const r of headerRows) {\n      const m = mergeAt(r, c);\n      if (m && m === lastMerge) continue;\n      lastMerge = m;\n      const value = shown(r, c);\n      if (!hasText(value)) continue;\n      // Text under a plain label is a data row that a merge pulled into the header.\n      if (plainLabel !== null) problems.push({ range: cellAt(r, c),\n        reason: `\"${tidy(value)}\" is under \"${tidy(plainLabel)}\", ` +\n          `which is not a group label, so row ${r + origin.r + 1} looks like data`,\n        hint: \"unmerge cells that are only layout, or type the full name in one cell\" });\n      if (!groups.includes(m)) plainLabel = value;\n      parts.push(tidy(value));\n    }\n    // Every column under a group label needs a name in a row below the label.\n    for (const g of groups) {\n      if (c < g.left || c > g.right) continue;\n      if (headerRows.some((r) => r > g.bottom && hasText(shown(r, c)))) continue;\n      problems.push({ range: cellAt(g.bottom + 1, c),\n        reason: `\"${tidy(mergeText(rows, g))}\" (${g.address}) has no column name under it here`,\n        hint: \"type the column's name in this cell\" });\n    }\n    if (parts.length) columns.push({ name: parts.join(\" \"), parts, index: c,\n      letter: XLSX.utils.encode_col(c + origin.c) });\n  }\n  if (problems.length) return { problems };\n  if (!rows.slice(end).some((row) => row.some(hasText))) return { problems: [{ range: null,\n    reason: `there are no data rows under the header (rows ${found.headerRow}-${found.lastRow})` }] };\n\n  // A repeated name would overwrite the first column's value in every record.\n  // Names that differ only in case are refused too: a mapping that ignores\n  // case would mix them up.\n  const seen = new Map();\n  for (const col of columns) {\n    const first = seen.get(col.name.toLowerCase());\n    if (!first) { seen.set(col.name.toLowerCase(), col); continue; }\n    problems.push({ range: col.letter,\n      reason: `column ${col.letter} has the same name as column ${first.letter}: \"${first.name}\"`,\n      hint: \"rename one of them\" });\n  }\n  return problems.length ? { problems } : { columns, end };\n}\n", "// Reads the records under the header. Each record has its Excel row number.\nfunction readGroupedTable(bytes, options) {\n  const sheet = readSheet(bytes);\n  const header = readHeader(sheet, options);\n  const { rows, merges, origin } = sheet;\n  if (header.problems) {\n    return { columns: [], records: [], notes: [], problems: header.problems };\n  }\n  const records = [], notes = [];\n  for (let r = header.end; r < rows.length; r++) {\n    if (!rows[r].some(hasText)) continue; // blank row\n    // fromEntries keeps a column named \"__proto__\" as an ordinary key.\n    const values = Object.fromEntries(\n      header.columns.map((col) => [col.name, rows[r][col.index] ?? null]));\n    records.push({ row: r + origin.r + 1, values });\n  }\n  // A loop, not Math.max(...rows): spreading 100,000 rows overflows the stack.\n  let width = 0;\n  for (const row of rows) width = Math.max(width, row.length);\n  const data = rows.slice(header.end);\n  for (let c = 0; c < width; c++) {\n    const named = header.columns.some((col) => col.index === c);\n    if (!named && data.some((row) => hasText(row[c]))) notes.push({\n      range: XLSX.utils.encode_col(c + origin.c),\n      reason: \"this column has data but no name, so it was left out\" });\n  }\n  for (const m of merges) {\n    const first = XLSX.utils.encode_cell({ r: m.top + origin.r, c: m.left + origin.c });\n    if (m.top >= header.end) notes.push({ range: m.address,\n      reason: `merged in the data: only ${first} holds the value` });\n  }\n  const columns = header.columns.map((col) => col.name);\n  return { columns, records, notes, problems: [] };\n}\n", "// file: a File from <input type=\"file\">, inside an async change handler.\nconst bytes = new Uint8Array(await file.arrayBuffer());\nconst { columns, records, notes, problems } = readGroupedTable(bytes);\ncolumns;\n// [ 'Region', 'Rep', 'Q1 Revenue', 'Q1 Cost', 'Q2 Revenue', 'Q2 Cost' ]\nrecords[0];\n// { row: 3, values: { Region: 'North', Rep: 'Ana', 'Q1 Revenue': 100, 'Q1 Cost': 60, 'Q2 Revenue': 120, 'Q2 Cost': 70 } }\nrecords[1].values.Region; // null\nnotes.map((n) => `${n.range}: ${n.reason}`);\n// [ 'A3:A4: merged in the data: only A3 holds the value' ]\nproblems; // []\n", "// title, hole, layout and total hold the bytes of four small .xlsx files:\n// title: \"Sales 2026\" merged across A1:C1, above the names Name, Rep, City in row 2.\n// hole: \"Name\" merged over A1:A2; \"Q1\" merged across B1:C1, with \"Revenue\"\n//   in B2 and nothing in C2.\n// layout: \"Name\" in A1 and \"Note\" merged across B1:C1 only to make room;\n//   row 2 is Ana's data: Ana, hi, 5.\n// total: \"Q1\" merged across A1:B1 over Revenue and Cost; \"Total\" in C1 over\n//   \"Amount\" in C2, not merged.\nconst reasons = (table) => table.problems.map((p) => `${p.range}: ${p.reason}`);\nconst titled = readGroupedTable(title);\nreasons(titled);\n// [ 'A1:C1: \"Sales 2026\" (A1:C1) spans every column, so it looks like a title' ]\ntitled.problems[0].hint; // 'pass headerRow: 2 if the names start there'\nreadGroupedTable(title, { headerRow: 2 }).columns; // [ 'Name', 'Rep', 'City' ]\nreasons(readGroupedTable(hole));\n// [ 'C2: \"Q1\" (B1:C1) has no column name under it here' ]\nreasons(readGroupedTable(layout));\n// [ 'A2: \"Ana\" is under \"Name\", which is not a group label, so row 2 looks like data' ]\nreasons(readGroupedTable(total));\n// [ 'C2: \"Amount\" is under \"Total\", which is not a group label, so row 2 looks like data' ]\n"]) assert(!/[\u00a0\u00ad\u200b-\u200f\u2028\u2029\u202f\u2060\u3000\ufeff]/.test(s));
 });
 }
