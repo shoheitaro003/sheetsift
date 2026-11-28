@@ -1553,3 +1553,111 @@ problems.map((p) => `${p.range}: ${p.reason}`);
 //   'B4:C4: covers 2 columns; "Paid by card, see note" is read into B4 only' ]
 records[1].values; // { Customer: 'Acme', Invoice: 'INV-7', Line: 'Shipping', Amount: '' }
 '''
+
+TH_PROBLEM = r'''// Sales.xlsx: "Q1" is merged over C1:D1, "Q2" over E1:F1,
+// "Region" over A1:A2 and "Rep" over B1:B2.
+const sheet = workbook.Sheets[workbook.SheetNames[0]];
+const records = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+Object.keys(records[0]).join(", "); // 'Region, Rep, Q1, __EMPTY, Q2, __EMPTY_1'
+records[0].Q1;                      // 'Revenue'  (header row 2, read as data)
+records.length;                     // 4  (three sales rows plus that one)
+'''
+
+TH_READ = r'''// npm install https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
+import * as XLSX from "xlsx";
+
+// Reads a sheet whose header has two rows: group labels such as "Q1" in the
+// first row, over the columns they group, and names such as "Revenue" under
+// them. Returns { columns, records }, or throws an Error whose `problems`
+// list has one line per header cell to fix, starting with its Excel address.
+export function readTwoRowTable(sheet) {
+  const fail = (problems) =>
+    Object.assign(new Error(problems.join("\n")), { problems });
+  if (!sheet?.["!ref"]) throw fail(["the sheet is empty"]);
+  const { s, e } = XLSX.utils.decode_range(sheet["!ref"]);
+  const text = (r, c) => {
+    const cell = sheet[XLSX.utils.encode_cell({ r, c })];
+    return String(cell?.w ?? cell?.v ?? "").replace(/\s+/g, " ").trim();
+  };
+  const top = [], below = [], problems = [];
+  for (let c = s.c; c <= e.c; c++) {
+    top[c] = text(s.r, c);
+    below[c] = text(s.r + 1, c);
+  }
+
+  // A merged cell stores its value in its first cell only: copy it across.
+  for (const m of sheet["!merges"] ?? []) {
+    const outside = m.e.r < s.r || m.s.r > s.r + 1 || m.e.c < s.c || m.s.c > e.c;
+    if (outside) continue; // above the header, in the data, or beside the table
+    const where = XLSX.utils.encode_range(m);
+    if (m.s.r < s.r) problems.push(`${where}: starts above the header`);
+    else if (m.s.r > s.r) problems.push(`${where}: merged in the second header row`);
+    else if (m.e.r > s.r + 1) problems.push(`${where}: reaches below the header`);
+    else if (m.s.c < s.c || m.e.c > e.c) problems.push(`${where}: crosses the table's edge`);
+    else if (m.e.r === s.r && m.s.c <= s.c && m.e.c >= e.c) {
+      problems.push(`${where}: spans the whole table; is it a title?`);
+    } else {
+      for (let c = m.s.c; c <= m.e.c; c++) {
+        top[c] = top[m.s.c];
+        if (m.e.r === s.r + 1) below[c] = ""; // merged down, like "Region"
+      }
+    }
+  }
+
+  // At least one group label must cover two columns that have names under
+  // them. Without one, row 2 is probably data under a one-row header.
+  let hasGroup = false;
+  for (let c = s.c + 1; c <= e.c; c++) {
+    if (top[c] && top[c] === top[c - 1] && below[c] && below[c - 1]) hasGroup = true;
+  }
+  if (!hasGroup) {
+    problems.push(`row ${s.r + 1}: no group label covers two columns; ` +
+      "is this a one-row header?");
+  }
+
+  const columns = [];
+  for (let c = s.c; c <= e.c; c++) {
+    const at = XLSX.utils.encode_cell({ r: s.r + 1, c });
+    const name = [top[c], below[c]].filter(Boolean).join(" ");
+    let hasData = false;
+    for (let r = s.r + 2; r <= e.r && !hasData; r++) hasData = text(r, c) !== "";
+    const lower = name.toLowerCase();
+    if (!name && hasData) {
+      problems.push(`${at}: the column has data but no name`);
+    } else if (name && !top[c]) {
+      problems.push(`${at}: "${name}" has no group label above it`);
+    } else if (name && columns.some((n) => n?.toLowerCase() === lower)) {
+      problems.push(`${at}: "${name}" is used twice`);
+    }
+    columns.push(name || null); // null: an empty column, left out of the records
+  }
+  if (problems.length) throw fail(problems);
+
+  const records = XLSX.utils.sheet_to_json(sheet, {
+    header: columns, range: s.r + 2, defval: "" });
+  return { columns: columns.filter(Boolean), records };
+}
+'''
+
+TH_EXAMPLE = r'''import * as XLSX from "xlsx";
+import { readTwoRowTable } from "./read-two-row-table.js";
+
+const workbook = XLSX.read(await file.arrayBuffer());
+const sheet = workbook.Sheets[workbook.SheetNames[0]];
+try {
+  const { columns, records } = readTwoRowTable(sheet);
+  // columns: Region, Rep, Q1 Revenue, Q1 Cost, Q2 Revenue, Q2 Cost
+  // records[1]: { Region: 'North', Rep: 'Bo', 'Q1 Revenue': 90, 'Q1 Cost': 50,
+  //                'Q2 Revenue': 80, 'Q2 Cost': 40 }
+  showPreview(columns, records);
+} catch (error) {
+  showProblems(error.problems ?? [String(error)]); // one line per cell to fix
+}
+'''
+
+TH_REFUSED = r'''// The same report with "Q1" and "Q2" centered over their columns, not merged.
+// Each label sits in C1 or E1 alone, so readTwoRowTable throws:
+row 1: no group label covers two columns; is this a one-row header?
+D2: "Cost" has no group label above it
+F2: "Cost" has no group label above it
+'''
